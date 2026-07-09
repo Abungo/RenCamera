@@ -12,8 +12,8 @@ namespace hn = hwy::HWY_NAMESPACE;
 namespace {
 
 static constexpr int BLOCK_SIZE    = 16;  // pixels per alignment block
-static constexpr int SEARCH_RANGE  = 16;  // ±pixels at coarsest pyramid level
-static constexpr int REFINE_RANGE  =  4;  // ±pixels at finer levels
+static constexpr int SEARCH_RANGE  =  8;  // ±pixels at coarsest pyramid level
+static constexpr int REFINE_RANGE  =  2;  // ±pixels at finer levels
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers

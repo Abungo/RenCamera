@@ -49,12 +49,11 @@ bool EncodeStage::process(FrameContext& ctx) {
     jpeg_set_quality(&cinfo, quality, TRUE);
 
     jpeg_start_compress(&cinfo, TRUE);
-    while (cinfo.next_scanline < cinfo.image_height) {
-        const uint8_t* rowPtr =
-            src.data.data() + cinfo.next_scanline * src.width * 3;
-        auto row = const_cast<JSAMPROW>(rowPtr);
-        jpeg_write_scanlines(&cinfo, &row, 1);
+    std::vector<JSAMPROW> rowPointers(src.height);
+    for (int y = 0; y < src.height; ++y) {
+        rowPointers[y] = const_cast<JSAMPLE*>(src.data.data() + y * src.width * 3);
     }
+    jpeg_write_scanlines(&cinfo, rowPointers.data(), src.height);
     jpeg_finish_compress(&cinfo);
     jpeg_destroy_compress(&cinfo);
 
