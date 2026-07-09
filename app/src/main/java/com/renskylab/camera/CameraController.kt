@@ -406,24 +406,35 @@ class CameraController(
             runCatching { session?.stopRepeating() }
 
             val isNight = config.nightMode
-            val burst = if (isNight) {
+            val forceBurst = !isNight && currentIso > 400
+            val burst = if (isNight || forceBurst) {
                 isCapturingPsl = true
                 ringBuffer.flush() // Clear preview frames
 
-                // Dynamically calculate optimal ISO for 125ms target exposure based on viewfinder exposure
-                val targetExposureTime = 125_000_000L // 125ms
-                val calculatedIso = (currentIso * (currentExposureTime.toDouble() / targetExposureTime.toDouble())).toInt()
-                val targetIso = calculatedIso.coerceIn(50, currentIso)
-                Log.i(TAG, "Dynamic ISO calculation: viewfinderIso=$currentIso, viewfinderExp=${currentExposureTime / 1_000_000}ms -> targetIso=$targetIso")
+                val targetExposureTime: Long
+                val targetIso: Int
+                val numFrames: Int
 
-                // Create a manual still capture burst to collect massive light
-                val requests = List(15) {
+                if (isNight) {
+                    numFrames = 15
+                    targetExposureTime = 125_000_000L // 125ms
+                    val calculatedIso = (currentIso * (currentExposureTime.toDouble() / targetExposureTime.toDouble())).toInt()
+                    targetIso = calculatedIso.coerceIn(50, currentIso)
+                } else {
+                    // Normal mode: clamp ISO at 400 and scale exposure time proportionally
+                    numFrames = 12
+                    targetIso = 400
+                    val calculatedExp = (currentExposureTime * (currentIso.toDouble() / 400.0)).toLong()
+                    targetExposureTime = calculatedExp.coerceIn(12_000_000L, 80_000_000L) // 1/80s to 1/12s
+                }
+                Log.i(TAG, "Still capture burst: isNight=$isNight, forceBurst=$forceBurst -> targetIso=$targetIso, targetExp=${targetExposureTime / 1_000_000}ms")
+
+                // Create a manual still capture burst to collect clean frames
+                val requests = List(numFrames) {
                     cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                         addTarget(imageReader!!.surface)
                         set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-                        // Request 125ms per-frame exposure time (1/8s)
                         set(CaptureRequest.SENSOR_EXPOSURE_TIME, targetExposureTime)
-                        // Target calculated dynamic ISO
                         set(CaptureRequest.SENSOR_SENSITIVITY, targetIso)
                         set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                     }.build()
@@ -456,19 +467,19 @@ class CameraController(
                     return@launch
                 }
 
-                // Wait up to 6 seconds for all 15 long-exposure frames to arrive
+                // Wait up to 6 seconds for all frames to arrive
                 val timeoutMs = 6000L
                 val startTime = System.currentTimeMillis()
-                while (ringBuffer.size < 15 && (System.currentTimeMillis() - startTime) < timeoutMs) {
+                while (ringBuffer.size < numFrames && (System.currentTimeMillis() - startTime) < timeoutMs) {
                     delay(50)
                 }
 
                 isCapturingPsl = false
                 val pslFrames = ringBuffer.snapshot()
-                if (pslFrames.size < 15) {
-                    Log.w(TAG, "PSL capture timed out, got ${pslFrames.size}/15 frames")
+                if (pslFrames.size < numFrames) {
+                    Log.w(TAG, "Still burst capture timed out, got ${pslFrames.size}/$numFrames frames")
                 } else {
-                    Log.i(TAG, "Successfully captured all 15 PSL frames!")
+                    Log.i(TAG, "Successfully captured all $numFrames still burst frames!")
                 }
                 pslFrames
             } else {
