@@ -233,20 +233,6 @@ class CameraController(
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun openCamera(texture: android.graphics.SurfaceTexture) {
-        // Diagnostic log of all device cameras and configurations
-        runCatching {
-            manager.cameraIdList.forEach { id ->
-                val chars = manager.getCameraCharacteristics(id)
-                val facing = chars.get(CameraCharacteristics.LENS_FACING)
-                val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
-                val hasRaw = caps?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW) == true
-                val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-                val rawSizes = map?.getOutputSizes(ImageFormat.RAW_SENSOR)?.map { "${it.width}x${it.height}" }?.joinToString(", ")
-                val yuvSizes = map?.getOutputSizes(ImageFormat.YUV_420_888)?.map { "${it.width}x${it.height}" }?.joinToString(", ")
-                Log.i(TAG, "DIAGNOSTIC - Camera ID $id: facing=$facing, rawSupported=$hasRaw, rawSizes=[$rawSizes], yuvSizes=[$yuvSizes]")
-            }
-        }
-
         val cameraId = pickBackCamera() ?: run {
             Log.e(TAG, "No back camera found"); return
         }
@@ -358,6 +344,7 @@ class CameraController(
         val requestBuilder = cameraDevice!!
             .createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                 addTarget(previewSurface)
+                addTarget(imageReader!!.surface)
                 set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, evSteps)
                 set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
                 set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
@@ -419,8 +406,7 @@ class CameraController(
             runCatching { session?.stopRepeating() }
 
             val isNight = config.nightMode
-            val numFrames = 12
-            val burst = run {
+            val burst = if (isNight) {
                 isCapturingPsl = true
                 ringBuffer.flush() // Clear preview frames
 
@@ -430,21 +416,15 @@ class CameraController(
                 val targetIso = calculatedIso.coerceIn(50, currentIso)
                 Log.i(TAG, "Dynamic ISO calculation: viewfinderIso=$currentIso, viewfinderExp=${currentExposureTime / 1_000_000}ms -> targetIso=$targetIso")
 
-                // Create a still capture burst to collect massive light / full-res frames
-                val requests = List(numFrames) {
+                // Create a manual still capture burst to collect massive light
+                val requests = List(15) {
                     cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                         addTarget(imageReader!!.surface)
-                        if (isNight) {
-                            set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-                            // Request 125ms per-frame exposure time (1/8s)
-                            set(CaptureRequest.SENSOR_EXPOSURE_TIME, targetExposureTime)
-                            // Target calculated dynamic ISO
-                            set(CaptureRequest.SENSOR_SENSITIVITY, targetIso)
-                        } else {
-                            // Normal mode: let Auto Exposure run but lock it (AE lock)
-                            set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                            set(CaptureRequest.CONTROL_AE_LOCK, true)
-                        }
+                        set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+                        // Request 125ms per-frame exposure time (1/8s)
+                        set(CaptureRequest.SENSOR_EXPOSURE_TIME, targetExposureTime)
+                        // Target calculated dynamic ISO
+                        set(CaptureRequest.SENSOR_SENSITIVITY, targetIso)
                         set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                     }.build()
                 }
@@ -476,21 +456,43 @@ class CameraController(
                     return@launch
                 }
 
-                // Wait up to 6 seconds for all burst frames to arrive
+                // Wait up to 6 seconds for all 15 long-exposure frames to arrive
                 val timeoutMs = 6000L
                 val startTime = System.currentTimeMillis()
-                while (ringBuffer.size < numFrames && (System.currentTimeMillis() - startTime) < timeoutMs) {
+                while (ringBuffer.size < 15 && (System.currentTimeMillis() - startTime) < timeoutMs) {
                     delay(50)
                 }
 
                 isCapturingPsl = false
-                val burstFrames = ringBuffer.snapshot()
-                if (burstFrames.size < numFrames) {
-                    Log.w(TAG, "Burst capture timed out, got ${burstFrames.size}/$numFrames frames")
+                val pslFrames = ringBuffer.snapshot()
+                if (pslFrames.size < 15) {
+                    Log.w(TAG, "PSL capture timed out, got ${pslFrames.size}/15 frames")
                 } else {
-                    Log.i(TAG, "Successfully captured all $numFrames burst frames!")
+                    Log.i(TAG, "Successfully captured all 15 PSL frames!")
                 }
-                burstFrames
+                pslFrames
+            } else {
+                val fullDrained = ringBuffer.snapshot()
+                if (fullDrained.isEmpty()) {
+                    _isProcessing.value = false
+                    if (session != null && surface != null) {
+                        runCatching { startRepeatingRequest(session, surface) }
+                    }
+                    withContext(Dispatchers.Main) {
+                        onDispatched()
+                        onError("Ring buffer is empty — point camera at subject")
+                    }
+                    return@launch
+                }
+
+                val needed = 12
+                if (fullDrained.size > needed) {
+                    val discard = fullDrained.size - needed
+                    fullDrained.subList(0, discard).forEach { runCatching { it.image.close() } }
+                    fullDrained.subList(discard, fullDrained.size)
+                } else {
+                    fullDrained
+                }
             }
 
             // Extract array parameters for copyBurst
