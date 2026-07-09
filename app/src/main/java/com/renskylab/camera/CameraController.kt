@@ -435,11 +435,11 @@ class CameraController(
                     val calculatedIso = (currentIso * (currentExposureTime.toDouble() / targetExposureTime.toDouble())).toInt()
                     targetIso = calculatedIso.coerceIn(50, currentIso)
                 } else {
-                    // Normal mode: clamp ISO at 400 and scale exposure time proportionally
+                    // Normal mode: divide viewfinder ISO by a factor of 2.0 and scale exposure time by 2.0
+                    val factor = 2.0
                     numFrames = 12
-                    targetIso = 400
-                    val calculatedExp = (currentExposureTime * (currentIso.toDouble() / 400.0)).toLong()
-                    targetExposureTime = calculatedExp.coerceIn(12_000_000L, 80_000_000L) // 1/80s to 1/12s
+                    targetIso = (currentIso / factor).toInt().coerceIn(50, currentIso)
+                    targetExposureTime = (currentExposureTime * factor).toLong()
                 }
                 captureIso = targetIso
                 Log.i(TAG, "Still capture burst: isNight=$isNight, forceBurst=$forceBurst -> targetIso=$targetIso, targetExp=${targetExposureTime / 1_000_000}ms")
