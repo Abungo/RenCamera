@@ -1,0 +1,5 @@
+<resources>
+    <!-- Bootstrap theme for the Activity window.
+         Compose handles all in-app theming via MaterialTheme. -->
+    <style name="Theme.RenCamera" parent="Theme.AppCompat.DayNight.NoActionBar" />
+</resources>
