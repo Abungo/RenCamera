@@ -16,7 +16,7 @@
 #include "stages/encode_stage.h"
 
 #define LOG_TAG "RenCamera/JNI"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -250,43 +250,7 @@ Java_com_renskylab_camera_NativeEngine_saveRawBurst(
             std::vector<uint8_t> uvGray(pixelCount / 2, 128);
             saveYuvAsJpeg(previewY.data(), uvGray.data(), uvGray.data(), f.width, f.height, jpegFilePath);
         } else {
-            char filename[128];
-            snprintf(filename, sizeof(filename), "/frame_%02zu_%dx%d.yuv", i, f.width, f.height);
-            std::string filePath = path + filename;
-            
-            std::ofstream out(filePath, std::ios::binary);
-            if (!out) {
-                LOGE("saveRawBurst: failed to open file %s for writing", filePath.c_str());
-                return JNI_FALSE;
-            }
-            
-            // Write Y (planar, stride-free)
-            for (int r = 0; r < f.height; ++r) {
-                out.write(reinterpret_cast<const char*>(f.yData.data() + r * f.yRowStride), f.width);
-            }
-            
-            // Write U
-            int uvW = f.width / 2;
-            int uvH = f.height / 2;
-            for (int r = 0; r < uvH; ++r) {
-                const uint8_t* row = f.uData.data() + r * f.uvRowStride;
-                for (int c = 0; c < uvW; ++c) {
-                    uint8_t uVal = row[c * f.uvPixelStride];
-                    out.write(reinterpret_cast<const char*>(&uVal), 1);
-                }
-            }
-            
-            // Write V
-            for (int r = 0; r < uvH; ++r) {
-                const uint8_t* row = f.vData.data() + r * f.uvRowStride;
-                for (int c = 0; c < uvW; ++c) {
-                    uint8_t vVal = row[c * f.uvPixelStride];
-                    out.write(reinterpret_cast<const char*>(&vVal), 1);
-                }
-            }
-            out.close();
-
-            // Also save JPEG equivalent of the raw frame
+            // YUV frame: always save JPEG preview for inspection
             char jpegFilename[128];
             snprintf(jpegFilename, sizeof(jpegFilename), "/frame_%02zu_%dx%d.jpg", i, f.width, f.height);
             std::string jpegFilePath = path + jpegFilename;
@@ -296,6 +260,44 @@ Java_com_renskylab_camera_NativeEngine_saveRawBurst(
                 f.vData.data(), f.uvPixelStride,
                 f.width, f.height,
                 jpegFilePath);
+
+            // Raw YUV binary — only written when debug_raw_dumps flag is active.
+            // Note: saveRawBurst is currently called with useRaw determining RAW Bayer
+            // vs YUV; raw dump behaviour is controlled by the pipeline ctx in runNativeEngine.
+            // Keep false here unless saveRawBurst is extended with a debugRawDumps param.
+            bool rawDumps = g_debug_raw_dumps;
+            if (rawDumps) {
+                char filename[128];
+                snprintf(filename, sizeof(filename), "/frame_%02zu_%dx%d.yuv", i, f.width, f.height);
+                std::string filePath = path + filename;
+
+                std::ofstream out(filePath, std::ios::binary);
+                if (out) {
+                    // Write Y (planar, stride-free)
+                    for (int r = 0; r < f.height; ++r) {
+                        out.write(reinterpret_cast<const char*>(f.yData.data() + r * f.yRowStride), f.width);
+                    }
+                    // Write U
+                    int uvW = f.width / 2;
+                    int uvH = f.height / 2;
+                    for (int r = 0; r < uvH; ++r) {
+                        const uint8_t* row = f.uData.data() + r * f.uvRowStride;
+                        for (int c = 0; c < uvW; ++c) {
+                            uint8_t uVal = row[c * f.uvPixelStride];
+                            out.write(reinterpret_cast<const char*>(&uVal), 1);
+                        }
+                    }
+                    // Write V
+                    for (int r = 0; r < uvH; ++r) {
+                        const uint8_t* row = f.vData.data() + r * f.uvRowStride;
+                        for (int c = 0; c < uvW; ++c) {
+                            uint8_t vVal = row[c * f.uvPixelStride];
+                            out.write(reinterpret_cast<const char*>(&vVal), 1);
+                        }
+                    }
+                    out.close();
+                }
+            }
         }
     }
     LOGI("saveRawBurst: saved %zu frames to %s (useRaw = %d)", burst->frames.size(), path.c_str(), useRaw);
@@ -398,6 +400,20 @@ Java_com_renskylab_camera_NativeEngine_processCopiedBurst(
             LOGI("ISO override applied: %d", isoOverride);
         }
         ctx.metadata["use_raw_capture"] = static_cast<bool>(params[10] > 0.5f);
+        // debug_raw_dumps: when true, each stage also writes raw binary blobs (YUV/PPM)
+        // alongside JPEGs. Off by default (~94 MB extra I/O adds ~25 s).
+        if (env->GetArrayLength(configParams) > 11) {
+            ctx.metadata["debug_raw_dumps"] = static_cast<bool>(params[11] > 0.5f);
+        } else {
+            ctx.metadata["debug_raw_dumps"] = false;
+        }
+        // debug_images_enabled: master switch (handled in Kotlin by passing "" debug dir when off)
+        // Stored here in case native code needs to check it directly in future.
+        if (env->GetArrayLength(configParams) > 12) {
+            ctx.metadata["debug_images_enabled"] = static_cast<bool>(params[12] > 0.5f);
+        } else {
+            ctx.metadata["debug_images_enabled"] = true;
+        }
         env->ReleaseFloatArrayElements(configParams, params, JNI_ABORT);
     }
     
