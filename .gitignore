@@ -18,3 +18,5 @@ crash_log*.txt
 
 # Exclude Python folder as requested
 Python/
+halide_dist/
+halide_generators/
