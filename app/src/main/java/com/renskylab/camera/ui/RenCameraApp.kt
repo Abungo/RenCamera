@@ -590,7 +590,8 @@ private fun SettingsScreen(
                             exposureBias = -1.5f,
                             isoOverride = 0,
                             useRawCapture = true,
-                            normalModeIsoReductionFactor = 2.0f
+                            normalModeIsoReductionFactor = 2.0f,
+                            captureFrameCount = 15
                         ))
                     }
                 ) {
@@ -636,6 +637,17 @@ private fun SettingsScreen(
                         description = "Factor to reduce ISO and increase shutter speed in low-light normal mode captures. 1.0x disables shift. 2.0x halves ISO and doubles shutter time.",
                         onValueChange = { onConfigChange(config.copy(normalModeIsoReductionFactor = it)) },
                         onShowInfo = { infoDialogText = "Normal ISO Reduction Factor" to "In normal mode under lower lighting (viewfinder ISO > 400), this factor divides the ISO and multiplies the exposure time. Helps trade high-ISO digital noise for real physical photon capture." }
+                    )
+
+                    SliderSetting(
+                        label = "Capture Frame Count",
+                        value = config.captureFrameCount.toFloat(),
+                        valueRange = 5f..25f,
+                        steps = 20,
+                        valueFormatter = { "${it.toInt()} frames" },
+                        description = "Number of frames captured in the burst/ZSL stack. More frames = cleaner image but slower capture/processing.",
+                        onValueChange = { onConfigChange(config.copy(captureFrameCount = it.toInt())) },
+                        onShowInfo = { infoDialogText = "Capture Frame Count" to "Sets the number of frames to capture and align. Google Camera uses 15 frames by default. More frames yield higher signal-to-noise ratios in shadows, but require more processing time and memory." }
                     )
 
                     SwitchSetting(

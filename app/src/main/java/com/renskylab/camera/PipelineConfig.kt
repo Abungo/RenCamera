@@ -43,7 +43,10 @@ data class PipelineConfig(
     val debugImagesEnabled: Boolean = true,
 
     // Normal mode ISO reduction factor (e.g. 2.0f halves ISO and doubles exposure time)
-    val normalModeIsoReductionFactor: Float = 2.0f
+    val normalModeIsoReductionFactor: Float = 2.0f,
+
+    // Dynamic capture burst frame count (default is 15)
+    val captureFrameCount: Int = 15
 ) : Serializable {
 
     companion object {
@@ -78,6 +81,7 @@ data class PipelineConfig(
             var debugRawDumps = false
             var debugImagesEnabled = true
             var normalModeIsoReductionFactor = 2.0f
+            var captureFrameCount = 15
 
             val tagRegex = "<([^>]+)>([^<]*)</\\1>".toRegex()
             val matches = tagRegex.findAll(xml)
@@ -102,6 +106,7 @@ data class PipelineConfig(
                     "debugRawDumps" -> debugRawDumps = value.toBooleanStrictOrNull() ?: false
                     "debugImagesEnabled" -> debugImagesEnabled = value.toBooleanStrictOrNull() ?: true
                     "normalModeIsoReductionFactor" -> normalModeIsoReductionFactor = value.toFloatOrNull() ?: 2.0f
+                    "captureFrameCount" -> captureFrameCount = value.toIntOrNull() ?: 15
                     else -> {
                         if (tag.startsWith("stage_")) {
                             val stageName = tag.substringAfter("stage_")
@@ -128,7 +133,8 @@ data class PipelineConfig(
                 useRawCapture = useRawCapture,
                 debugRawDumps = debugRawDumps,
                 debugImagesEnabled = debugImagesEnabled,
-                normalModeIsoReductionFactor = normalModeIsoReductionFactor
+                normalModeIsoReductionFactor = normalModeIsoReductionFactor,
+                captureFrameCount = captureFrameCount
             )
         }
     }
@@ -148,7 +154,8 @@ data class PipelineConfig(
             if (useRawCapture) 1.0f else 0.0f,   // 10
             if (debugRawDumps) 1.0f else 0.0f,    // 11
             if (debugImagesEnabled) 1.0f else 0.0f, // 12
-            normalModeIsoReductionFactor               // 13
+            normalModeIsoReductionFactor,              // 13
+            captureFrameCount.toFloat()                // 14
         )
     }
 
@@ -180,6 +187,7 @@ data class PipelineConfig(
         sb.append("  <debugRawDumps>${debugRawDumps}</debugRawDumps>\n")
         sb.append("  <debugImagesEnabled>${debugImagesEnabled}</debugImagesEnabled>\n")
         sb.append("  <normalModeIsoReductionFactor>${normalModeIsoReductionFactor}</normalModeIsoReductionFactor>\n")
+        sb.append("  <captureFrameCount>${captureFrameCount}</captureFrameCount>\n")
         stageEnabled.forEach { (k, v) ->
             sb.append("  <stage_${k}>${v}</stage_${k}>\n")
         }

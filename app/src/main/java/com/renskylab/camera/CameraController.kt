@@ -430,14 +430,14 @@ class CameraController(
                 val numFrames: Int
 
                 if (isNight) {
-                    numFrames = 15
+                    numFrames = config.captureFrameCount
                     targetExposureTime = 125_000_000L // 125ms
                     val calculatedIso = (currentIso * (currentExposureTime.toDouble() / targetExposureTime.toDouble())).toInt()
                     targetIso = calculatedIso.coerceIn(50, currentIso)
                 } else {
                     // Normal mode: divide viewfinder ISO by the configured factor and keep shutter fast to prevent blur
                     val factor = config.normalModeIsoReductionFactor.toDouble()
-                    numFrames = 12
+                    numFrames = config.captureFrameCount
                     targetIso = (currentIso / factor).toInt().coerceIn(50, currentIso)
                     // Cap shutter speed at 1/60s (16.6ms) to prevent motion blur and handshake
                     targetExposureTime = currentExposureTime.coerceAtMost(16_666_667L)
@@ -514,10 +514,11 @@ class CameraController(
                     return@launch
                 }
 
-                val needed = 12
+                val needed = config.captureFrameCount
                 if (fullDrained.size > needed) {
                     val discard = fullDrained.size - needed
                     fullDrained.subList(0, discard).forEach { runCatching { it.image.close() } }
+                    fullDrained.subList(discard, fullDrained.size)
                     fullDrained.subList(discard, fullDrained.size)
                 } else {
                     fullDrained
