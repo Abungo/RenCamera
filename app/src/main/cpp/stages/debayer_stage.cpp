@@ -167,25 +167,33 @@ bool DebayerStage::process(FrameContext& ctx) {
                     bool isEvenCol = (c % 2 == 0);
 
                     if (isEvenRow && isEvenCol) {
-                        // Blue pixel
-                        R = (getRaw(c-1, r-1) + getRaw(c+1, r-1) + getRaw(c-1, r+1) + getRaw(c+1, r+1)) * 0.25;
-                        G = (getRaw(c, r-1) + getRaw(c, r+1) + getRaw(c-1, r) + getRaw(c+1, r)) * 0.25;
+                        // Blue pixel (BGGR)
                         B = getRaw(c, r);
+                        G = (getRaw(c-1, r) + getRaw(c+1, r) + getRaw(c, r-1) + getRaw(c, r+1)) * 0.25 + 
+                            (4.0 * getRaw(c, r) - getRaw(c-2, r) - getRaw(c+2, r) - getRaw(c, r-2) - getRaw(c, r+2)) * 0.125;
+                        R = (getRaw(c-1, r-1) + getRaw(c+1, r-1) + getRaw(c-1, r+1) + getRaw(c+1, r+1)) * 0.25 + 
+                            (6.0 * getRaw(c, r) - 1.5 * (getRaw(c-2, r) + getRaw(c+2, r) + getRaw(c, r-2) + getRaw(c, r+2))) * 0.0625;
                     } else if (!isEvenRow && !isEvenCol) {
                         // Red pixel
                         R = getRaw(c, r);
-                        G = (getRaw(c, r-1) + getRaw(c, r+1) + getRaw(c-1, r) + getRaw(c+1, r)) * 0.25;
-                        B = (getRaw(c-1, r-1) + getRaw(c+1, r-1) + getRaw(c-1, r+1) + getRaw(c+1, r+1)) * 0.25;
+                        G = (getRaw(c-1, r) + getRaw(c+1, r) + getRaw(c, r-1) + getRaw(c, r+1)) * 0.25 + 
+                            (4.0 * getRaw(c, r) - getRaw(c-2, r) - getRaw(c+2, r) - getRaw(c, r-2) - getRaw(c, r+2)) * 0.125;
+                        B = (getRaw(c-1, r-1) + getRaw(c+1, r-1) + getRaw(c-1, r+1) + getRaw(c+1, r+1)) * 0.25 + 
+                            (6.0 * getRaw(c, r) - 1.5 * (getRaw(c-2, r) + getRaw(c+2, r) + getRaw(c, r-2) + getRaw(c, r+2))) * 0.0625;
                     } else if (isEvenRow && !isEvenCol) {
                         // Green pixel on Blue row
-                        R = (getRaw(c, r-1) + getRaw(c, r+1)) * 0.5;
                         G = getRaw(c, r);
-                        B = (getRaw(c-1, r) + getRaw(c+1, r)) * 0.5;
+                        B = (getRaw(c-1, r) + getRaw(c+1, r)) * 0.5 + 
+                            (2.0 * getRaw(c, r) - getRaw(c-2, r) - getRaw(c+2, r)) * 0.125;
+                        R = (getRaw(c, r-1) + getRaw(c, r+1)) * 0.5 + 
+                            (2.0 * getRaw(c, r) - getRaw(c, r-2) - getRaw(c, r+2)) * 0.125;
                     } else {
                         // Green pixel on Red row
-                        R = (getRaw(c-1, r) + getRaw(c+1, r)) * 0.5;
                         G = getRaw(c, r);
-                        B = (getRaw(c, r-1) + getRaw(c, r+1)) * 0.5;
+                        R = (getRaw(c-1, r) + getRaw(c+1, r)) * 0.5 + 
+                            (2.0 * getRaw(c, r) - getRaw(c-2, r) - getRaw(c+2, r)) * 0.125;
+                        B = (getRaw(c, r-1) + getRaw(c, r+1)) * 0.5 + 
+                            (2.0 * getRaw(c, r) - getRaw(c, r-2) - getRaw(c, r+2)) * 0.125;
                     }
 
                     uint uR = uint(clamp(R, 0.0, 255.0));
