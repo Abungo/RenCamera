@@ -377,7 +377,7 @@ bool ToneMapStage::process(FrameContext& ctx) {
                 ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
                 if (pos.x >= u_width || pos.y >= u_height) return;
 
-                vec3 rgbVal = texelFetch(u_input_texture, pos, 0).rgb;
+                vec3 rgbVal = texelFetch(u_input_texture, pos, 0).rgb * 255.0;
                 float L = luma(rgbVal);
 
                 // Single-pass bilateral filter on the GPU to extract local low-frequency base layer
@@ -391,7 +391,7 @@ bool ToneMapStage::process(FrameContext& ctx) {
                 for (int dy = -radius; dy <= radius; dy += 2) {
                     for (int dx = -radius; dx <= radius; dx += 2) {
                         ivec2 nPos = clamp(pos + ivec2(dx, dy), ivec2(0), ivec2(u_width - 1, u_height - 1));
-                        vec3 nRgb = texelFetch(u_input_texture, nPos, 0).rgb;
+                        vec3 nRgb = texelFetch(u_input_texture, nPos, 0).rgb * 255.0;
                         float nL = luma(nRgb);
 
                         float dS2 = float(dx * dx + dy * dy);
