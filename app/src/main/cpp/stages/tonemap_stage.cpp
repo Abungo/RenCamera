@@ -288,7 +288,7 @@ bool ToneMapStage::process(FrameContext& ctx) {
         } catch (...) {}
     }
 
-    float detailAlpha = 1.15f;
+    float detailAlpha = 1.35f;
     if (ctx.metadata.count("detail_alpha")) {
         try {
             detailAlpha = std::any_cast<float>(ctx.metadata.at("detail_alpha"));
@@ -539,7 +539,7 @@ bool ToneMapStage::process(FrameContext& ctx) {
                     float spatial_sigma2 = 2.0 * u_spatial_sigma * u_spatial_sigma;
                     float range_sigma2 = 2.0 * u_range_sigma * u_range_sigma;
 
-                    int radius = 3;
+                    int radius = 2;
                     for (int dy = -radius; dy <= radius; ++dy) {
                         for (int dx = -radius; dx <= radius; ++dx) {
                             ivec2 nPos = clamp(pos + ivec2(dx, dy), ivec2(0), ivec2(u_width - 1, u_height - 1));
@@ -583,8 +583,8 @@ bool ToneMapStage::process(FrameContext& ctx) {
 
                 glUniform1i(glGetUniformLocation(denoiseProgram, "u_width"), w);
                 glUniform1i(glGetUniformLocation(denoiseProgram, "u_height"), h);
-                glUniform1f(glGetUniformLocation(denoiseProgram, "u_spatial_sigma"), 3.0f);
-                glUniform1f(glGetUniformLocation(denoiseProgram, "u_range_sigma"), 15.0f);
+                glUniform1f(glGetUniformLocation(denoiseProgram, "u_spatial_sigma"), 1.5f);
+                glUniform1f(glGetUniformLocation(denoiseProgram, "u_range_sigma"), 8.0f);
 
                 // Dispatch denoise compute shader
                 glDispatchCompute(static_cast<GLuint>((w + 15) / 16), static_cast<GLuint>((h + 15) / 16), 1);
