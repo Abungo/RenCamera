@@ -456,8 +456,8 @@ void main() {
 
         vec2 mv = texture(u_motion_fields, vec3(mv_uv, float(f - 1))).rg;
 
-        int dx = (int(mv.x) / 2) * 2;
-        int dy = (int(mv.y) / 2) * 2;
+        int dx = int(round(mv.x * 0.5)) * 2;
+        int dy = int(round(mv.y * 0.5)) * 2;
 
         ivec2 warped_pos = clamp(pos + ivec2(dx, dy), ivec2(0), ivec2(u_width - 1, u_height - 1));
         float warped_val = float(texelFetch(u_input_frames, ivec3(warped_pos, f), 0).r);
