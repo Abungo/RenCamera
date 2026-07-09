@@ -15,7 +15,8 @@ Thumbs.db
 crash_log*.txt
 *.jpg
 *.png
-
+*/*.txt
+*.txt
 # Exclude Python folder as requested
 Python/
 halide_dist/
