@@ -188,6 +188,11 @@ layout(std430, binding = 0) writeonly buffer OutputBuffer {
     uint outY[];
 };
 
+// Accumulate per-frame weights for chroma ghosting protection
+layout(std430, binding = 1) writeonly buffer WeightBuffer {
+    float outWeights[];
+};
+
 void main() {
     ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
     if (pos.x >= u_width || pos.y >= u_height) return;
@@ -196,10 +201,18 @@ void main() {
     float h_inv = 1.0 / float(u_height);
     vec2 uv = (vec2(pos) + 0.5) * vec2(w_inv, h_inv);
 
-    float ref_val = texture(u_input_frames, vec3(uv, 0.0)).r * 255.0;
+    // Sample 3x3 patch for reference luma (robust against single-pixel noise)
+    float ref_val = 0.0;
+    for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            vec2 p_uv = (vec2(pos) + vec2(dx, dy) + 0.5) * vec2(w_inv, h_inv);
+            ref_val += texture(u_input_frames, vec3(p_uv, 0.0)).r * 255.0;
+        }
+    ref_val /= 9.0;
 
-    float acc = ref_val;
+    float acc = texture(u_input_frames, vec3(uv, 0.0)).r * 255.0;
     float wgt = 1.0;
+    float total_frame_weight = 1.0; // weight contribution for chroma (frame 0 = 1)
 
     for (int f = 1; f < u_num_frames; ++f) {
         float bx = (float(pos.x) - u_block_size * 0.5) / u_block_size;
@@ -208,8 +221,14 @@ void main() {
 
         vec2 mv = texture(u_motion_fields, vec3(mv_uv, float(f - 1))).rg;
 
-        vec2 warped_uv = (vec2(pos) + mv + 0.5) * vec2(w_inv, h_inv);
-        float warped_val = texture(u_input_frames, vec3(warped_uv, float(f))).r * 255.0;
+        // Sample 3x3 patch for warped luma to reduce noise sensitivity
+        float warped_val = 0.0;
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                vec2 p_uv = (vec2(pos) + mv + vec2(dx, dy) + 0.5) * vec2(w_inv, h_inv);
+                warped_val += texture(u_input_frames, vec3(p_uv, float(f))).r * 255.0;
+            }
+        warped_val /= 9.0;
 
         float residual = warped_val - ref_val;
 
@@ -218,20 +237,30 @@ void main() {
 
         float w_val = exp(-residual * residual * inv_2sigma2);
 
-        acc += warped_val * w_val;
+        // Hard ghost rejection: clamp near-zero weights to exactly 0
+        w_val = (w_val < 0.05) ? 0.0 : w_val;
+
+        // Sample center pixel (not patch) for accumulation quality
+        float center_warped = texture(u_input_frames, vec3((vec2(pos) + mv + 0.5) * vec2(w_inv, h_inv), float(f))).r * 255.0;
+        acc += center_warped * w_val;
         wgt += w_val;
+        total_frame_weight += w_val;
     }
 
     float fused_val = (wgt > 1e-6) ? acc / wgt : acc;
 
     uint idx = uint(pos.y * u_width + pos.x);
     outY[idx] = uint(clamp(fused_val, 0.0, 255.0));
+
+    // Write normalized frame weight (0=fully ghosted, 1=all frames accepted)
+    outWeights[idx] = total_frame_weight / float(u_num_frames);
 }
 )glsl";
 
 static void fuseYPlane(const std::vector<YuvFrame>& frames,
                        const std::vector<MotionField>& motionFields,
                        std::vector<uint8_t>& outY,
+                       std::vector<float>& outWeights,
                        int w, int h,
                        const std::vector<std::vector<float>>& inv_2sigma2_luts,
                        const std::string& debugDir)
@@ -323,12 +352,19 @@ static void fuseYPlane(const std::vector<YuvFrame>& frames,
             glUniform1i(glGetUniformLocation(program, "u_blocks_tall"), blocksTall);
             glUniform1f(glGetUniformLocation(program, "u_block_size"), static_cast<float>(blockSize));
 
-            // Set up output SSBO (4 bytes per element std430 uint array for wide driver support)
+            // Set up output SSBO (binding=0): fused Y plane
             GLuint outBuffer;
             glGenBuffers(1, &outBuffer);
             glBindBuffer(GL_SHADER_STORAGE_BUFFER, outBuffer);
             glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<size_t>(w) * h * 4, nullptr, GL_DYNAMIC_READ);
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outBuffer);
+
+            // Set up weight SSBO (binding=1): per-pixel frame acceptance weights for chroma ghosting
+            GLuint weightBuffer;
+            glGenBuffers(1, &weightBuffer);
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, weightBuffer);
+            glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<size_t>(w) * h * sizeof(float), nullptr, GL_DYNAMIC_READ);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, weightBuffer);
 
             checkGlError("resource binding", errorLog);
 
@@ -338,7 +374,8 @@ static void fuseYPlane(const std::vector<YuvFrame>& frames,
 
             checkGlError("dispatch", errorLog);
 
-            // Map and retrieve output
+            // Map and retrieve Y output
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, outBuffer);
             void* ptr = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, static_cast<size_t>(w) * h * 4, GL_MAP_READ_BIT);
             if (ptr != nullptr) {
                 const uint32_t* results = static_cast<const uint32_t*>(ptr);
@@ -347,6 +384,19 @@ static void fuseYPlane(const std::vector<YuvFrame>& frames,
                     outY[i] = static_cast<uint8_t>(results[i]);
                 }
                 glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+
+                // Map and retrieve weight output
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, weightBuffer);
+                void* wptr = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, static_cast<size_t>(w) * h * sizeof(float), GL_MAP_READ_BIT);
+                if (wptr != nullptr) {
+                    outWeights.resize(static_cast<size_t>(w) * h);
+                    std::memcpy(outWeights.data(), wptr, outWeights.size() * sizeof(float));
+                    glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+                } else {
+                    // Weight readback failed - fill with 1.0 (accept all)
+                    outWeights.assign(static_cast<size_t>(w) * h, 1.0f);
+                }
+
                 success = true;
                 logMsg = "fuseYPlane: Headless OpenGL ES 3.1 compute shader executed successfully.\n";
             } else {
@@ -356,6 +406,7 @@ static void fuseYPlane(const std::vector<YuvFrame>& frames,
 
             // Cleanup resources
             glDeleteBuffers(1, &outBuffer);
+            glDeleteBuffers(1, &weightBuffer);
             glDeleteTextures(1, &inputFramesTex);
             glDeleteTextures(1, &motionFieldsTex);
             glDeleteTextures(1, &noiseLutsTex);
@@ -374,6 +425,8 @@ static void fuseYPlane(const std::vector<YuvFrame>& frames,
                       refFrame.yPlane + r * refFrame.yRowStride + w,
                       outY.data() + r * w);
         }
+        // Weights unavailable - fill with 1.0 (accept all, fallback mode)
+        outWeights.assign(static_cast<size_t>(w) * h, 1.0f);
     }
 
     auto tEnd = std::chrono::high_resolution_clock::now();
@@ -393,22 +446,66 @@ static void fuseYPlane(const std::vector<YuvFrame>& frames,
     }
 }
 
-/// Simple nearest-neighbour chroma fusion (average of all frames, no motion).
-/// Chroma detail at half-res contributes little to perceived sharpness.
+/// Chroma fusion weighted by luma ghost-rejection weights.
+/// Pixels where luma rejected frames (weight < threshold) fall back to reference frame chroma.
 static void fuseChromaPlane(const std::vector<YuvFrame>& frames,
                              const std::vector<MotionField>& motionFields,
                              bool isU,
                              std::vector<uint8_t>& out,
                              int uvW, int uvH,
-                             const std::vector<std::vector<float>>& inv_2sigma2_luts)
+                             const std::vector<std::vector<float>>& inv_2sigma2_luts,
+                             const std::vector<float>& lumaWeights,
+                             int lumaW, int lumaH)
 {
     auto tStart = std::chrono::high_resolution_clock::now();
     const YuvFrame& ref = frames[0];
-    const uint8_t* plane = isU ? ref.uPlane : ref.vPlane;
+    const uint8_t* refPlane = isU ? ref.uPlane : ref.vPlane;
     out.resize(static_cast<size_t>(uvW) * uvH);
+
+    // Threshold: if luma weight < 0.5, more than half the frames were ghosted -> use reference only
+    const float ghostThreshold = 0.5f;
+
     for (int r = 0; r < uvH; ++r) {
         for (int c = 0; c < uvW; ++c) {
-            out[r * uvW + c] = plane[r * ref.uvRowStride + c * ref.uvPixelStride];
+            // Map chroma pixel to luma pixel (2x scale)
+            int lumaR = std::min(r * 2, lumaH - 1);
+            int lumaC = std::min(c * 2, lumaW - 1);
+            float lumaWeight = lumaWeights[lumaR * lumaW + lumaC];
+
+            if (lumaWeight < ghostThreshold || frames.size() <= 1) {
+                // Ghosted region: use reference frame only
+                out[r * uvW + c] = refPlane[r * ref.uvRowStride + c * ref.uvPixelStride];
+            } else {
+                // Safe region: blend motion-compensated chroma from all accepted frames
+                float acc = static_cast<float>(refPlane[r * ref.uvRowStride + c * ref.uvPixelStride]);
+                float wgt = 1.0f;
+                int blocksWide = motionFields[0].blocksWide;
+                int blocksTall = motionFields[0].blocksTall;
+                int blockSize   = motionFields[0].blockSize;
+
+                for (int f = 1; f < (int)frames.size(); ++f) {
+                    const YuvFrame& fr = frames[f];
+                    const uint8_t* frPlane = isU ? fr.uPlane : fr.vPlane;
+                    const MotionField& mf = motionFields[f - 1];
+
+                    // Look up motion vector at this chroma pixel's luma position
+                    int bx = std::clamp(lumaC / blockSize, 0, blocksWide - 1);
+                    int by = std::clamp(lumaR / blockSize, 0, blocksTall - 1);
+                    MotionVec mv = mf.vectors[by * blocksWide + bx];
+
+                    // Halve motion vectors for chroma (half-resolution)
+                    int cdx = static_cast<int>(std::round(mv.dx * 0.5f));
+                    int cdy = static_cast<int>(std::round(mv.dy * 0.5f));
+
+                    int sc = std::clamp(c + cdx, 0, uvW - 1);
+                    int sr = std::clamp(r + cdy, 0, uvH - 1);
+
+                    float val = static_cast<float>(frPlane[sr * fr.uvRowStride + sc * fr.uvPixelStride]);
+                    acc += val;
+                    wgt += 1.0f;
+                }
+                out[r * uvW + c] = static_cast<uint8_t>(std::clamp(acc / wgt, 0.f, 255.f));
+            }
         }
     }
     auto tEnd = std::chrono::high_resolution_clock::now();
@@ -444,9 +541,16 @@ void main() {
     ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
     if (pos.x >= u_width || pos.y >= u_height) return;
 
-    float ref_val = float(texelFetch(u_input_frames, ivec3(pos, 0), 0).r);
+    // Sample a 2x2 Bayer-aligned patch for patch-based residual computation
+    float ref_val = 0.0;
+    for (int dy = -2; dy <= 2; dy += 2)
+        for (int dx = -2; dx <= 2; dx += 2) {
+            ivec2 p = clamp(pos + ivec2(dx, dy), ivec2(0), ivec2(u_width-1, u_height-1));
+            ref_val += float(texelFetch(u_input_frames, ivec3(p, 0), 0).r);
+        }
+    ref_val /= 9.0;
 
-    float acc = ref_val;
+    float acc = float(texelFetch(u_input_frames, ivec3(pos, 0), 0).r);
     float wgt = 1.0;
 
     for (int f = 1; f < u_num_frames; ++f) {
@@ -456,11 +560,18 @@ void main() {
 
         vec2 mv = texture(u_motion_fields, vec3(mv_uv, float(f - 1))).rg;
 
+        // Round to nearest Bayer-aligned 2-pixel boundary
         int dx = int(round(mv.x * 0.5)) * 2;
         int dy = int(round(mv.y * 0.5)) * 2;
 
-        ivec2 warped_pos = clamp(pos + ivec2(dx, dy), ivec2(0), ivec2(u_width - 1, u_height - 1));
-        float warped_val = float(texelFetch(u_input_frames, ivec3(warped_pos, f), 0).r);
+        // Patch-based residual for robustness
+        float warped_val = 0.0;
+        for (int pdy = -2; pdy <= 2; pdy += 2)
+            for (int pdx = -2; pdx <= 2; pdx += 2) {
+                ivec2 p = clamp(pos + ivec2(dx + pdx, dy + pdy), ivec2(0), ivec2(u_width-1, u_height-1));
+                warped_val += float(texelFetch(u_input_frames, ivec3(p, f), 0).r);
+            }
+        warped_val /= 9.0;
 
         float residual = warped_val - ref_val;
 
@@ -469,7 +580,13 @@ void main() {
 
         float w_val = exp(-residual * residual * inv_2sigma2);
 
-        acc += warped_val * w_val;
+        // Hard ghost rejection: clamp near-zero weights to exactly 0
+        w_val = (w_val < 0.05) ? 0.0 : w_val;
+
+        // Accumulate center pixel only
+        ivec2 center_warped_pos = clamp(pos + ivec2(dx, dy), ivec2(0), ivec2(u_width - 1, u_height - 1));
+        float center_warped = float(texelFetch(u_input_frames, ivec3(center_warped_pos, f), 0).r);
+        acc += center_warped * w_val;
         wgt += w_val;
     }
 
@@ -789,9 +906,10 @@ bool FusionStage::process(FrameContext& ctx) {
         if (ctx.metadata.count("debug_dir")) {
             try { debugDir = std::any_cast<std::string>(ctx.metadata.at("debug_dir")); } catch (...) {}
         }
-        fuseYPlane(ctx.inputFrames, ctx.motionFields, ctx.fusedY, w, h, inv_2sigma2_luts, debugDir);
-        fuseChromaPlane(ctx.inputFrames, ctx.motionFields, /*isU=*/true,  ctx.fusedU, uvW, uvH, inv_2sigma2_luts);
-        fuseChromaPlane(ctx.inputFrames, ctx.motionFields, /*isU=*/false, ctx.fusedV, uvW, uvH, inv_2sigma2_luts);
+        std::vector<float> lumaWeights;
+        fuseYPlane(ctx.inputFrames, ctx.motionFields, ctx.fusedY, lumaWeights, w, h, inv_2sigma2_luts, debugDir);
+        fuseChromaPlane(ctx.inputFrames, ctx.motionFields, /*isU=*/true,  ctx.fusedU, uvW, uvH, inv_2sigma2_luts, lumaWeights, w, h);
+        fuseChromaPlane(ctx.inputFrames, ctx.motionFields, /*isU=*/false, ctx.fusedV, uvW, uvH, inv_2sigma2_luts, lumaWeights, w, h);
 
         bool chromaDenoise = true;
         if (ctx.metadata.count("chroma_denoise_enabled")) {
