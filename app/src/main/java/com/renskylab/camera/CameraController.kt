@@ -95,6 +95,7 @@ class CameraController(
     @Volatile private var lastTexture: android.graphics.SurfaceTexture? = null
     @Volatile private var useRawCapture: Boolean = false
     @Volatile private var currentIso: Int = 400
+    @Volatile private var currentExposureTime: Long = 33_333_333L
     @Volatile private var isCapturingPsl = false
     private val rawBufferPool = ArrayList<ByteBuffer>()
 
@@ -368,6 +369,10 @@ class CameraController(
                 if (iso != null) {
                     currentIso = iso
                 }
+                val expTime = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                if (expTime != null) {
+                    currentExposureTime = expTime
+                }
                 val ts = result.get(CaptureResult.SENSOR_TIMESTAMP)
                 if (ts != null) {
                     pendingMetadata[ts] = result
@@ -405,15 +410,21 @@ class CameraController(
                 isCapturingPsl = true
                 ringBuffer.flush() // Clear preview frames
 
+                // Dynamically calculate optimal ISO for 125ms target exposure based on viewfinder exposure
+                val targetExposureTime = 125_000_000L // 125ms
+                val calculatedIso = (currentIso * (currentExposureTime.toDouble() / targetExposureTime.toDouble())).toInt()
+                val targetIso = calculatedIso.coerceIn(50, currentIso)
+                Log.i(TAG, "Dynamic ISO calculation: viewfinderIso=$currentIso, viewfinderExp=${currentExposureTime / 1_000_000}ms -> targetIso=$targetIso")
+
                 // Create a manual still capture burst to collect massive light
                 val requests = List(15) {
                     cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                         addTarget(imageReader!!.surface)
                         set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
                         // Request 125ms per-frame exposure time (1/8s)
-                        set(CaptureRequest.SENSOR_EXPOSURE_TIME, 125_000_000L)
-                        // Target ISO based on scene exposure, minimum ISO 50
-                        set(CaptureRequest.SENSOR_SENSITIVITY, currentIso.coerceAtLeast(50))
+                        set(CaptureRequest.SENSOR_EXPOSURE_TIME, targetExposureTime)
+                        // Target calculated dynamic ISO
+                        set(CaptureRequest.SENSOR_SENSITIVITY, targetIso)
                         set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                     }.build()
                 }
