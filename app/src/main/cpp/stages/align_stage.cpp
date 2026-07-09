@@ -5,6 +5,8 @@
 #include <climits>
 #include <vector>
 
+#include <arm_neon.h>
+
 // Highway SIMD — processes the Gaussian blur inner loop
 #include <hwy/highway.h>
 namespace hn = hwy::HWY_NAMESPACE;
@@ -12,8 +14,8 @@ namespace hn = hwy::HWY_NAMESPACE;
 namespace {
 
 static constexpr int BLOCK_SIZE    = 16;  // pixels per alignment block
-static constexpr int SEARCH_RANGE  =  8;  // ±pixels at coarsest pyramid level
-static constexpr int REFINE_RANGE  =  2;  // ±pixels at finer levels
+static constexpr int SEARCH_RANGE  = 16;  // ±pixels at coarsest pyramid level
+static constexpr int REFINE_RANGE  =  4;  // ±pixels at finer levels
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -123,6 +125,26 @@ static Pyramid buildPyramid(FloatImage base) {
 // Block matching — returns integer (dx, dy) in `level`-resolution pixels
 // ─────────────────────────────────────────────────────────────────────────────
 
+static inline int computeSSD_NEON(const float* ref, const float* src, int len) {
+    float32x4_t sum_vec = vdupq_n_f32(0.f);
+    int i = 0;
+    for (; i <= len - 4; i += 4) {
+        float32x4_t r_val = vld1q_f32(ref + i);
+        float32x4_t s_val = vld1q_f32(src + i);
+        float32x4_t diff = vsubq_f32(r_val, s_val);
+        sum_vec = vmlaq_f32(sum_vec, diff, diff);
+    }
+    float sum_arr[4];
+    vst1q_f32(sum_arr, sum_vec);
+    float total = sum_arr[0] + sum_arr[1] + sum_arr[2] + sum_arr[3];
+    int ssd = static_cast<int>(total);
+    for (; i < len; ++i) {
+        float diff = ref[i] - src[i];
+        ssd += static_cast<int>(diff * diff);
+    }
+    return ssd;
+}
+
 static MotionVec matchBlock(
     const FloatImage& ref,
     const FloatImage& src,
@@ -159,10 +181,7 @@ static MotionVec matchBlock(
             const float* srcRow = src.ptr(srcY);
             int startRefX = bx * blockPx;
             int startSrcX = startRefX + hint.dx;
-            for (int rx = 0; rx < blockPx; ++rx) {
-                float diff = refRow[startRefX + rx] - srcRow[startSrcX + rx];
-                hintSSD += static_cast<int>(diff * diff);
-            }
+            hintSSD += computeSSD_NEON(refRow + startRefX, srcRow + startSrcX, blockPx);
         }
         bestSSD = hintSSD;
         bestCost = hintSSD; // Hint has dx=0, dy=0 relative to itself, so penalty = 0
@@ -187,10 +206,7 @@ static MotionVec matchBlock(
                     int startRefX = bx * blockPx;
                     int startSrcX = startRefX + tdx;
                     
-                    for (int rx = 0; rx < blockPx; ++rx) {
-                        float diff = refRow[startRefX + rx] - srcRow[startSrcX + rx];
-                        ssd += static_cast<int>(diff * diff);
-                    }
+                    ssd += computeSSD_NEON(refRow + startRefX, srcRow + startSrcX, blockPx);
                     if (ssd + penalty >= bestCost) break; // Early exit
                 }
                 
