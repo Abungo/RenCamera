@@ -25,7 +25,14 @@ echo "2. Running generator to produce Android ARM64 library..."
     -o "${OUTPUT_DIR}" \
     -e static_library,h \
     -f temporal_fusion \
-    target=arm-64-android-armv8a-no_asserts
+    target=arm-64-android-armv8a-no_asserts-vulkan-no_runtime,arm-64-android-armv8a-no_asserts-no_runtime
+
+echo "3. Running generator to produce standalone multi-target Halide runtime..."
+"${GENERATOR_DIR}/fusion_gen" \
+    -r halide_runtime \
+    -o "${OUTPUT_DIR}" \
+    -e static_library,h \
+    target=arm-64-android-armv8a-no_asserts-vulkan,arm-64-android-armv8a-no_asserts
 
 echo "Halide compilation completed successfully!"
 ls -la "${OUTPUT_DIR}"

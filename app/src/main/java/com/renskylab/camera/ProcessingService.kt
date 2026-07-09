@@ -159,21 +159,34 @@ class ProcessingService : Service() {
             java.io.File(rawDir, "stage_1_fusion").mkdirs()
             java.io.File(rawDir, "stage_2_debayer").mkdirs()
             java.io.File(rawDir, "stage_3_tonemap").mkdirs()
-            // Log.i(TAG, "Saving raw frames to ${rawDir.absolutePath}")
-            // NativeEngine.saveRawBurst(job.nativeBurstHandle, rawDir.absolutePath, job.config.useRawCapture)
-
-            val jpegBytes = runNativeEngine(
-                job.nativeBurstHandle,
-                job.config,
-                job.iso,
-                job.frameIsos,
-                if (job.config.debugImagesEnabled) rawDir.absolutePath else "", // master debug toggle
-                object : NativeEngine.ProgressListener {
-                    override fun onProgress(step: String, percentage: Int) {
-                        updateNotification(step, percentage)
+            val jpegBytes = coroutineScope {
+                val saveDeferred = if (job.config.debugImagesEnabled) {
+                    async(Dispatchers.IO) {
+                        Log.i(TAG, "Saving raw frames in background to ${rawDir.absolutePath}")
+                        NativeEngine.saveRawBurst(job.nativeBurstHandle, rawDir.absolutePath, job.config.useRawCapture, job.config.debugRawDumps)
                     }
+                } else {
+                    null
                 }
-            )
+
+                val pipelineDeferred = async(Dispatchers.Default) {
+                    runNativeEngine(
+                        job.nativeBurstHandle,
+                        job.config,
+                        job.iso,
+                        job.frameIsos,
+                        if (job.config.debugImagesEnabled) rawDir.absolutePath else "", // master debug toggle
+                        object : NativeEngine.ProgressListener {
+                            override fun onProgress(step: String, percentage: Int) {
+                                updateNotification(step, percentage)
+                            }
+                        }
+                    )
+                }
+
+                saveDeferred?.await()
+                pipelineDeferred.await()
+            }
             if (jpegBytes != null) {
                 val uri = PhotoSaver.save(this, jpegBytes, filename)
                 if (uri != null) {

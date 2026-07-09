@@ -5,6 +5,8 @@
 #include <any>
 #include <fstream>
 #include <cstdio>
+#include <thread>
+#include <atomic>
 
 #include "pipeline.h"
 #include "frame_context.h"
@@ -128,22 +130,22 @@ Java_com_renskylab_camera_NativeEngine_copyBurst(
         }
 
         jlong yLength = env->GetDirectBufferCapacity(yBuf);
-        if (yLength <= 0) {
-            yLength = static_cast<jlong>(yStrides[i]) * height;
-        }
-        if (yLength < 0) yLength = 0;
+        jlong expectedYLength = static_cast<jlong>(yStrides[i]) * height;
+        if (yLength <= 0) yLength = expectedYLength;
+        jlong copyY = std::min(yLength, expectedYLength);
+        if (copyY < 0) copyY = 0;
 
         jlong uLength = env->GetDirectBufferCapacity(uBuf);
-        if (uLength <= 0) {
-            uLength = static_cast<jlong>(uvRStride[i]) * (height / 2);
-        }
-        if (uLength < 0) uLength = 0;
+        jlong expectedULength = static_cast<jlong>(uvRStride[i]) * (height / 2);
+        if (uLength <= 0) uLength = expectedULength;
+        jlong copyU = std::min(uLength, expectedULength);
+        if (copyU < 0) copyU = 0;
 
         jlong vLength = env->GetDirectBufferCapacity(vBuf);
-        if (vLength <= 0) {
-            vLength = static_cast<jlong>(uvRStride[i]) * (height / 2);
-        }
-        if (vLength < 0) vLength = 0;
+        jlong expectedVLength = static_cast<jlong>(uvRStride[i]) * (height / 2);
+        if (vLength <= 0) vLength = expectedVLength;
+        jlong copyV = std::min(vLength, expectedVLength);
+        if (copyV < 0) copyV = 0;
 
         CopiedFrame& f = burst->frames[i];
         f.width = width;
@@ -152,10 +154,21 @@ Java_com_renskylab_camera_NativeEngine_copyBurst(
         f.uvRowStride = uvRStride[i];
         f.uvPixelStride = uvPStride[i];
 
-        // Allocate and copy data
-        f.yData.assign(yPtr, yPtr + yLength);
-        f.uData.assign(uPtr, uPtr + uLength);
-        f.vData.assign(vPtr, vPtr + vLength);
+        // Allocate and copy data safely, zero-padding if capacity is smaller than strides
+        f.yData.assign(yPtr, yPtr + copyY);
+        if (f.yData.size() < static_cast<size_t>(expectedYLength)) {
+            f.yData.resize(expectedYLength, 0);
+        }
+
+        f.uData.assign(uPtr, uPtr + copyU);
+        if (f.uData.size() < static_cast<size_t>(expectedULength)) {
+            f.uData.resize(expectedULength, 0);
+        }
+
+        f.vData.assign(vPtr, vPtr + copyV);
+        if (f.vData.size() < static_cast<size_t>(expectedVLength)) {
+            f.vData.resize(expectedVLength, 0);
+        }
 
         env->DeleteLocalRef(yBuf);
         env->DeleteLocalRef(uBuf);
@@ -186,7 +199,8 @@ Java_com_renskylab_camera_NativeEngine_saveRawBurst(
     JNIEnv* env, jobject /* thiz */,
     jlong handle,
     jstring dirPathStr,
-    jboolean useRaw)
+    jboolean useRaw,
+    jboolean debugRawDumps)
 {
     auto* burst = reinterpret_cast<CopiedBurst*>(handle);
     if (!burst || burst->frames.empty()) {
@@ -198,108 +212,127 @@ Java_com_renskylab_camera_NativeEngine_saveRawBurst(
     std::string path(dirPath);
     env->ReleaseStringUTFChars(dirPathStr, dirPath);
 
+    std::atomic<bool> success{true};
+    std::vector<std::thread> threads;
+    threads.reserve(burst->frames.size());
+
     for (size_t i = 0; i < burst->frames.size(); ++i) {
-        const CopiedFrame& f = burst->frames[i];
-        
-        if (useRaw) {
-            char filename[128];
-            snprintf(filename, sizeof(filename), "/frame_%02zu_%dx%d.raw", i, f.width, f.height);
-            std::string filePath = path + filename;
+        threads.emplace_back([&path, useRaw, debugRawDumps, &success, burst, i]() {
+            const CopiedFrame& f = burst->frames[i];
             
-            std::ofstream out(filePath, std::ios::binary);
-            if (!out) {
-                LOGE("saveRawBurst: failed to open file %s for writing", filePath.c_str());
-                return JNI_FALSE;
-            }
-            out.write(reinterpret_cast<const char*>(f.yData.data()), f.yData.size());
-            out.close();
-
-            // Create a grayscale JPEG preview representing the RAW sensor frame
-            char jpegFilename[128];
-            snprintf(jpegFilename, sizeof(jpegFilename), "/frame_%02zu_%dx%d.jpg", i, f.width, f.height);
-            std::string jpegFilePath = path + jpegFilename;
-
-            // Compute normalized 8-bit Y plane from 16-bit raw data
-            int pixelCount = f.width * f.height;
-            std::vector<uint8_t> previewY(pixelCount);
-            const uint16_t* rawData = reinterpret_cast<const uint16_t*>(f.yData.data());
-            
-            // Sony default: black = 1024, white = 4095
-            float blackLevel = 1024.f;
-            float whiteLevel = 4095.f;
-            
-            // Dynamically check range to support different bit depths in preview
-            uint16_t maxVal = 0;
-            for (int p = 0; p < std::min(pixelCount, 10000); ++p) {
-                if (rawData[p] > maxVal) maxVal = rawData[p];
-            }
-            if (maxVal <= 1023) {
-                blackLevel = 64.f;
-                whiteLevel = 1023.f;
-            }
-
-            float scale = 255.f / std::max(1.f, whiteLevel - blackLevel);
-            int strideElements = f.yRowStride / 2;
-            for (int r = 0; r < f.height; ++r) {
-                for (int c = 0; c < f.width; ++c) {
-                    float cleanVal = (static_cast<float>(rawData[r * strideElements + c]) - blackLevel) * scale;
-                    previewY[r * f.width + c] = static_cast<uint8_t>(std::clamp(cleanVal, 0.f, 255.f));
-                }
-            }
-
-            std::vector<uint8_t> uvGray(pixelCount / 2, 128);
-            saveYuvAsJpeg(previewY.data(), uvGray.data(), uvGray.data(), f.width, f.height, jpegFilePath);
-        } else {
-            // YUV frame: always save JPEG preview for inspection
-            char jpegFilename[128];
-            snprintf(jpegFilename, sizeof(jpegFilename), "/frame_%02zu_%dx%d.jpg", i, f.width, f.height);
-            std::string jpegFilePath = path + jpegFilename;
-            saveStridedYuvAsJpeg(
-                f.yData.data(), f.yRowStride,
-                f.uData.data(), f.uvRowStride,
-                f.vData.data(), f.uvPixelStride,
-                f.width, f.height,
-                jpegFilePath);
-
-            // Raw YUV binary — only written when debug_raw_dumps flag is active.
-            // Note: saveRawBurst is currently called with useRaw determining RAW Bayer
-            // vs YUV; raw dump behaviour is controlled by the pipeline ctx in runNativeEngine.
-            // Keep false here unless saveRawBurst is extended with a debugRawDumps param.
-            bool rawDumps = g_debug_raw_dumps;
-            if (rawDumps) {
+            if (useRaw) {
                 char filename[128];
-                snprintf(filename, sizeof(filename), "/frame_%02zu_%dx%d.yuv", i, f.width, f.height);
+                snprintf(filename, sizeof(filename), "/frame_%02zu_%dx%d.raw", i, f.width, f.height);
                 std::string filePath = path + filename;
-
+                
                 std::ofstream out(filePath, std::ios::binary);
-                if (out) {
-                    // Write Y (planar, stride-free)
-                    for (int r = 0; r < f.height; ++r) {
-                        out.write(reinterpret_cast<const char*>(f.yData.data() + r * f.yRowStride), f.width);
+                if (!out) {
+                    LOGE("saveRawBurst: failed to open file %s for writing", filePath.c_str());
+                    success = false;
+                    return;
+                }
+                out.write(reinterpret_cast<const char*>(f.yData.data()), f.yData.size());
+                out.close();
+
+                // Create a grayscale JPEG preview representing the RAW sensor frame
+                char jpegFilename[128];
+                snprintf(jpegFilename, sizeof(jpegFilename), "/frame_%02zu_%dx%d.jpg", i, f.width, f.height);
+                std::string jpegFilePath = path + jpegFilename;
+
+                // Compute normalized 8-bit Y plane from 16-bit raw data
+                int pixelCount = f.width * f.height;
+                std::vector<uint8_t> previewY(pixelCount);
+                const uint16_t* rawData = reinterpret_cast<const uint16_t*>(f.yData.data());
+                
+                // Sony default: black = 1024, white = 4095
+                float blackLevel = 1024.f;
+                float whiteLevel = 4095.f;
+                
+                // Dynamically check range to support different bit depths in preview
+                uint16_t maxVal = 0;
+                for (int p = 0; p < std::min(pixelCount, 10000); ++p) {
+                    if (rawData[p] > maxVal) maxVal = rawData[p];
+                }
+                if (maxVal <= 1023) {
+                    blackLevel = 64.f;
+                    whiteLevel = 1023.f;
+                }
+
+                uint8_t lut[65536];
+                float scale = 255.f / std::max(1.f, whiteLevel - blackLevel);
+                for (int val = 0; val < 65536; ++val) {
+                    float cleanVal = (static_cast<float>(val) - blackLevel) * scale;
+                    lut[val] = static_cast<uint8_t>(std::clamp(cleanVal, 0.f, 255.f));
+                }
+
+                int strideElements = f.yRowStride / 2;
+                for (int r = 0; r < f.height; ++r) {
+                    const uint16_t* rowStart = rawData + r * strideElements;
+                    uint8_t* destStart = previewY.data() + r * f.width;
+                    for (int c = 0; c < f.width; ++c) {
+                        destStart[c] = lut[rowStart[c]];
                     }
-                    // Write U
-                    int uvW = f.width / 2;
-                    int uvH = f.height / 2;
-                    for (int r = 0; r < uvH; ++r) {
-                        const uint8_t* row = f.uData.data() + r * f.uvRowStride;
-                        for (int c = 0; c < uvW; ++c) {
-                            uint8_t uVal = row[c * f.uvPixelStride];
-                            out.write(reinterpret_cast<const char*>(&uVal), 1);
+                }
+
+                std::vector<uint8_t> uvGray(pixelCount / 2, 128);
+                saveYuvAsJpeg(previewY.data(), uvGray.data(), uvGray.data(), f.width, f.height, jpegFilePath);
+            } else {
+                // YUV frame: always save JPEG preview for inspection
+                char jpegFilename[128];
+                snprintf(jpegFilename, sizeof(jpegFilename), "/frame_%02zu_%dx%d.jpg", i, f.width, f.height);
+                std::string jpegFilePath = path + jpegFilename;
+                saveStridedYuvAsJpeg(
+                    f.yData.data(), f.yRowStride,
+                    f.uData.data(), f.uvRowStride,
+                    f.vData.data(), f.uvPixelStride,
+                    f.width, f.height,
+                    jpegFilePath);
+
+                // Raw YUV binary — only written when debug_raw_dumps flag is active.
+                if (debugRawDumps) {
+                    char filename[128];
+                    snprintf(filename, sizeof(filename), "/frame_%02zu_%dx%d.yuv", i, f.width, f.height);
+                    std::string filePath = path + filename;
+
+                    std::ofstream out(filePath, std::ios::binary);
+                    if (out) {
+                        // Write Y (planar, stride-free)
+                        for (int r = 0; r < f.height; ++r) {
+                            out.write(reinterpret_cast<const char*>(f.yData.data() + r * f.yRowStride), f.width);
                         }
-                    }
-                    // Write V
-                    for (int r = 0; r < uvH; ++r) {
-                        const uint8_t* row = f.vData.data() + r * f.uvRowStride;
-                        for (int c = 0; c < uvW; ++c) {
-                            uint8_t vVal = row[c * f.uvPixelStride];
-                            out.write(reinterpret_cast<const char*>(&vVal), 1);
+                        // Write U
+                        int uvW = f.width / 2;
+                        int uvH = f.height / 2;
+                        for (int r = 0; r < uvH; ++r) {
+                            const uint8_t* row = f.uData.data() + r * f.uvRowStride;
+                            for (int c = 0; c < uvW; ++c) {
+                                uint8_t uVal = row[c * f.uvPixelStride];
+                                out.write(reinterpret_cast<const char*>(&uVal), 1);
+                            }
                         }
+                        // Write V
+                        for (int r = 0; r < uvH; ++r) {
+                            const uint8_t* row = f.vData.data() + r * f.uvRowStride;
+                            for (int c = 0; c < uvW; ++c) {
+                                uint8_t vVal = row[c * f.uvPixelStride];
+                                out.write(reinterpret_cast<const char*>(&vVal), 1);
+                            }
+                        }
+                        out.close();
                     }
-                    out.close();
                 }
             }
-        }
+        });
     }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    if (!success) {
+        return JNI_FALSE;
+    }
+
     LOGI("saveRawBurst: saved %zu frames to %s (useRaw = %d)", burst->frames.size(), path.c_str(), useRaw);
     return JNI_TRUE;
 }

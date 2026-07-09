@@ -161,7 +161,8 @@ struct BilateralGrid {
         // Intensity Z blur (Range dimension)
         for (int gy = 0; gy < gH; ++gy) {
             for (int gx = 0; gx < gW; ++gx) {
-                std::vector<float> tmp(INTENSITY_BINS), tmpW(INTENSITY_BINS);
+                float tmp[INTENSITY_BINS];
+                float tmpW[INTENSITY_BINS];
                 for (int gi = 0; gi < INTENSITY_BINS; ++gi) {
                     int u = std::max(gi-1, 0), d = std::min(gi+1, INTENSITY_BINS-1);
                     tmp [gi] = (splatSum[idx(gy,gx,u)] + splatSum[idx(gy,gx,gi)] + splatSum[idx(gy,gx,d)]) / 3.f;
@@ -172,6 +173,18 @@ struct BilateralGrid {
                     splatWgt[idx(gy,gx,gi)] = tmpW[gi];
                 }
             }
+        }
+    }
+
+    std::vector<float> normalizedGrid; // Precomputed sum / weight values
+
+    void normalize() {
+        size_t sz = splatSum.size();
+        normalizedGrid.resize(sz);
+        for (size_t i = 0; i < sz; ++i) {
+            float s = splatSum[i];
+            float w = splatWgt[i];
+            normalizedGrid[i] = (w > 1e-6f) ? (s / w) : -1.f;
         }
     }
 
@@ -190,11 +203,10 @@ struct BilateralGrid {
 
         float wx = fgx - gx0, wy = fgy - gy0, wI = fi - gi0;
 
-        // Trilinear interpolation of (sum / weight)
+        // Trilinear interpolation using pre-normalized grid
         auto val = [&](int gya, int gxa, int gia) -> float {
-            float s = splatSum[idx(gya, gxa, gia)];
-            float w = splatWgt[idx(gya, gxa, gia)];
-            return (w > 1e-6f) ? s / w : L; // fallback: identity
+            float val = normalizedGrid[idx(gya, gxa, gia)];
+            return (val >= 0.f) ? val : L;
         };
 
         float v000 = val(gy0, gx0, gi0), v001 = val(gy0, gx0, gi1);
@@ -255,7 +267,7 @@ bool ToneMapStage::process(FrameContext& ctx) {
 
     // Adapt gamma based on actual scene brightness
     // Darker scenes get a stronger shadow boost, brighter scenes stay natural.
-    float gammaMin = isNight ? 0.40f : 0.55f;
+    float gammaMin = isNight ? 0.55f : 0.65f;
     float gammaMax = isNight ? 0.80f : 0.95f;
 
     float t_mean = std::clamp((meanL - 10.f) / (80.f - 10.f), 0.f, 1.f);
@@ -289,7 +301,7 @@ bool ToneMapStage::process(FrameContext& ctx) {
         } catch (...) {}
     }
 
-    float blackPointClamp = 0.08f;
+    float blackPointClamp = 0.02f;
     if (ctx.metadata.count("black_point_clamp")) {
         try {
             blackPointClamp = std::any_cast<float>(ctx.metadata.at("black_point_clamp"));
@@ -322,7 +334,7 @@ bool ToneMapStage::process(FrameContext& ctx) {
 
     ctx.processedImage.resize(w, h);
 
-    // ── 1. Build bilateral grid ───────────────────────────────────────────────
+    // ── 1. Build bilateral grid in log-domain ───────────────────────────────
     BilateralGrid grid;
     grid.init(w, h);
 
@@ -331,14 +343,17 @@ bool ToneMapStage::process(FrameContext& ctx) {
         const uint8_t* row = ctx.colorImage.rowPtr(r);
         for (int c = 0; c < w; c += 4) {
             float L = luma(row[c*3], row[c*3+1], row[c*3+2]);
-            grid.splat(c, r, L);
+            // Working in log-domain matches human visual perception and reduces halos
+            float logL = std::log2f(L + 1.f);
+            grid.splat(c, r, logL * (255.f / 8.f)); // scale 0-8 log2 range to 0-255 JNI grid space
         }
     }
 
     // ── 2. Blur grid ─────────────────────────────────────────────────────────
     grid.blur();
+    grid.normalize();
 
-    // ── 3. Sample + reconstruct in parallel ───────────────────────────────────
+    // ── 3. Sample + reconstruct in parallel in log-domain ─────────────────────
     int numThreads = 8;
     int rowsPerThread = h / numThreads;
     std::vector<std::future<void>> futures;
@@ -354,38 +369,82 @@ bool ToneMapStage::process(FrameContext& ctx) {
                 uint8_t*       dst = ctx.processedImage.rowPtr(r);
 
                 for (int c = 0; c < w; ++c) {
-                    float L = luma(src[c*3], src[c*3+1], src[c*3+2]);
+                    float R = src[c*3];
+                    float G = src[c*3+1];
+                    float B = src[c*3+2];
+                    
+                    float L = luma(R, G, B);
+                    float logL = std::log2f(L + 1.f);
 
-                    float baseL = grid.sample(c, r, L);
+                    // Retrieve base illumination (local low-frequency contrast)
+                    float gridVal = grid.sample(c, r, logL * (255.f / 8.f));
+                    float logBase = gridVal * (8.f / 255.f);
+                    logBase = std::clamp(logBase, 0.f, 8.f);
+                    float baseL = std::exp2f(logBase) - 1.f;
                     baseL = std::max(1.f, baseL);
 
-                    // Normalize base luminance to [0, 1] for filmic curve
+                    // Compress base layer (dynamic range compression)
                     float normBase = baseL / 255.f;
-                    float boostedBase = std::pow(normBase, adaptiveGamma);
+                    float boostedBase = std::powf(normBase, adaptiveGamma);
                     
-                    // Soft black-point compression for night mode (preserves deep black skies)
-                    if (isNight && boostedBase < blackPointClamp) {
+                    // Soft black-point compression (preserves deep blacks and mutes background noise)
+                    if (boostedBase < blackPointClamp) {
                         boostedBase = (boostedBase * boostedBase) / blackPointClamp;
                     }
                     
                     float compBase = acesFilm(boostedBase) * 255.f;
 
-                    // Multiplicative detail boosting (equivalent to log-domain tone mapping)
-                    float ratio = (L > 0.f) ? L / baseL : 0.f;
-                    float compL = compBase * std::pow(ratio, detailAlpha);
-                    compL = std::clamp(compL, 0.f, 255.f);
+                    // Suppress detail boost in dark areas to prevent noise/grain amplification
+                    float currentDetailAlpha = detailAlpha;
+                    if (baseL < 50.f) {
+                        float factor = baseL / 50.f;
+                        currentDetailAlpha = 1.0f + factor * (detailAlpha - 1.0f);
+                    }
 
-                    // Scale RGB channels to match new luminance (preserves hue)
+                    // Add log details back (Log detail = logL - logBase)
+                    float logDetail = logL - logBase;
+                    float compLogL = std::log2f(compBase + 1.f) + logDetail * currentDetailAlpha;
+                    float compL = std::exp2f(compLogL) - 1.f;
+                    compL = std::clamp(compL, 0.f, 65535.f);
+
+                    // Scale RGB channels to match the local tone mapped luminance
                     float scale = (L > 0.1f) ? compL / L : 1.f;
-                    scale = std::min(scale, 8.0f); // limit maximum noise amplification
-                    uint8_t oR = static_cast<uint8_t>(std::clamp(src[c*3]   * scale, 0.f, 255.f));
-                    uint8_t oG = static_cast<uint8_t>(std::clamp(src[c*3+1] * scale, 0.f, 255.f));
-                    uint8_t oB = static_cast<uint8_t>(std::clamp(src[c*3+2] * scale, 0.f, 255.f));
+                    scale = std::min(scale, 10.0f); // cap noise amplification to allow low-light boosting
+                    
+                    float oR = R * scale;
+                    float oG = G * scale;
+                    float oB = B * scale;
 
-                    // Saturation boost
-                    adjustSaturation(oR, oG, oB, saturationBoost);
+                    // Apply desaturation / saturation boost
+                    float newL = luma(oR, oG, oB);
+                    if (newL > 0.1f) {
+                        float factor = saturationBoost;
+                        // Softly desaturate bright highlights towards white to prevent color distortion/clipping
+                        if (newL > 200.f) {
+                            float t = (newL - 200.f) / (255.f - 200.f);
+                            factor = factor * (1.f - std::clamp(t, 0.f, 1.f));
+                        }
+                        oR = newL + factor * (oR - newL);
+                        oG = newL + factor * (oG - newL);
+                        oB = newL + factor * (oB - newL);
+                    }
 
-                    dst[c*3] = oR; dst[c*3+1] = oG; dst[c*3+2] = oB;
+                    // Soft highlight roll-off (Desaturate to white if a channel clips, matching high-end film/GCam look)
+                    float maxChan = std::max({oR, oG, oB});
+                    if (maxChan > 255.f) {
+                        float blendL = luma(oR, oG, oB);
+                        if (maxChan - blendL > 1e-4f) {
+                            float blend = (255.f - blendL) / (maxChan - blendL);
+                            blend = std::clamp(blend, 0.f, 1.f);
+                            oR = blendL + blend * (oR - blendL);
+                            oG = blendL + blend * (oG - blendL);
+                            oB = blendL + blend * (oB - blendL);
+                        }
+                    }
+
+                    dst[c*3]   = static_cast<uint8_t>(std::clamp(oR, 0.f, 255.f));
+                    dst[c*3+1] = static_cast<uint8_t>(std::clamp(oG, 0.f, 255.f));
+                    dst[c*3+2] = static_cast<uint8_t>(std::clamp(oB, 0.f, 255.f));
                 }
             }
         }));

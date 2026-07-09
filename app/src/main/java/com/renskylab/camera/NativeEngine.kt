@@ -42,7 +42,7 @@ object NativeEngine {
     /**
      * Save the raw YUV frames inside the native burst to a directory as planar I420 YUV files.
      */
-    external fun saveRawBurst(handle: Long, dirPath: String, useRaw: Boolean): Boolean
+    external fun saveRawBurst(handle: Long, dirPath: String, useRaw: Boolean, debugRawDumps: Boolean): Boolean
 
     /**
      * Process the pre-copied native burst using JNI.

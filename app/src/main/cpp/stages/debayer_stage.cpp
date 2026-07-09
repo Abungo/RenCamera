@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <fstream>
 #include <any>
+#include <future>
+#include <vector>
 
 // Highway SIMD — vectorised YUV→RGB inner loop
 #include <hwy/highway.h>
@@ -106,58 +108,73 @@ bool DebayerStage::process(FrameContext& ctx) {
         float bGain = 1.9f;
         float gGain = 1.0f;
 
-        auto getRaw = [&](int r, int c) -> float {
-            int cr = std::clamp(r, 0, h - 1);
-            int cc = std::clamp(c, 0, w - 1);
-            float val = static_cast<float>(fusedRaw[cr * w + cc]);
-            float cleanVal = std::max(0.f, (val - blackLevel) * scale);
-            
-            // Determine Bayer color filter grid position (RGGB pattern)
-            bool isEvenRow = (cr % 2 == 0);
-            bool isEvenCol = (cc % 2 == 0);
-            if (isEvenRow && isEvenCol) {
-                return cleanVal * rGain; // Red
-            } else if (!isEvenRow && !isEvenCol) {
-                return cleanVal * bGain; // Blue
-            } else {
-                return cleanVal * gGain; // Green
-            }
-        };
+        // Bilinear Demosaicing (RGGB layout) - Multi-threaded
+        int numThreads = 8;
+        int rowsPerThread = h / numThreads;
+        std::vector<std::future<void>> futures;
+        futures.reserve(numThreads);
 
-        // Bilinear Demosaicing (RGGB layout)
-        for (int r = 0; r < h; ++r) {
-            uint8_t* rgbRow = ctx.colorImage.rowPtr(r);
-            for (int c = 0; c < w; ++c) {
-                float R = 0.f, G = 0.f, B = 0.f;
-                bool isEvenRow = (r % 2 == 0);
-                bool isEvenCol = (c % 2 == 0);
+        for (int t = 0; t < numThreads; ++t) {
+            int rStart = t * rowsPerThread;
+            int rEnd = (t == numThreads - 1) ? h : (t + 1) * rowsPerThread;
 
-                if (isEvenRow && isEvenCol) {
-                    // Red pixel
-                    R = getRaw(r, c);
-                    G = (getRaw(r-1, c) + getRaw(r+1, c) + getRaw(r, c-1) + getRaw(r, c+1)) * 0.25f;
-                    B = (getRaw(r-1, c-1) + getRaw(r-1, c+1) + getRaw(r+1, c-1) + getRaw(r+1, c+1)) * 0.25f;
-                } else if (!isEvenRow && !isEvenCol) {
-                    // Blue pixel
-                    R = (getRaw(r-1, c-1) + getRaw(r-1, c+1) + getRaw(r+1, c-1) + getRaw(r+1, c+1)) * 0.25f;
-                    G = (getRaw(r-1, c) + getRaw(r+1, c) + getRaw(r, c-1) + getRaw(r, c+1)) * 0.25f;
-                    B = getRaw(r, c);
-                } else if (isEvenRow && !isEvenCol) {
-                    // Green pixel on Red row
-                    R = (getRaw(r, c-1) + getRaw(r, c+1)) * 0.5f;
-                    G = getRaw(r, c);
-                    B = (getRaw(r-1, c) + getRaw(r+1, c)) * 0.5f;
-                } else {
-                    // Green pixel on Blue row
-                    R = (getRaw(r-1, c) + getRaw(r+1, c)) * 0.5f;
-                    G = getRaw(r, c);
-                    B = (getRaw(r, c-1) + getRaw(r, c+1)) * 0.5f;
+            futures.push_back(std::async(std::launch::async, [&ctx, &fusedRaw, rStart, rEnd, w, h, blackLevel, scale, rGain, gGain, bGain]() {
+                auto getRaw = [&](int r, int cc) -> float {
+                    int cr = std::clamp(r, 0, h - 1);
+                    int c_clamped = std::clamp(cc, 0, w - 1);
+                    float val = static_cast<float>(fusedRaw[cr * w + c_clamped]);
+                    float cleanVal = std::max(0.f, (val - blackLevel) * scale);
+                    
+                    // Determine Bayer color filter grid position (BGGR pattern)
+                    bool isEvenRow = (cr % 2 == 0);
+                    bool isEvenCol = (c_clamped % 2 == 0);
+                    if (isEvenRow && isEvenCol) {
+                        return cleanVal * bGain; // Blue
+                    } else if (!isEvenRow && !isEvenCol) {
+                        return cleanVal * rGain; // Red
+                    } else {
+                        return cleanVal * gGain; // Green
+                    }
+                };
+
+                for (int r = rStart; r < rEnd; ++r) {
+                    uint8_t* rgbRow = ctx.colorImage.rowPtr(r);
+                    for (int c = 0; c < w; ++c) {
+                        float R = 0.f, G = 0.f, B = 0.f;
+                        bool isEvenRow = (r % 2 == 0);
+                        bool isEvenCol = (c % 2 == 0);
+
+                        if (isEvenRow && isEvenCol) {
+                            // Blue pixel
+                            R = (getRaw(r-1, c-1) + getRaw(r-1, c+1) + getRaw(r+1, c-1) + getRaw(r+1, c+1)) * 0.25f;
+                            G = (getRaw(r-1, c) + getRaw(r+1, c) + getRaw(r, c-1) + getRaw(r, c+1)) * 0.25f;
+                            B = getRaw(r, c);
+                        } else if (!isEvenRow && !isEvenCol) {
+                            // Red pixel
+                            R = getRaw(r, c);
+                            G = (getRaw(r-1, c) + getRaw(r+1, c) + getRaw(r, c-1) + getRaw(r, c+1)) * 0.25f;
+                            B = (getRaw(r-1, c-1) + getRaw(r-1, c+1) + getRaw(r+1, c-1) + getRaw(r+1, c+1)) * 0.25f;
+                        } else if (isEvenRow && !isEvenCol) {
+                            // Green pixel on Blue row
+                            R = (getRaw(r-1, c) + getRaw(r+1, c)) * 0.5f;
+                            G = getRaw(r, c);
+                            B = (getRaw(r, c-1) + getRaw(r, c+1)) * 0.5f;
+                        } else {
+                            // Green pixel on Red row
+                            R = (getRaw(r, c-1) + getRaw(r, c+1)) * 0.5f;
+                            G = getRaw(r, c);
+                            B = (getRaw(r-1, c) + getRaw(r+1, c)) * 0.5f;
+                        }
+
+                        rgbRow[c * 3 + 0] = static_cast<uint8_t>(std::clamp(R, 0.f, 255.f));
+                        rgbRow[c * 3 + 1] = static_cast<uint8_t>(std::clamp(G, 0.f, 255.f));
+                        rgbRow[c * 3 + 2] = static_cast<uint8_t>(std::clamp(B, 0.f, 255.f));
+                    }
                 }
-
-                rgbRow[c * 3 + 0] = static_cast<uint8_t>(std::clamp(R, 0.f, 255.f));
-                rgbRow[c * 3 + 1] = static_cast<uint8_t>(std::clamp(G, 0.f, 255.f));
-                rgbRow[c * 3 + 2] = static_cast<uint8_t>(std::clamp(B, 0.f, 255.f));
-            }
+            }));
+        }
+        for (auto& fut : futures) {
+            fut.get();
         }
     } else {
         if (ctx.fusedY.empty()) {
@@ -171,13 +188,28 @@ bool DebayerStage::process(FrameContext& ctx) {
 
         int uvW = w / 2;
 
-        for (int r = 0; r < h; ++r) {
-            convertRowScalar(
-                Y + r * w,
-                U + (r / 2) * uvW,
-                V + (r / 2) * uvW,
-                ctx.colorImage.rowPtr(r),
-                w);
+        int numThreads = 8;
+        int rowsPerThread = h / numThreads;
+        std::vector<std::future<void>> futures;
+        futures.reserve(numThreads);
+
+        for (int t = 0; t < numThreads; ++t) {
+            int rStart = t * rowsPerThread;
+            int rEnd = (t == numThreads - 1) ? h : (t + 1) * rowsPerThread;
+
+            futures.push_back(std::async(std::launch::async, [&ctx, Y, U, V, rStart, rEnd, w, uvW]() {
+                for (int r = rStart; r < rEnd; ++r) {
+                    convertRowScalar(
+                        Y + r * w,
+                        U + (r / 2) * uvW,
+                        V + (r / 2) * uvW,
+                        ctx.colorImage.rowPtr(r),
+                        w);
+                }
+            }));
+        }
+        for (auto& fut : futures) {
+            fut.get();
         }
     }
 

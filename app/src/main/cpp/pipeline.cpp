@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <fstream>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Registration
@@ -62,6 +63,7 @@ bool Pipeline::run(FrameContext& ctx, std::function<void(const std::string&, int
     }
 
     int completedStages = 0;
+    std::vector<std::pair<std::string, long long>> stageTimes;
     for (auto& stage : stages_) {
         if (!stage->enabled) {
             LOGI("Pipeline: skipping disabled stage '%s'", std::string(stage->name()).c_str());
@@ -82,6 +84,8 @@ bool Pipeline::run(FrameContext& ctx, std::function<void(const std::string&, int
              ok ? "OK" : "FAILED",
              static_cast<long long>(ms));
 
+        stageTimes.push_back({std::string(stage->name()), ms});
+
         if (!ok) {
             LOGE("Pipeline: aborting after failed stage '%s'",
                  std::string(stage->name()).c_str());
@@ -98,6 +102,27 @@ bool Pipeline::run(FrameContext& ctx, std::function<void(const std::string&, int
                        clock::now() - pipelineStart)
                        .count();
     LOGI("Pipeline: complete — total %lld ms", static_cast<long long>(totalMs));
+
+    // Save persistent timing log to debug directory if enabled
+    std::string debugDir = "";
+    if (ctx.metadata.count("debug_dir")) {
+        try {
+            debugDir = std::any_cast<std::string>(ctx.metadata.at("debug_dir"));
+        } catch (...) {}
+    }
+    if (!debugDir.empty()) {
+        try {
+            std::ofstream logFile(debugDir + "/pipeline_timing_log.txt");
+            if (logFile) {
+                logFile << "=== PIPELINE STAGE TIMING LOG ===\n";
+                for (const auto& entry : stageTimes) {
+                    logFile << entry.first << ": " << entry.second << " ms\n";
+                }
+                logFile << "TOTAL PIPELINE TIME: " << totalMs << " ms\n";
+                logFile.close();
+            }
+        } catch (...) {}
+    }
     return true;
 }
 

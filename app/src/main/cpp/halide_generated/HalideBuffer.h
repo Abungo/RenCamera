@@ -28,6 +28,7 @@
 #endif
 #endif
 
+#include "HalideRuntime.h"
 #include "temporal_fusion.h"
 
 #ifdef _MSC_VER

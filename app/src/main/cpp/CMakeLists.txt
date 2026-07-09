@@ -69,6 +69,11 @@ set_target_properties(temporal_fusion PROPERTIES
     IMPORTED_LOCATION ${CMAKE_CURRENT_SOURCE_DIR}/halide_generated/temporal_fusion.a
 )
 
+add_library(halide_runtime STATIC IMPORTED GLOBAL)
+set_target_properties(halide_runtime PROPERTIES
+    IMPORTED_LOCATION ${CMAKE_CURRENT_SOURCE_DIR}/halide_generated/halide_runtime.a
+)
+
 # ── Native shared library ─────────────────────────────────────────────────────
 add_library(gcam_core SHARED
     gcam_core.cpp
@@ -94,13 +99,16 @@ find_library(android-lib   android)
 find_library(log-lib       log)
 find_library(mediandk-lib  mediandk)
 find_library(z-lib         z)
+find_library(egl-lib       EGL)
+find_library(gles3-lib     GLESv3)
 
 target_link_libraries(gcam_core
     ${android-lib}
     ${log-lib}
     ${mediandk-lib}
     ${z-lib}
+    ${egl-lib}
+    ${gles3-lib}
     hwy
     jpeg-static   # libjpeg-turbo static lib target name
-    temporal_fusion # Halide AOT static library
 )

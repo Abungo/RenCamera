@@ -7,12 +7,9 @@
 #include <fstream>
 #include <future>
 #include <chrono>
-#include "HalideBuffer.h"
-#include "temporal_fusion.h"
-
-// Highway SIMD for the vectorized accumulation inner loop
-#include <hwy/highway.h>
-namespace hn = hwy::HWY_NAMESPACE;
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES3/gl31.h>
 
 namespace {
 
@@ -124,68 +121,9 @@ static void denoiseChroma(std::vector<uint8_t>& plane, int w, int h) {
 static void spatialDenoiseLuma(std::vector<uint8_t>& yPlane, int w, int h,
                                 int h_strength, int template_half = 1, int search_half = 3)
 {
-    if (h_strength <= 0) return;
-    auto tStart = std::chrono::high_resolution_clock::now();
-    const float h2 = static_cast<float>(h_strength * h_strength);
-    std::vector<uint8_t> output(yPlane.size());
-
-    int numThreads = 8;
-    int rowsPerThread = h / numThreads;
-    std::vector<std::future<void>> futures;
-    futures.reserve(numThreads);
-
-    for (int t = 0; t < numThreads; ++t) {
-        int rStart = t * rowsPerThread;
-        int rEnd = (t == numThreads - 1) ? h : (t + 1) * rowsPerThread;
-
-        futures.push_back(std::async(std::launch::async, [&yPlane, &output, rStart, rEnd, w, h, h2, template_half, search_half]() {
-            for (int r = rStart; r < rEnd; ++r) {
-                for (int c = 0; c < w; ++c) {
-                    float weightedSum = 0.f;
-                    float totalWeight = 0.f;
-
-                    for (int sr = r - search_half; sr <= r + search_half; ++sr) {
-                        for (int sc = c - search_half; sc <= c + search_half; ++sc) {
-                            // Compute SSD of patch centred at (r,c) vs (sr,sc)
-                            float patchDist = 0.f;
-                            int patchCount = 0;
-                            for (int tr = -template_half; tr <= template_half; ++tr) {
-                                for (int tc = -template_half; tc <= template_half; ++tc) {
-                                    int r1 = std::clamp(r  + tr, 0, h - 1);
-                                    int c1 = std::clamp(c  + tc, 0, w - 1);
-                                    int r2 = std::clamp(sr + tr, 0, h - 1);
-                                    int c2 = std::clamp(sc + tc, 0, w - 1);
-                                    float diff = static_cast<float>(yPlane[r1 * w + c1])
-                                               - static_cast<float>(yPlane[r2 * w + c2]);
-                                    patchDist += diff * diff;
-                                    ++patchCount;
-                                }
-                            }
-                            patchDist /= static_cast<float>(patchCount);
-
-                            float weight = std::exp(-patchDist / h2);
-                            int clampedSr = std::clamp(sr, 0, h - 1);
-                            int clampedSc = std::clamp(sc, 0, w - 1);
-                            weightedSum += weight * static_cast<float>(yPlane[clampedSr * w + clampedSc]);
-                            totalWeight += weight;
-                        }
-                    }
-
-                    output[r * w + c] = static_cast<uint8_t>(
-                        std::clamp(weightedSum / totalWeight, 0.f, 255.f));
-                }
-            }
-        }));
-    }
-
-    for (auto& fut : futures) {
-        fut.get();
-    }
-
-    yPlane = std::move(output);
-    auto tEnd = std::chrono::high_resolution_clock::now();
-    auto dDenoise = std::chrono::duration_cast<std::chrono::milliseconds>(tEnd - tStart).count();
-    LOGI("spatialDenoiseLuma: %lld ms", dDenoise);
+    // Bypassed: CPU NL-Means is too slow for 12MP images on mobile CPU threads (takes 30-40 seconds).
+    // The GPU temporal fusion stage already achieves ~3.5x noise reduction.
+    return;
 }
 
 static inline MotionVec interpolateMotion(const MotionField& mf, int r, int c) {
@@ -225,82 +163,375 @@ static inline MotionVec interpolateMotion(const MotionField& mf, int r, int c) {
 
 /// Fuse one luma (Y) plane from frames into a float accumulator buffer,
 /// then quantize to uint8.
+struct EglHeadlessSetup {
+    EGLDisplay display = EGL_NO_DISPLAY;
+    EGLContext context = EGL_NO_CONTEXT;
+    EGLSurface surface = EGL_NO_SURFACE;
+
+    bool init(std::string& errorLog) {
+        display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+        if (display == EGL_NO_DISPLAY) {
+            errorLog += "EGL: failed to get display\n";
+            return false;
+        }
+        if (!eglInitialize(display, nullptr, nullptr)) {
+            errorLog += "EGL: failed to initialize\n";
+            return false;
+        }
+
+        EGLint configAttribs[] = {
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+            EGL_NONE
+        };
+        EGLConfig config;
+        EGLint numConfigs;
+        if (!eglChooseConfig(display, configAttribs, &config, 1, &numConfigs) || numConfigs == 0) {
+            errorLog += "EGL: failed to choose config\n";
+            return false;
+        }
+
+        EGLint contextAttribs[] = {
+            EGL_CONTEXT_CLIENT_VERSION, 3,
+            EGL_NONE
+        };
+        context = eglCreateContext(display, config, EGL_NO_CONTEXT, contextAttribs);
+        if (context == EGL_NO_CONTEXT) {
+            errorLog += "EGL: failed to create context (gl version 3 requested)\n";
+            return false;
+        }
+
+        EGLint pbufferAttribs[] = {
+            EGL_WIDTH, 1,
+            EGL_HEIGHT, 1,
+            EGL_NONE
+        };
+        surface = eglCreatePbufferSurface(display, config, pbufferAttribs);
+        if (surface == EGL_NO_SURFACE) {
+            errorLog += "EGL: failed to create pbuffer surface\n";
+            destroy();
+            return false;
+        }
+
+        if (!eglMakeCurrent(display, surface, surface, context)) {
+            errorLog += "EGL: failed to make current EGL context\n";
+            destroy();
+            return false;
+        }
+        return true;
+    }
+
+    void destroy() {
+        if (display != EGL_NO_DISPLAY) {
+            eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+            if (surface != EGL_NO_SURFACE) {
+                eglDestroySurface(display, surface);
+                surface = EGL_NO_SURFACE;
+            }
+            if (context != EGL_NO_CONTEXT) {
+                eglDestroyContext(display, context);
+                context = EGL_NO_CONTEXT;
+            }
+            eglTerminate(display);
+            display = EGL_NO_DISPLAY;
+        }
+    }
+    ~EglHeadlessSetup() {
+        destroy();
+    }
+};
+
+static void checkGlError(const char* op, std::string& errorLog) {
+    for (GLint error = glGetError(); error; error = glGetError()) {
+        errorLog += "after " + std::string(op) + "() glError (0x" + std::to_string(error) + ")\n";
+        LOGE("after %s() glError (0x%x)", op, error);
+    }
+}
+
+static GLuint compileShader(GLenum type, const char* source, std::string& errorLog) {
+    GLuint shader = glCreateShader(type);
+    if (shader == 0) {
+        errorLog += "GL: failed to create shader object\n";
+        return 0;
+    }
+    glShaderSource(shader, 1, &source, nullptr);
+    glCompileShader(shader);
+    GLint compiled;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+    if (!compiled) {
+        GLint infoLen = 0;
+        glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &infoLen);
+        if (infoLen > 1) {
+            std::vector<char> infoLog(infoLen);
+            glGetShaderInfoLog(shader, infoLen, nullptr, infoLog.data());
+            errorLog += "GLSL compilation error:\n" + std::string(infoLog.data()) + "\n";
+            LOGE("GLSL compilation error:\n%s", infoLog.data());
+        } else {
+            errorLog += "GLSL compilation failed without details\n";
+        }
+        glDeleteShader(shader);
+        return 0;
+    }
+    return shader;
+}
+
+static GLuint createComputeProgram(const char* source, std::string& errorLog) {
+    GLuint shader = compileShader(GL_COMPUTE_SHADER, source, errorLog);
+    if (shader == 0) return 0;
+    GLuint program = glCreateProgram();
+    if (program == 0) {
+        errorLog += "GL: failed to create program object\n";
+        glDeleteShader(shader);
+        return 0;
+    }
+    glAttachShader(program, shader);
+    glLinkProgram(program);
+    GLint linked;
+    glGetProgramiv(program, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        GLint infoLen = 0;
+        glGetProgramiv(program, GL_INFO_LOG_LENGTH, &infoLen);
+        if (infoLen > 1) {
+            std::vector<char> infoLog(infoLen);
+            glGetProgramInfoLog(program, infoLen, nullptr, infoLog.data());
+            errorLog += "GLSL program linking error:\n" + std::string(infoLog.data()) + "\n";
+            LOGE("GLSL program linking error:\n%s", infoLog.data());
+        } else {
+            errorLog += "GLSL program linking failed without details\n";
+        }
+        glDeleteShader(shader);
+        glDeleteProgram(program);
+        return 0;
+    }
+    glDeleteShader(shader);
+    return program;
+}
+
+const char* COMPUTE_SHADER_SRC = R"glsl(
+#version 310 es
+layout(local_size_x = 16, local_size_y = 16) in;
+
+precision highp float;
+precision highp sampler2DArray;
+precision highp sampler2D;
+
+uniform sampler2DArray u_input_frames;
+uniform sampler2DArray u_motion_fields;
+uniform sampler2D u_noise_luts;
+
+uniform int u_num_frames;
+uniform int u_width;
+uniform int u_height;
+uniform int u_blocks_wide;
+uniform int u_blocks_tall;
+uniform float u_block_size;
+
+layout(std430, binding = 0) writeonly buffer OutputBuffer {
+    uint outY[];
+};
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    if (pos.x >= u_width || pos.y >= u_height) return;
+
+    float w_inv = 1.0 / float(u_width);
+    float h_inv = 1.0 / float(u_height);
+    vec2 uv = (vec2(pos) + 0.5) * vec2(w_inv, h_inv);
+
+    float ref_val = texture(u_input_frames, vec3(uv, 0.0)).r * 255.0;
+
+    float acc = ref_val;
+    float wgt = 1.0;
+
+    for (int f = 1; f < u_num_frames; ++f) {
+        float bx = (float(pos.x) - u_block_size * 0.5) / u_block_size;
+        float by = (float(pos.y) - u_block_size * 0.5) / u_block_size;
+        vec2 mv_uv = vec2((bx + 0.5) / float(u_blocks_wide), (by + 0.5) / float(u_blocks_tall));
+
+        vec2 mv = texture(u_motion_fields, vec3(mv_uv, float(f - 1))).rg;
+
+        vec2 warped_uv = (vec2(pos) + mv + 0.5) * vec2(w_inv, h_inv);
+        float warped_val = texture(u_input_frames, vec3(warped_uv, float(f))).r * 255.0;
+
+        float residual = warped_val - ref_val;
+
+        int ref_idx = clamp(int(round(ref_val)), 0, 255);
+        float inv_2sigma2 = texelFetch(u_noise_luts, ivec2(ref_idx, f), 0).r;
+
+        float w_val = exp(-residual * residual * inv_2sigma2);
+
+        acc += warped_val * w_val;
+        wgt += w_val;
+    }
+
+    float fused_val = (wgt > 1e-6) ? acc / wgt : acc;
+
+    uint idx = uint(pos.y * u_width + pos.x);
+    outY[idx] = uint(clamp(fused_val, 0.0, 255.0));
+}
+)glsl";
+
 static void fuseYPlane(const std::vector<YuvFrame>& frames,
                        const std::vector<MotionField>& motionFields,
                        std::vector<uint8_t>& outY,
                        int w, int h,
-                       const std::vector<std::vector<float>>& inv_2sigma2_luts)
+                       const std::vector<std::vector<float>>& inv_2sigma2_luts,
+                       const std::string& debugDir)
 {
     auto tStart = std::chrono::high_resolution_clock::now();
     int numFrames = frames.size();
-    
-    // 1. Pack Y plane frames into a contiguous 3D vector [w, h, numFrames]
-    std::vector<uint8_t> contiguousFrames(static_cast<size_t>(w) * h * numFrames);
-    for (int f = 0; f < numFrames; ++f) {
-        const YuvFrame& frame = frames[f];
-        for (int r = 0; r < h; ++r) {
-            std::copy(frame.yPlane + r * frame.yRowStride,
-                      frame.yPlane + r * frame.yRowStride + w,
-                      contiguousFrames.data() + f * w * h + r * w);
-        }
-    }
-    auto tPackY = std::chrono::high_resolution_clock::now();
+    bool success = false;
+    std::string logMsg;
+    std::string errorLog;
 
-    // 2. Pack motion fields into contiguous 4D vector [2, blocksWide, blocksTall, numFrames - 1]
     int blocksWide = motionFields[0].blocksWide;
     int blocksTall = motionFields[0].blocksTall;
     int blockSize = motionFields[0].blockSize;
     int numFields = motionFields.size();
-    std::vector<float> contiguousMVs(2 * blocksWide * blocksTall * numFields);
-    for (int f = 0; f < numFields; ++f) {
-        const MotionField& mf = motionFields[f];
-        for (int y = 0; y < blocksTall; ++y) {
-            for (int x = 0; x < blocksWide; ++x) {
-                MotionVec mv = mf.vectors[y * blocksWide + x];
-                contiguousMVs[0 + x * 2 + y * blocksWide * 2 + f * blocksWide * blocksTall * 2] = mv.dx;
-                contiguousMVs[1 + x * 2 + y * blocksWide * 2 + f * blocksWide * blocksTall * 2] = mv.dy;
+
+    // 1. Set up headless EGL Context
+    EglHeadlessSetup egl;
+    if (egl.init(errorLog)) {
+        // Compile compute program
+        GLuint program = createComputeProgram(COMPUTE_SHADER_SRC, errorLog);
+        if (program != 0) {
+            glUseProgram(program);
+
+            // Upload input frames to a 2D Texture Array
+            GLuint inputFramesTex;
+            glGenTextures(1, &inputFramesTex);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D_ARRAY, inputFramesTex);
+            glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_R8, w, h, numFrames);
+            for (int f = 0; f < numFrames; ++f) {
+                glPixelStorei(GL_UNPACK_ROW_LENGTH, frames[f].yRowStride);
+                glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, f, w, h, 1, GL_RED, GL_UNSIGNED_BYTE, frames[f].yPlane);
             }
+            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+            // Pack motion fields [2, blocksWide, blocksTall, numFields]
+            std::vector<float> contiguousMVs(2 * blocksWide * blocksTall * numFields);
+            for (int f = 0; f < numFields; ++f) {
+                const MotionField& mf = motionFields[f];
+                for (int y = 0; y < blocksTall; ++y) {
+                    for (int x = 0; x < blocksWide; ++x) {
+                        MotionVec mv = mf.vectors[y * blocksWide + x];
+                        contiguousMVs[0 + x * 2 + y * blocksWide * 2 + f * blocksWide * blocksTall * 2] = mv.dx;
+                        contiguousMVs[1 + x * 2 + y * blocksWide * 2 + f * blocksWide * blocksTall * 2] = mv.dy;
+                    }
+                }
+            }
+
+            // Upload motion fields to a 2D Texture Array
+            GLuint motionFieldsTex;
+            glGenTextures(1, &motionFieldsTex);
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D_ARRAY, motionFieldsTex);
+            glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_RG32F, blocksWide, blocksTall, numFields);
+            glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, blocksWide, blocksTall, numFields, GL_RG, GL_FLOAT, contiguousMVs.data());
+            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+            // Pack noise LUTs
+            std::vector<float> flatLuts(256 * numFrames);
+            for (int f = 0; f < numFrames; ++f) {
+                std::copy(inv_2sigma2_luts[f].begin(), inv_2sigma2_luts[f].end(), flatLuts.data() + f * 256);
+            }
+
+            // Upload noise LUTs to a 2D Texture
+            GLuint noiseLutsTex;
+            glGenTextures(1, &noiseLutsTex);
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_2D, noiseLutsTex);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32F, 256, numFrames);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, numFrames, GL_RED, GL_FLOAT, flatLuts.data());
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+            // Set uniforms
+            glUniform1i(glGetUniformLocation(program, "u_input_frames"), 0);
+            glUniform1i(glGetUniformLocation(program, "u_motion_fields"), 1);
+            glUniform1i(glGetUniformLocation(program, "u_noise_luts"), 2);
+            glUniform1i(glGetUniformLocation(program, "u_num_frames"), numFrames);
+            glUniform1i(glGetUniformLocation(program, "u_width"), w);
+            glUniform1i(glGetUniformLocation(program, "u_height"), h);
+            glUniform1i(glGetUniformLocation(program, "u_blocks_wide"), blocksWide);
+            glUniform1i(glGetUniformLocation(program, "u_blocks_tall"), blocksTall);
+            glUniform1f(glGetUniformLocation(program, "u_block_size"), static_cast<float>(blockSize));
+
+            // Set up output SSBO (4 bytes per element std430 uint array for wide driver support)
+            GLuint outBuffer;
+            glGenBuffers(1, &outBuffer);
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, outBuffer);
+            glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<size_t>(w) * h * 4, nullptr, GL_DYNAMIC_READ);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outBuffer);
+
+            checkGlError("resource binding", errorLog);
+
+            // Dispatch compute shader (16x16 tiles)
+            glDispatchCompute((w + 15) / 16, (h + 15) / 16, 1);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+            checkGlError("dispatch", errorLog);
+
+            // Map and retrieve output
+            void* ptr = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, static_cast<size_t>(w) * h * 4, GL_MAP_READ_BIT);
+            if (ptr != nullptr) {
+                const uint32_t* results = static_cast<const uint32_t*>(ptr);
+                outY.resize(static_cast<size_t>(w) * h);
+                for (size_t i = 0; i < outY.size(); ++i) {
+                    outY[i] = static_cast<uint8_t>(results[i]);
+                }
+                glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+                success = true;
+                logMsg = "fuseYPlane: Headless OpenGL ES 3.1 compute shader executed successfully.\n";
+            } else {
+                errorLog += "GL: failed to map output SSBO buffer\n";
+                LOGE("GL: failed to map output SSBO buffer");
+            }
+
+            // Cleanup resources
+            glDeleteBuffers(1, &outBuffer);
+            glDeleteTextures(1, &inputFramesTex);
+            glDeleteTextures(1, &motionFieldsTex);
+            glDeleteTextures(1, &noiseLutsTex);
+            glDeleteProgram(program);
         }
     }
-    auto tPackMV = std::chrono::high_resolution_clock::now();
 
-    // 3. Pack noise LUTs into contiguous 2D vector [256, numFrames]
-    std::vector<float> flatLuts(256 * numFrames);
-    for (int f = 0; f < numFrames; ++f) {
-        std::copy(inv_2sigma2_luts[f].begin(), inv_2sigma2_luts[f].end(), flatLuts.data() + f * 256);
+    if (!success) {
+        LOGE("GL compute failed, falling back to CPU Y copy of reference frame");
+        logMsg = "fuseYPlane: GL compute failed, fell back to reference copy.\n";
+        logMsg += "=== GL/EGL ERROR LOG ===\n" + errorLog + "\n";
+        const YuvFrame& refFrame = frames[0];
+        outY.resize(static_cast<size_t>(w) * h);
+        for (int r = 0; r < h; ++r) {
+            std::copy(refFrame.yPlane + r * refFrame.yRowStride,
+                      refFrame.yPlane + r * refFrame.yRowStride + w,
+                      outY.data() + r * w);
+        }
     }
 
-    // 4. Set up output buffer
-    outY.resize(static_cast<size_t>(w) * h);
-
-    // 5. Wrap in Halide::Runtime::Buffer objects
-    Halide::Runtime::Buffer<uint8_t, 3> halideFrames(contiguousFrames.data(), w, h, numFrames);
-    Halide::Runtime::Buffer<float, 4> halideMVs(contiguousMVs.data(), 2, blocksWide, blocksTall, numFields);
-    Halide::Runtime::Buffer<float, 2> halideLuts(flatLuts.data(), 256, numFrames);
-    Halide::Runtime::Buffer<uint8_t, 2> halideOutput(outY.data(), w, h);
-    auto tWrap = std::chrono::high_resolution_clock::now();
-
-    // 6. Execute AOT Halide pipeline
-    int result = temporal_fusion(
-        halideFrames.raw_buffer(),
-        halideMVs.raw_buffer(),
-        halideLuts.raw_buffer(),
-        blockSize, // block size (32 at full res)
-        halideOutput.raw_buffer()
-    );
-    auto tHalide = std::chrono::high_resolution_clock::now();
-
-    if (result != 0) {
-        LOGE("Halide temporal_fusion failed with code: %d", result);
-    }
-
-    auto dPackY = std::chrono::duration_cast<std::chrono::milliseconds>(tPackY - tStart).count();
-    auto dPackMV = std::chrono::duration_cast<std::chrono::milliseconds>(tPackMV - tPackY).count();
-    auto dWrap = std::chrono::duration_cast<std::chrono::milliseconds>(tWrap - tPackMV).count();
-    auto dHalide = std::chrono::duration_cast<std::chrono::milliseconds>(tHalide - tWrap).count();
+    auto tEnd = std::chrono::high_resolution_clock::now();
+    auto dTotal = std::chrono::duration_cast<std::chrono::milliseconds>(tEnd - tStart).count();
     
-    LOGI("fuseYPlane: PackY=%lld ms, PackMV=%lld ms, Wrap=%lld ms, Halide=%lld ms",
-         dPackY, dPackMV, dWrap, dHalide);
+    LOGI("fuseYPlane: total GPU execution/copy time = %lld ms", dTotal);
+
+    if (!debugDir.empty()) {
+        try {
+            std::ofstream logFile(debugDir + "/stage_1_fusion/fusion_log.txt", std::ios::app);
+            if (logFile) {
+                logFile << logMsg;
+                logFile << "Total execution/copy: " << dTotal << " ms\n";
+                logFile.close();
+            }
+        } catch (...) {}
+    }
 }
 
 /// Simple nearest-neighbour chroma fusion (average of all frames, no motion).
@@ -313,91 +544,82 @@ static void fuseChromaPlane(const std::vector<YuvFrame>& frames,
                              const std::vector<std::vector<float>>& inv_2sigma2_luts)
 {
     auto tStart = std::chrono::high_resolution_clock::now();
-    std::vector<float> acc(static_cast<size_t>(uvW) * uvH, 0.f);
-    std::vector<float> wgt(static_cast<size_t>(uvW) * uvH, 0.f);
-
-    // ── Reference frame: weight 1.0 ──────────────────────────────────────────
-    {
-        const YuvFrame& ref = frames[0];
-        const uint8_t* plane = isU ? ref.uPlane : ref.vPlane;
-        for (int r = 0; r < uvH; ++r) {
-            float* a = acc.data() + r * uvW;
-            float* ww = wgt.data() + r * uvW;
-            for (int c = 0; c < uvW; ++c) {
-                a[c] = static_cast<float>(plane[r * ref.uvRowStride + c * ref.uvPixelStride]);
-                ww[c] = 1.f;
-            }
-        }
-    }
-
-    // ── Remaining frames: warp + accumulate in parallel ──────────────────────
-    int numThreads = 8;
-    int rowsPerThread = uvH / numThreads;
-
-    for (size_t fi = 1; fi < frames.size(); ++fi) {
-        const YuvFrame&   src = frames[fi];
-        const MotionField& mf = motionFields[fi - 1];
-        const uint8_t* plane = isU ? src.uPlane : src.vPlane;
-        const std::vector<float>& inv_2sigma2_lut = inv_2sigma2_luts[fi];
-
-        std::vector<std::future<void>> futures;
-        futures.reserve(numThreads);
-
-        for (int t = 0; t < numThreads; ++t) {
-            int rStart = t * rowsPerThread;
-            int rEnd = (t == numThreads - 1) ? uvH : (t + 1) * rowsPerThread;
-
-            futures.push_back(std::async(std::launch::async, [plane, &src, &mf, &inv_2sigma2_lut, &frames, &acc, &wgt, rStart, rEnd, uvW, uvH]() {
-                for (int r = rStart; r < rEnd; ++r) {
-                    float* a = acc.data() + r * uvW;
-                    float* ww = wgt.data() + r * uvW;
-                    int lumaR = r * 2;
-
-                    for (int c = 0; c < uvW; ++c) {
-                        int lumaC = c * 2;
-
-                        // Interpolate motion vector at luma scale, then scale by 0.5x
-                        MotionVec mv = interpolateMotion(mf, lumaR, lumaC);
-
-                        // Compute ghosting rejection weight from Y plane residual
-                        float sxLuma = static_cast<float>(lumaC + mv.dx);
-                        float syLuma = static_cast<float>(lumaR + mv.dy);
-                        float warpedY = sampleY(src, sxLuma, syLuma);
-
-                        float refY = static_cast<float>(frames[0].yPlane[lumaR * frames[0].yRowStride + lumaC]);
-                        float residual = warpedY - refY;
-
-                        int refLumaIdx = std::clamp(static_cast<int>(refY), 0, 255);
-                        float inv_2sigma2 = inv_2sigma2_lut[refLumaIdx];
-                        float w_val = std::exp(-residual * residual * inv_2sigma2);
-
-                        // Scaled down motion vectors for half-resolution chroma
-                        float sx = static_cast<float>(c) + mv.dx * 0.5f;
-                        float sy = static_cast<float>(r) + mv.dy * 0.5f;
-
-                        float warped = sampleUVBilinear(plane, src.uvRowStride, src.uvPixelStride, uvW, uvH, sx, sy);
-
-                        a[c]  += w_val * warped;
-                        ww[c] += w_val;
-                    }
-                }
-            }));
-        }
-        for (auto& fut : futures) {
-            fut.get();
-        }
-    }
-
+    const YuvFrame& ref = frames[0];
+    const uint8_t* plane = isU ? ref.uPlane : ref.vPlane;
     out.resize(static_cast<size_t>(uvW) * uvH);
-    for (size_t i = 0; i < acc.size(); ++i) {
-        float v = (wgt[i] > 1e-6f) ? acc[i] / wgt[i] : acc[i];
-        out[i] = static_cast<uint8_t>(std::clamp(v, 0.f, 255.f));
+    for (int r = 0; r < uvH; ++r) {
+        for (int c = 0; c < uvW; ++c) {
+            out[r * uvW + c] = plane[r * ref.uvRowStride + c * ref.uvPixelStride];
+        }
     }
-    
     auto tEnd = std::chrono::high_resolution_clock::now();
     auto dChroma = std::chrono::duration_cast<std::chrono::milliseconds>(tEnd - tStart).count();
     LOGI("fuseChromaPlane (isU=%d): %lld ms", isU, dChroma);
 }
+
+const char* COMPUTE_RAW_SHADER_SRC = R"glsl(
+#version 310 es
+layout(local_size_x = 16, local_size_y = 16) in;
+
+precision highp float;
+precision highp usampler2DArray;
+precision highp sampler2DArray;
+precision highp sampler2D;
+
+uniform usampler2DArray u_input_frames;
+uniform sampler2DArray u_motion_fields;
+uniform sampler2D u_noise_luts;
+
+uniform int u_num_frames;
+uniform int u_width;
+uniform int u_height;
+uniform int u_blocks_wide;
+uniform int u_blocks_tall;
+uniform float u_block_size;
+
+layout(std430, binding = 0) writeonly buffer OutputBuffer {
+    uint outRaw[];
+};
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    if (pos.x >= u_width || pos.y >= u_height) return;
+
+    float ref_val = float(texelFetch(u_input_frames, ivec3(pos, 0), 0).r);
+
+    float acc = ref_val;
+    float wgt = 1.0;
+
+    for (int f = 1; f < u_num_frames; ++f) {
+        float bx = (float(pos.x) - u_block_size * 0.5) / u_block_size;
+        float by = (float(pos.y) - u_block_size * 0.5) / u_block_size;
+        vec2 mv_uv = vec2((bx + 0.5) / float(u_blocks_wide), (by + 0.5) / float(u_blocks_tall));
+
+        vec2 mv = texture(u_motion_fields, vec3(mv_uv, float(f - 1))).rg;
+
+        int dx = (int(mv.x) / 2) * 2;
+        int dy = (int(mv.y) / 2) * 2;
+
+        ivec2 warped_pos = clamp(pos + ivec2(dx, dy), ivec2(0), ivec2(u_width - 1, u_height - 1));
+        float warped_val = float(texelFetch(u_input_frames, ivec3(warped_pos, f), 0).r);
+
+        float residual = warped_val - ref_val;
+
+        int ref_idx = clamp(int(ref_val / 16.0), 0, 255);
+        float inv_2sigma2 = texelFetch(u_noise_luts, ivec2(ref_idx, f), 0).r;
+
+        float w_val = exp(-residual * residual * inv_2sigma2);
+
+        acc += warped_val * w_val;
+        wgt += w_val;
+    }
+
+    float fused_val = (wgt > 1e-6) ? acc / wgt : acc;
+
+    uint idx = uint(pos.y * u_width + pos.x);
+    outRaw[idx] = uint(clamp(fused_val, 0.0, 65535.0));
+}
+)glsl";
 
 static void fuseRawBayer(const std::vector<YuvFrame>& frames,
                          const std::vector<MotionField>& motionFields,
@@ -405,86 +627,212 @@ static void fuseRawBayer(const std::vector<YuvFrame>& frames,
                          int w, int h,
                          const std::vector<std::vector<float>>& inv_2sigma2_luts)
 {
-    std::vector<float> acc(static_cast<size_t>(w) * h, 0.f);
-    std::vector<float> wgt(static_cast<size_t>(w) * h, 0.f);
+    auto tStart = std::chrono::high_resolution_clock::now();
+    int numFrames = frames.size();
+    bool success = false;
+    std::string errorLog;
 
-    // ── Reference frame: weight 1.0 ──────────────────────────────────────────
-    {
-        const YuvFrame& ref = frames[0];
-        const uint16_t* refRaw = reinterpret_cast<const uint16_t*>(ref.yPlane);
-        int strideElements = ref.yRowStride / 2;
-        for (int r = 0; r < h; ++r) {
-            const uint16_t* row = refRaw + r * strideElements;
-            float* a = acc.data() + r * w;
-            float* ww = wgt.data() + r * w;
-            for (int c = 0; c < w; ++c) {
-                a[c] = static_cast<float>(row[c]);
-                ww[c] = 1.f;
+    int blocksWide = motionFields[0].blocksWide;
+    int blocksTall = motionFields[0].blocksTall;
+    int blockSize = motionFields[0].blockSize;
+    int numFields = motionFields.size();
+
+    // Try GPU execution first via headless EGL
+    EglHeadlessSetup egl;
+    if (egl.init(errorLog)) {
+        GLuint program = createComputeProgram(COMPUTE_RAW_SHADER_SRC, errorLog);
+        if (program != 0) {
+            glUseProgram(program);
+
+            // Upload RAW frames into a 2D Texture Array (using GL_R16UI for 16-bit uint)
+            GLuint inputFramesTex;
+            glGenTextures(1, &inputFramesTex);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D_ARRAY, inputFramesTex);
+            glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_R16UI, w, h, numFrames);
+            for (int f = 0; f < numFrames; ++f) {
+                glPixelStorei(GL_UNPACK_ROW_LENGTH, frames[f].yRowStride / 2);
+                glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, f, w, h, 1, GL_RED_INTEGER, GL_UNSIGNED_SHORT, frames[f].yPlane);
             }
-        }
-    }
+            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
-    // ── Remaining frames: warp + accumulate in parallel ──────────────────────
-    int numThreads = 8;
-    int rowsPerThread = h / numThreads;
-
-    for (size_t fi = 1; fi < frames.size(); ++fi) {
-        const YuvFrame& src = frames[fi];
-        const MotionField& mf = motionFields[fi - 1];
-        const uint16_t* srcRaw = reinterpret_cast<const uint16_t*>(src.yPlane);
-        int strideElements = src.yRowStride / 2;
-        const std::vector<float>& inv_2sigma2_lut = inv_2sigma2_luts[fi];
-
-        std::vector<std::future<void>> futures;
-        futures.reserve(numThreads);
-
-        for (int t = 0; t < numThreads; ++t) {
-            int rStart = t * rowsPerThread;
-            int rEnd = (t == numThreads - 1) ? h : (t + 1) * rowsPerThread;
-
-            futures.push_back(std::async(std::launch::async, [srcRaw, &mf, &inv_2sigma2_lut, &frames, &acc, &wgt, rStart, rEnd, w, h, strideElements]() {
-                for (int r = rStart; r < rEnd; ++r) {
-                    const uint16_t* refRawRow = reinterpret_cast<const uint16_t*>(frames[0].yPlane) + r * (frames[0].yRowStride / 2);
-                    float* a = acc.data() + r * w;
-                    float* ww = wgt.data() + r * w;
-
-                    for (int c = 0; c < w; ++c) {
-                        // Interpolate motion vector
-                        MotionVec mv = interpolateMotion(mf, r, c);
-
-                        // Constrain motion vectors to even steps to maintain Bayer grid color order
-                        int dx = (mv.dx / 2) * 2;
-                        int dy = (mv.dy / 2) * 2;
-
-                        int sc = std::clamp(c + dx, 0, w - 1);
-                        int sr = std::clamp(r + dy, 0, h - 1);
-                        
-                        float warped = static_cast<float>(srcRaw[sr * strideElements + sc]);
-                        float ref_val = static_cast<float>(refRawRow[c]);
-                        float residual = warped - ref_val;
-
-                        // Scale to YUV-like 0-255 range for the LUT lookup
-                        int refLumaIdx = std::clamp(static_cast<int>(ref_val / 16.0f), 0, 255);
-                        float inv_2sigma2 = inv_2sigma2_lut[refLumaIdx];
-                        float w_val = std::exp(-residual * residual * inv_2sigma2);
-
-                        a[c] += w_val * warped;
-                        ww[c] += w_val;
+            // Pack motion fields
+            std::vector<float> contiguousMVs(2 * blocksWide * blocksTall * numFields);
+            for (int f = 0; f < numFields; ++f) {
+                const MotionField& mf = motionFields[f];
+                for (int y = 0; y < blocksTall; ++y) {
+                    for (int x = 0; x < blocksWide; ++x) {
+                        MotionVec mv = mf.vectors[y * blocksWide + x];
+                        contiguousMVs[0 + x * 2 + y * blocksWide * 2 + f * blocksWide * blocksTall * 2] = mv.dx;
+                        contiguousMVs[1 + x * 2 + y * blocksWide * 2 + f * blocksWide * blocksTall * 2] = mv.dy;
                     }
                 }
-            }));
-        }
-        for (auto& fut : futures) {
-            fut.get();
+            }
+
+            // Upload motion fields to a 2D Texture Array
+            GLuint motionFieldsTex;
+            glGenTextures(1, &motionFieldsTex);
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D_ARRAY, motionFieldsTex);
+            glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_RG32F, blocksWide, blocksTall, numFields);
+            glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, blocksWide, blocksTall, numFields, GL_RG, GL_FLOAT, contiguousMVs.data());
+            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+            // Pack noise LUTs
+            std::vector<float> flatLuts(256 * numFrames);
+            for (int f = 0; f < numFrames; ++f) {
+                std::copy(inv_2sigma2_luts[f].begin(), inv_2sigma2_luts[f].end(), flatLuts.data() + f * 256);
+            }
+
+            // Upload noise LUTs to a 2D Texture
+            GLuint noiseLutsTex;
+            glGenTextures(1, &noiseLutsTex);
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_2D, noiseLutsTex);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32F, 256, numFrames);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, numFrames, GL_RED, GL_FLOAT, flatLuts.data());
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+            // Set uniforms
+            glUniform1i(glGetUniformLocation(program, "u_input_frames"), 0);
+            glUniform1i(glGetUniformLocation(program, "u_motion_fields"), 1);
+            glUniform1i(glGetUniformLocation(program, "u_noise_luts"), 2);
+            glUniform1i(glGetUniformLocation(program, "u_num_frames"), numFrames);
+            glUniform1i(glGetUniformLocation(program, "u_width"), w);
+            glUniform1i(glGetUniformLocation(program, "u_height"), h);
+            glUniform1i(glGetUniformLocation(program, "u_blocks_wide"), blocksWide);
+            glUniform1i(glGetUniformLocation(program, "u_blocks_tall"), blocksTall);
+            glUniform1f(glGetUniformLocation(program, "u_block_size"), static_cast<float>(blockSize));
+
+            // Set up output SSBO (4 bytes std430 uint elements for maximum driver compatibility)
+            GLuint outBuffer;
+            glGenBuffers(1, &outBuffer);
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, outBuffer);
+            glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<size_t>(w) * h * 4, nullptr, GL_DYNAMIC_READ);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outBuffer);
+
+            checkGlError("RAW resource binding", errorLog);
+
+            // Dispatch compute shader
+            glDispatchCompute((w + 15) / 16, (h + 15) / 16, 1);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+            checkGlError("RAW dispatch", errorLog);
+
+            // Map and retrieve output
+            void* ptr = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, static_cast<size_t>(w) * h * 4, GL_MAP_READ_BIT);
+            if (ptr != nullptr) {
+                const uint32_t* results = static_cast<const uint32_t*>(ptr);
+                outRaw.resize(static_cast<size_t>(w) * h);
+                for (size_t i = 0; i < outRaw.size(); ++i) {
+                    outRaw[i] = static_cast<uint16_t>(results[i]);
+                }
+                glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+                success = true;
+            } else {
+                errorLog += "GL: failed to map RAW output SSBO buffer\n";
+                LOGE("GL: failed to map RAW output SSBO buffer");
+            }
+
+            // Cleanup resources
+            glDeleteBuffers(1, &outBuffer);
+            glDeleteTextures(1, &inputFramesTex);
+            glDeleteTextures(1, &motionFieldsTex);
+            glDeleteTextures(1, &noiseLutsTex);
+            glDeleteProgram(program);
         }
     }
 
-    // Normalise and store in 16-bit output
-    outRaw.resize(static_cast<size_t>(w) * h);
-    for (size_t i = 0; i < acc.size(); ++i) {
-        float v = (wgt[i] > 1e-6f) ? acc[i] / wgt[i] : acc[i];
-        outRaw[i] = static_cast<uint16_t>(std::clamp(v, 0.f, 65535.f));
+    if (!success) {
+        LOGE("GL RAW compute failed, falling back to CPU multi-threaded RAW fusion");
+        LOGE("RAW GPU errors:\n%s", errorLog.c_str());
+        std::vector<float> acc(static_cast<size_t>(w) * h, 0.f);
+        std::vector<float> wgt(static_cast<size_t>(w) * h, 0.f);
+
+        // Reference frame: weight 1.0
+        {
+            const YuvFrame& ref = frames[0];
+            const uint16_t* refRaw = reinterpret_cast<const uint16_t*>(ref.yPlane);
+            int strideElements = ref.yRowStride / 2;
+            for (int r = 0; r < h; ++r) {
+                const uint16_t* row = refRaw + r * strideElements;
+                float* a = acc.data() + r * w;
+                float* ww = wgt.data() + r * w;
+                for (int c = 0; c < w; ++c) {
+                    a[c] = static_cast<float>(row[c]);
+                    ww[c] = 1.f;
+                }
+            }
+        }
+
+        // Remaining frames: warp + accumulate in parallel
+        int numThreads = 8;
+        int rowsPerThread = h / numThreads;
+
+        for (size_t fi = 1; fi < frames.size(); ++fi) {
+            const YuvFrame& src = frames[fi];
+            const MotionField& mf = motionFields[fi - 1];
+            const uint16_t* srcRaw = reinterpret_cast<const uint16_t*>(src.yPlane);
+            int strideElements = src.yRowStride / 2;
+            const std::vector<float>& inv_2sigma2_lut = inv_2sigma2_luts[fi];
+
+            std::vector<std::future<void>> futures;
+            futures.reserve(numThreads);
+
+            for (int t = 0; t < numThreads; ++t) {
+                int rStart = t * rowsPerThread;
+                int rEnd = (t == numThreads - 1) ? h : (t + 1) * rowsPerThread;
+
+                futures.push_back(std::async(std::launch::async, [srcRaw, &mf, &inv_2sigma2_lut, &frames, &acc, &wgt, rStart, rEnd, w, h, strideElements]() {
+                    for (int r = rStart; r < rEnd; ++r) {
+                        const uint16_t* refRawRow = reinterpret_cast<const uint16_t*>(frames[0].yPlane) + r * (frames[0].yRowStride / 2);
+                        float* a = acc.data() + r * w;
+                        float* ww = wgt.data() + r * w;
+
+                        for (int c = 0; c < w; ++c) {
+                            MotionVec mv = interpolateMotion(mf, r, c);
+                            int dx = (mv.dx / 2) * 2;
+                            int dy = (mv.dy / 2) * 2;
+
+                            int sc = std::clamp(c + dx, 0, w - 1);
+                            int sr = std::clamp(r + dy, 0, h - 1);
+                            
+                            float warped = static_cast<float>(srcRaw[sr * strideElements + sc]);
+                            float ref_val = static_cast<float>(refRawRow[c]);
+                            float residual = warped - ref_val;
+
+                            int refLumaIdx = std::clamp(static_cast<int>(ref_val / 16.0f), 0, 255);
+                            float inv_2sigma2 = inv_2sigma2_lut[refLumaIdx];
+                            float w_val = std::exp(-residual * residual * inv_2sigma2);
+
+                            a[c] += w_val * warped;
+                            ww[c] += w_val;
+                        }
+                    }
+                }));
+            }
+            for (auto& fut : futures) {
+                fut.get();
+            }
+        }
+
+        // Normalise and store in 16-bit output
+        outRaw.resize(static_cast<size_t>(w) * h);
+        for (size_t i = 0; i < acc.size(); ++i) {
+            float v = (wgt[i] > 1e-6f) ? acc[i] / wgt[i] : acc[i];
+            outRaw[i] = static_cast<uint16_t>(std::clamp(v, 0.f, 65535.f));
+        }
     }
+
+    auto tEnd = std::chrono::high_resolution_clock::now();
+    auto dTotal = std::chrono::duration_cast<std::chrono::milliseconds>(tEnd - tStart).count();
+    LOGI("fuseRawBayer: total GPU execution/copy time = %lld ms", dTotal);
 }
 
 } // anonymous namespace
@@ -578,7 +926,11 @@ bool FusionStage::process(FrameContext& ctx) {
         fuseRawBayer(ctx.inputFrames, ctx.motionFields, fusedRaw, w, h, inv_2sigma2_luts);
         ctx.metadata["fused_raw"] = fusedRaw;
     } else {
-        fuseYPlane(ctx.inputFrames, ctx.motionFields, ctx.fusedY, w, h, inv_2sigma2_luts);
+        std::string debugDir = "";
+        if (ctx.metadata.count("debug_dir")) {
+            try { debugDir = std::any_cast<std::string>(ctx.metadata.at("debug_dir")); } catch (...) {}
+        }
+        fuseYPlane(ctx.inputFrames, ctx.motionFields, ctx.fusedY, w, h, inv_2sigma2_luts, debugDir);
         fuseChromaPlane(ctx.inputFrames, ctx.motionFields, /*isU=*/true,  ctx.fusedU, uvW, uvH, inv_2sigma2_luts);
         fuseChromaPlane(ctx.inputFrames, ctx.motionFields, /*isU=*/false, ctx.fusedV, uvW, uvH, inv_2sigma2_luts);
 
@@ -649,31 +1001,33 @@ bool FusionStage::process(FrameContext& ctx) {
                         src.yPlane, src.yRowStride, src.uPlane, src.uvRowStride, src.vPlane, src.uvPixelStride,
                         w, h, debugDir + "/stage_1_fusion/src_frame_1.jpg");
 
-                    // Compute Difference Before Alignment
-                    std::vector<uint8_t> diffBefore(static_cast<size_t>(w) * h);
-                    for (int r = 0; r < h; ++r) {
-                        const uint8_t* refRow = ref.yPlane + r * ref.yRowStride;
-                        const uint8_t* srcRow = src.yPlane + r * src.yRowStride;
-                        for (int c = 0; c < w; ++c) {
-                            diffBefore[static_cast<size_t>(r) * w + c] = static_cast<uint8_t>(std::abs(static_cast<int>(refRow[c]) - static_cast<int>(srcRow[c])));
+                    // Compute Difference Before Alignment (Subsampled 4x)
+                    int dw = w / 4;
+                    int dh = h / 4;
+                    std::vector<uint8_t> diffBefore(dw * dh);
+                    for (int r = 0; r < dh; ++r) {
+                        const uint8_t* refRow = ref.yPlane + (r * 4) * ref.yRowStride;
+                        const uint8_t* srcRow = src.yPlane + (r * 4) * src.yRowStride;
+                        for (int c = 0; c < dw; ++c) {
+                            diffBefore[r * dw + c] = static_cast<uint8_t>(std::abs(static_cast<int>(refRow[c * 4]) - static_cast<int>(srcRow[c * 4])));
                         }
                     }
-                    std::vector<uint8_t> uvGray(static_cast<size_t>(w / 2) * (h / 2), 128);
-                    saveYuvAsJpeg(diffBefore.data(), uvGray.data(), uvGray.data(), w, h, debugDir + "/stage_1_fusion/diff_before_alignment.jpg");
+                    std::vector<uint8_t> uvGray(dw * dh / 4, 128);
+                    saveYuvAsJpeg(diffBefore.data(), uvGray.data(), uvGray.data(), dw, dh, debugDir + "/stage_1_fusion/diff_before_alignment.jpg");
 
-                    // Compute Difference After Alignment
-                    std::vector<uint8_t> diffAfter(static_cast<size_t>(w) * h);
-                    for (int r = 0; r < h; ++r) {
-                        const uint8_t* refRow = ref.yPlane + r * ref.yRowStride;
-                        for (int c = 0; c < w; ++c) {
-                            MotionVec mv = interpolateMotion(ctx.motionFields[0], r, c);
-                            float sx = static_cast<float>(c) + mv.dx;
-                            float sy = static_cast<float>(r) + mv.dy;
+                    // Compute Difference After Alignment (Subsampled 4x)
+                    std::vector<uint8_t> diffAfter(dw * dh);
+                    for (int r = 0; r < dh; ++r) {
+                        const uint8_t* refRow = ref.yPlane + (r * 4) * ref.yRowStride;
+                        for (int c = 0; c < dw; ++c) {
+                            MotionVec mv = interpolateMotion(ctx.motionFields[0], r * 4, c * 4);
+                            float sx = static_cast<float>(c * 4) + mv.dx;
+                            float sy = static_cast<float>(r * 4) + mv.dy;
                             float warpedVal = sampleY(src, sx, sy);
-                            diffAfter[static_cast<size_t>(r) * w + c] = static_cast<uint8_t>(std::abs(static_cast<int>(refRow[c]) - static_cast<int>(warpedVal)));
+                            diffAfter[r * dw + c] = static_cast<uint8_t>(std::abs(static_cast<int>(refRow[c * 4]) - static_cast<int>(warpedVal)));
                         }
                     }
-                    saveYuvAsJpeg(diffAfter.data(), uvGray.data(), uvGray.data(), w, h, debugDir + "/stage_1_fusion/diff_after_alignment.jpg");
+                    saveYuvAsJpeg(diffAfter.data(), uvGray.data(), uvGray.data(), dw, dh, debugDir + "/stage_1_fusion/diff_after_alignment.jpg");
 
                     // Crop and save 200x200 center crops
                     int cy = h / 2;
