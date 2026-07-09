@@ -47,8 +47,10 @@ static FloatImage yPlaneToFloatDownsampled2x(const YuvFrame& f, bool useRaw) {
             const uint8_t* src1 = src0 + f.yRowStride;
             float*         dst = out.ptr(row);
             for (int col = 0; col < dw; ++col) {
-                dst[col] = (src0[2 * col] + src0[2 * col + 1] +
-                            src1[2 * col] + src1[2 * col + 1]) * 0.25f;
+                // Average the 2x2 neighborhood
+                float sum = static_cast<float>(src0[2 * col]) + static_cast<float>(src0[2 * col + 1]) +
+                            static_cast<float>(src1[2 * col]) + static_cast<float>(src1[2 * col + 1]);
+                dst[col] = sum * 0.25f;
             }
         }
     }

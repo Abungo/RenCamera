@@ -63,6 +63,12 @@ set_target_properties(jpeg-static PROPERTIES
 )
 add_dependencies(jpeg-static libjpeg_turbo_ext)
 
+# ── Halide Generated Static Libraries ─────────────────────────────────────────
+add_library(temporal_fusion STATIC IMPORTED GLOBAL)
+set_target_properties(temporal_fusion PROPERTIES
+    IMPORTED_LOCATION ${CMAKE_CURRENT_SOURCE_DIR}/halide_generated/temporal_fusion.a
+)
+
 # ── Native shared library ─────────────────────────────────────────────────────
 add_library(gcam_core SHARED
     gcam_core.cpp
@@ -76,6 +82,7 @@ add_library(gcam_core SHARED
 
 target_include_directories(gcam_core PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/halide_generated
     ${LIBJPEG_TURBO_INSTALL}/include
 )
 
@@ -86,11 +93,14 @@ add_dependencies(gcam_core libjpeg_turbo_ext)
 find_library(android-lib   android)
 find_library(log-lib       log)
 find_library(mediandk-lib  mediandk)
+find_library(z-lib         z)
 
 target_link_libraries(gcam_core
     ${android-lib}
     ${log-lib}
     ${mediandk-lib}
+    ${z-lib}
     hwy
     jpeg-static   # libjpeg-turbo static lib target name
+    temporal_fusion # Halide AOT static library
 )

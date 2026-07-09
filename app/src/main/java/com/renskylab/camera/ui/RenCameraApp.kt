@@ -23,6 +23,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
@@ -537,6 +538,7 @@ private fun SettingsScreen(
     var expandedFuse by remember { mutableStateOf(false) }
     var expandedAwb by remember { mutableStateOf(false) }
     var expandedToneMap by remember { mutableStateOf(false) }
+    var expandedDebug by remember { mutableStateOf(false) }
 
     Box(
         modifier = Modifier
@@ -785,6 +787,37 @@ private fun SettingsScreen(
                         onShowInfo = { infoDialogText = "Black-Point Clamp" to "Applies quadratic compression to normalized base luminance values below this threshold. Prevents dark night skies from being lifted into noisy gray layers." }
                     )
                 }
+
+                // 6. Debug Settings Category
+                CategoryCard(
+                    title = "6. Debug & Diagnostics",
+                    expanded = expandedDebug,
+                    onToggle = { expandedDebug = !expandedDebug },
+                    infoText = "Developer diagnostics. These options write extra files to disk and may slow down capture.",
+                    onResetDefaults = {
+                        onConfigChange(config.copy(debugImagesEnabled = true, debugRawDumps = false))
+                    }
+                ) {
+                    // ── Master toggle ──────────────────────────────────────────
+                    SwitchSetting(
+                        label = "Debug Images",
+                        checked = config.debugImagesEnabled,
+                        description = "Write per-stage and per-frame JPEG previews to the capture folder for pipeline inspection. Disable for maximum capture speed.",
+                        onCheckedChange = { onConfigChange(config.copy(debugImagesEnabled = it)) },
+                        onShowInfo = { infoDialogText = "Debug Images" to "When enabled, each pipeline stage writes a JPEG snapshot to disk: ref_frame.jpg, src_frame_1.jpg, diff_before/after_alignment.jpg, denoised_crop.jpg, fused.jpg, debayered.jpg, tonemapped.jpg, final_output.jpg. These are useful for tuning and diagnosing the HDR+ algorithm. Disable to skip all debug writes and maximise capture speed." }
+                    )
+
+                    // ── Sub-toggle: raw binary dumps (only meaningful when master is on) ──
+                    Box(modifier = Modifier.alpha(if (config.debugImagesEnabled) 1f else 0.38f)) {
+                        SwitchSetting(
+                            label = "Also Write Raw Binaries",
+                            checked = config.debugRawDumps && config.debugImagesEnabled,
+                            description = "Additionally write uncompressed binary buffers: fused.yuv (∼19 MB), debayered.ppm (∼38 MB), tonemapped.ppm (∼38 MB). Opens in GIMP / ImageJ / ffplay. Adds ~25 s per capture.",
+                            onCheckedChange = { if (config.debugImagesEnabled) onConfigChange(config.copy(debugRawDumps = it)) },
+                            onShowInfo = { infoDialogText = "Also Write Raw Binaries" to "When enabled alongside Debug Images, each stage also writes its full-resolution uncompressed buffer: fused.yuv (planar YUV420), debayered.ppm (RGB P6 PPM), tonemapped.ppm (RGB P6 PPM). These contain the exact byte values after each computation and can be loaded in GIMP, ImageJ, or with ffplay -f rawvideo. Requires Debug Images to be on." }
+                        )
+                    }
+                }
             }
 
             Spacer(Modifier.height(16.dp))
@@ -982,9 +1015,10 @@ private fun SwitchSetting(
     checked: Boolean,
     description: String,
     onCheckedChange: (Boolean) -> Unit,
-    onShowInfo: () -> Unit
+    onShowInfo: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
-    Column(modifier = Modifier.fillMaxWidth()) {
+    Column(modifier = modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,

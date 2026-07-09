@@ -186,13 +186,19 @@ bool DebayerStage::process(FrameContext& ctx) {
         try {
             std::string debugDir = std::any_cast<std::string>(ctx.metadata.at("debug_dir"));
             
-            // Raw PPM
-            std::string ppmPath = debugDir + "/stage_2_debayer/debayered.ppm";
-            std::ofstream out(ppmPath, std::ios::binary);
-            if (out) {
-                out << "P6\n" << w << " " << h << "\n255\n";
-                out.write(reinterpret_cast<const char*>(ctx.colorImage.data.data()), ctx.colorImage.data.size());
-                out.close();
+            // Raw PPM — only written when debug_raw_dumps is enabled
+            bool rawDumps = false;
+            if (ctx.metadata.count("debug_raw_dumps")) {
+                try { rawDumps = std::any_cast<bool>(ctx.metadata.at("debug_raw_dumps")); } catch (...) {}
+            }
+            if (rawDumps) {
+                std::string ppmPath = debugDir + "/stage_2_debayer/debayered.ppm";
+                std::ofstream out(ppmPath, std::ios::binary);
+                if (out) {
+                    out << "P6\n" << w << " " << h << "\n255\n";
+                    out.write(reinterpret_cast<const char*>(ctx.colorImage.data.data()), ctx.colorImage.data.size());
+                    out.close();
+                }
             }
             
             // JPEG preview

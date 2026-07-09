@@ -31,7 +31,16 @@ data class PipelineConfig(
     val isoOverride: Int = 0,
 
     // Captures 16-bit RAW Bayer sensor data instead of 8-bit YUV
-    val useRawCapture: Boolean = true
+    val useRawCapture: Boolean = true,
+
+    // Debug: also write raw binary dumps (YUV / PPM) per stage alongside JPEGs.
+    // Disabled by default — these blobs are large (~94 MB) and slow down capture.
+    // Enable temporarily when you need to inspect pixel-exact intermediate buffers.
+    val debugRawDumps: Boolean = false,
+
+    // Debug: master switch — enables all per-stage debug image writing (frame JPEGs +
+    // pipeline-step JPEGs). When off, no debug images are written at all (fastest path).
+    val debugImagesEnabled: Boolean = true
 ) : Serializable {
 
     companion object {
@@ -63,6 +72,8 @@ data class PipelineConfig(
             var blackPointClamp = 0.08f
             var isoOverride = 0
             var useRawCapture = true
+            var debugRawDumps = false
+            var debugImagesEnabled = true
 
             val tagRegex = "<([^>]+)>([^<]*)</\\1>".toRegex()
             val matches = tagRegex.findAll(xml)
@@ -84,6 +95,8 @@ data class PipelineConfig(
                     "blackPointClamp" -> blackPointClamp = value.toFloatOrNull() ?: 0.08f
                     "isoOverride" -> isoOverride = value.toIntOrNull() ?: 0
                     "useRawCapture" -> useRawCapture = value.toBooleanStrictOrNull() ?: false
+                    "debugRawDumps" -> debugRawDumps = value.toBooleanStrictOrNull() ?: false
+                    "debugImagesEnabled" -> debugImagesEnabled = value.toBooleanStrictOrNull() ?: true
                     else -> {
                         if (tag.startsWith("stage_")) {
                             val stageName = tag.substringAfter("stage_")
@@ -107,7 +120,9 @@ data class PipelineConfig(
                 saturationBoost = saturationBoost,
                 blackPointClamp = blackPointClamp,
                 isoOverride = isoOverride,
-                useRawCapture = useRawCapture
+                useRawCapture = useRawCapture,
+                debugRawDumps = debugRawDumps,
+                debugImagesEnabled = debugImagesEnabled
             )
         }
     }
@@ -124,7 +139,9 @@ data class PipelineConfig(
             blackPointClamp,                           // 7
             spatialDenoiseStrength.toFloat(),          // 8
             isoOverride.toFloat(),                     // 9
-            if (useRawCapture) 1.0f else 0.0f          // 10
+            if (useRawCapture) 1.0f else 0.0f,   // 10
+            if (debugRawDumps) 1.0f else 0.0f,    // 11
+            if (debugImagesEnabled) 1.0f else 0.0f // 12
         )
     }
 
@@ -153,6 +170,8 @@ data class PipelineConfig(
         sb.append("  <blackPointClamp>${blackPointClamp}</blackPointClamp>\n")
         sb.append("  <isoOverride>${isoOverride}</isoOverride>\n")
         sb.append("  <useRawCapture>${useRawCapture}</useRawCapture>\n")
+        sb.append("  <debugRawDumps>${debugRawDumps}</debugRawDumps>\n")
+        sb.append("  <debugImagesEnabled>${debugImagesEnabled}</debugImagesEnabled>\n")
         stageEnabled.forEach { (k, v) ->
             sb.append("  <stage_${k}>${v}</stage_${k}>\n")
         }

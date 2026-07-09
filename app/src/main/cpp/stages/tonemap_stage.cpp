@@ -6,6 +6,7 @@
 #include <vector>
 #include <fstream>
 #include <any>
+#include <future>
 
 namespace {
 
@@ -325,9 +326,10 @@ bool ToneMapStage::process(FrameContext& ctx) {
     BilateralGrid grid;
     grid.init(w, h);
 
-    for (int r = 0; r < h; ++r) {
+    // Splat only 1 in 16 pixels (4x subsampling in both X and Y)
+    for (int r = 0; r < h; r += 4) {
         const uint8_t* row = ctx.colorImage.rowPtr(r);
-        for (int c = 0; c < w; ++c) {
+        for (int c = 0; c < w; c += 4) {
             float L = luma(row[c*3], row[c*3+1], row[c*3+2]);
             grid.splat(c, r, L);
         }
@@ -336,45 +338,61 @@ bool ToneMapStage::process(FrameContext& ctx) {
     // ── 2. Blur grid ─────────────────────────────────────────────────────────
     grid.blur();
 
-    // ── 3. Sample + reconstruct ───────────────────────────────────────────────
-    for (int r = 0; r < h; ++r) {
-        const uint8_t* src = ctx.colorImage.rowPtr(r);
-        uint8_t*       dst = ctx.processedImage.rowPtr(r);
+    // ── 3. Sample + reconstruct in parallel ───────────────────────────────────
+    int numThreads = 8;
+    int rowsPerThread = h / numThreads;
+    std::vector<std::future<void>> futures;
+    futures.reserve(numThreads);
 
-        for (int c = 0; c < w; ++c) {
-            float L = luma(src[c*3], src[c*3+1], src[c*3+2]);
+    for (int t = 0; t < numThreads; ++t) {
+        int rStart = t * rowsPerThread;
+        int rEnd = (t == numThreads - 1) ? h : (t + 1) * rowsPerThread;
 
-            float baseL = grid.sample(c, r, L);
-            baseL = std::max(1.f, baseL);
+        futures.push_back(std::async(std::launch::async, [&ctx, &grid, rStart, rEnd, w, h, adaptiveGamma, isNight, blackPointClamp, detailAlpha, saturationBoost]() {
+            for (int r = rStart; r < rEnd; ++r) {
+                const uint8_t* src = ctx.colorImage.rowPtr(r);
+                uint8_t*       dst = ctx.processedImage.rowPtr(r);
 
-            // Normalize base luminance to [0, 1] for filmic curve
-            float normBase = baseL / 255.f;
-            float boostedBase = std::pow(normBase, adaptiveGamma);
-            
-            // Soft black-point compression for night mode (preserves deep black skies)
-            if (isNight && boostedBase < blackPointClamp) {
-                boostedBase = (boostedBase * boostedBase) / blackPointClamp;
+                for (int c = 0; c < w; ++c) {
+                    float L = luma(src[c*3], src[c*3+1], src[c*3+2]);
+
+                    float baseL = grid.sample(c, r, L);
+                    baseL = std::max(1.f, baseL);
+
+                    // Normalize base luminance to [0, 1] for filmic curve
+                    float normBase = baseL / 255.f;
+                    float boostedBase = std::pow(normBase, adaptiveGamma);
+                    
+                    // Soft black-point compression for night mode (preserves deep black skies)
+                    if (isNight && boostedBase < blackPointClamp) {
+                        boostedBase = (boostedBase * boostedBase) / blackPointClamp;
+                    }
+                    
+                    float compBase = acesFilm(boostedBase) * 255.f;
+
+                    // Multiplicative detail boosting (equivalent to log-domain tone mapping)
+                    float ratio = (L > 0.f) ? L / baseL : 0.f;
+                    float compL = compBase * std::pow(ratio, detailAlpha);
+                    compL = std::clamp(compL, 0.f, 255.f);
+
+                    // Scale RGB channels to match new luminance (preserves hue)
+                    float scale = (L > 0.1f) ? compL / L : 1.f;
+                    scale = std::min(scale, 8.0f); // limit maximum noise amplification
+                    uint8_t oR = static_cast<uint8_t>(std::clamp(src[c*3]   * scale, 0.f, 255.f));
+                    uint8_t oG = static_cast<uint8_t>(std::clamp(src[c*3+1] * scale, 0.f, 255.f));
+                    uint8_t oB = static_cast<uint8_t>(std::clamp(src[c*3+2] * scale, 0.f, 255.f));
+
+                    // Saturation boost
+                    adjustSaturation(oR, oG, oB, saturationBoost);
+
+                    dst[c*3] = oR; dst[c*3+1] = oG; dst[c*3+2] = oB;
+                }
             }
-            
-            float compBase = acesFilm(boostedBase) * 255.f;
+        }));
+    }
 
-            // Multiplicative detail boosting (equivalent to log-domain tone mapping)
-            float ratio = (L > 0.f) ? L / baseL : 0.f;
-            float compL = compBase * std::pow(ratio, detailAlpha);
-            compL = std::clamp(compL, 0.f, 255.f);
-
-            // Scale RGB channels to match new luminance (preserves hue)
-            float scale = (L > 0.1f) ? compL / L : 1.f;
-            scale = std::min(scale, 8.0f); // limit maximum noise amplification
-            uint8_t oR = static_cast<uint8_t>(std::clamp(src[c*3]   * scale, 0.f, 255.f));
-            uint8_t oG = static_cast<uint8_t>(std::clamp(src[c*3+1] * scale, 0.f, 255.f));
-            uint8_t oB = static_cast<uint8_t>(std::clamp(src[c*3+2] * scale, 0.f, 255.f));
-
-            // Saturation boost
-            adjustSaturation(oR, oG, oB, saturationBoost);
-
-            dst[c*3] = oR; dst[c*3+1] = oG; dst[c*3+2] = oB;
-        }
+    for (auto& fut : futures) {
+        fut.get();
     }
 
     // Save intermediate tonemapped RGB + JPEG
@@ -382,16 +400,22 @@ bool ToneMapStage::process(FrameContext& ctx) {
         try {
             std::string debugDir = std::any_cast<std::string>(ctx.metadata.at("debug_dir"));
             
-            // Raw PPM
-            std::string ppmPath = debugDir + "/stage_3_tonemap/tonemapped.ppm";
-            std::ofstream out(ppmPath, std::ios::binary);
-            if (out) {
-                out << "P6\n" << w << " " << h << "\n255\n";
-                out.write(reinterpret_cast<const char*>(ctx.processedImage.data.data()), ctx.processedImage.data.size());
-                out.close();
+            // Raw PPM — only written when debug_raw_dumps is enabled
+            bool rawDumps = false;
+            if (ctx.metadata.count("debug_raw_dumps")) {
+                try { rawDumps = std::any_cast<bool>(ctx.metadata.at("debug_raw_dumps")); } catch (...) {}
+            }
+            if (rawDumps) {
+                std::string ppmPath = debugDir + "/stage_3_tonemap/tonemapped.ppm";
+                std::ofstream out(ppmPath, std::ios::binary);
+                if (out) {
+                    out << "P6\n" << w << " " << h << "\n255\n";
+                    out.write(reinterpret_cast<const char*>(ctx.processedImage.data.data()), ctx.processedImage.data.size());
+                    out.close();
+                }
             }
             
-            // JPEG preview
+            // JPEG previews
             saveRgbAsJpeg(
                 ctx.processedImage.data.data(), w, h,
                 debugDir + "/stage_3_tonemap/tonemapped.jpg");

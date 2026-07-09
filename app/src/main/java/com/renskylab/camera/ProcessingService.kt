@@ -159,15 +159,15 @@ class ProcessingService : Service() {
             java.io.File(rawDir, "stage_1_fusion").mkdirs()
             java.io.File(rawDir, "stage_2_debayer").mkdirs()
             java.io.File(rawDir, "stage_3_tonemap").mkdirs()
-            Log.i(TAG, "Saving raw frames to ${rawDir.absolutePath}")
-            NativeEngine.saveRawBurst(job.nativeBurstHandle, rawDir.absolutePath, job.config.useRawCapture)
+            // Log.i(TAG, "Saving raw frames to ${rawDir.absolutePath}")
+            // NativeEngine.saveRawBurst(job.nativeBurstHandle, rawDir.absolutePath, job.config.useRawCapture)
 
             val jpegBytes = runNativeEngine(
                 job.nativeBurstHandle,
                 job.config,
                 job.iso,
                 job.frameIsos,
-                rawDir.absolutePath,
+                if (job.config.debugImagesEnabled) rawDir.absolutePath else "", // master debug toggle
                 object : NativeEngine.ProgressListener {
                     override fun onProgress(step: String, percentage: Int) {
                         updateNotification(step, percentage)

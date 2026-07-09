@@ -6,6 +6,9 @@
 #include <vector>
 #include <fstream>
 #include <future>
+#include <chrono>
+#include "HalideBuffer.h"
+#include "temporal_fusion.h"
 
 // Highway SIMD for the vectorized accumulation inner loop
 #include <hwy/highway.h>
@@ -122,46 +125,67 @@ static void spatialDenoiseLuma(std::vector<uint8_t>& yPlane, int w, int h,
                                 int h_strength, int template_half = 1, int search_half = 3)
 {
     if (h_strength <= 0) return;
+    auto tStart = std::chrono::high_resolution_clock::now();
     const float h2 = static_cast<float>(h_strength * h_strength);
     std::vector<uint8_t> output(yPlane.size());
 
-    for (int r = 0; r < h; ++r) {
-        for (int c = 0; c < w; ++c) {
-            float weightedSum = 0.f;
-            float totalWeight = 0.f;
+    int numThreads = 8;
+    int rowsPerThread = h / numThreads;
+    std::vector<std::future<void>> futures;
+    futures.reserve(numThreads);
 
-            for (int sr = r - search_half; sr <= r + search_half; ++sr) {
-                for (int sc = c - search_half; sc <= c + search_half; ++sc) {
-                    // Compute SSD of patch centred at (r,c) vs (sr,sc)
-                    float patchDist = 0.f;
-                    int patchCount = 0;
-                    for (int tr = -template_half; tr <= template_half; ++tr) {
-                        for (int tc = -template_half; tc <= template_half; ++tc) {
-                            int r1 = std::clamp(r  + tr, 0, h - 1);
-                            int c1 = std::clamp(c  + tc, 0, w - 1);
-                            int r2 = std::clamp(sr + tr, 0, h - 1);
-                            int c2 = std::clamp(sc + tc, 0, w - 1);
-                            float diff = static_cast<float>(yPlane[r1 * w + c1])
-                                       - static_cast<float>(yPlane[r2 * w + c2]);
-                            patchDist += diff * diff;
-                            ++patchCount;
+    for (int t = 0; t < numThreads; ++t) {
+        int rStart = t * rowsPerThread;
+        int rEnd = (t == numThreads - 1) ? h : (t + 1) * rowsPerThread;
+
+        futures.push_back(std::async(std::launch::async, [&yPlane, &output, rStart, rEnd, w, h, h2, template_half, search_half]() {
+            for (int r = rStart; r < rEnd; ++r) {
+                for (int c = 0; c < w; ++c) {
+                    float weightedSum = 0.f;
+                    float totalWeight = 0.f;
+
+                    for (int sr = r - search_half; sr <= r + search_half; ++sr) {
+                        for (int sc = c - search_half; sc <= c + search_half; ++sc) {
+                            // Compute SSD of patch centred at (r,c) vs (sr,sc)
+                            float patchDist = 0.f;
+                            int patchCount = 0;
+                            for (int tr = -template_half; tr <= template_half; ++tr) {
+                                for (int tc = -template_half; tc <= template_half; ++tc) {
+                                    int r1 = std::clamp(r  + tr, 0, h - 1);
+                                    int c1 = std::clamp(c  + tc, 0, w - 1);
+                                    int r2 = std::clamp(sr + tr, 0, h - 1);
+                                    int c2 = std::clamp(sc + tc, 0, w - 1);
+                                    float diff = static_cast<float>(yPlane[r1 * w + c1])
+                                               - static_cast<float>(yPlane[r2 * w + c2]);
+                                    patchDist += diff * diff;
+                                    ++patchCount;
+                                }
+                            }
+                            patchDist /= static_cast<float>(patchCount);
+
+                            float weight = std::exp(-patchDist / h2);
+                            int clampedSr = std::clamp(sr, 0, h - 1);
+                            int clampedSc = std::clamp(sc, 0, w - 1);
+                            weightedSum += weight * static_cast<float>(yPlane[clampedSr * w + clampedSc]);
+                            totalWeight += weight;
                         }
                     }
-                    patchDist /= static_cast<float>(patchCount);
 
-                    float weight = std::exp(-patchDist / h2);
-                    int clampedSr = std::clamp(sr, 0, h - 1);
-                    int clampedSc = std::clamp(sc, 0, w - 1);
-                    weightedSum += weight * static_cast<float>(yPlane[clampedSr * w + clampedSc]);
-                    totalWeight += weight;
+                    output[r * w + c] = static_cast<uint8_t>(
+                        std::clamp(weightedSum / totalWeight, 0.f, 255.f));
                 }
             }
-
-            output[r * w + c] = static_cast<uint8_t>(
-                std::clamp(weightedSum / totalWeight, 0.f, 255.f));
-        }
+        }));
     }
+
+    for (auto& fut : futures) {
+        fut.get();
+    }
+
     yPlane = std::move(output);
+    auto tEnd = std::chrono::high_resolution_clock::now();
+    auto dDenoise = std::chrono::duration_cast<std::chrono::milliseconds>(tEnd - tStart).count();
+    LOGI("spatialDenoiseLuma: %lld ms", dDenoise);
 }
 
 static inline MotionVec interpolateMotion(const MotionField& mf, int r, int c) {
@@ -207,76 +231,76 @@ static void fuseYPlane(const std::vector<YuvFrame>& frames,
                        int w, int h,
                        const std::vector<std::vector<float>>& inv_2sigma2_luts)
 {
-    std::vector<float> acc(static_cast<size_t>(w) * h, 0.f);
-    std::vector<float> wgt(static_cast<size_t>(w) * h, 0.f);
-
-    // ── Reference frame: weight 1.0 ──────────────────────────────────────────
-    {
-        const YuvFrame& ref = frames[0];
+    auto tStart = std::chrono::high_resolution_clock::now();
+    int numFrames = frames.size();
+    
+    // 1. Pack Y plane frames into a contiguous 3D vector [w, h, numFrames]
+    std::vector<uint8_t> contiguousFrames(static_cast<size_t>(w) * h * numFrames);
+    for (int f = 0; f < numFrames; ++f) {
+        const YuvFrame& frame = frames[f];
         for (int r = 0; r < h; ++r) {
-            const uint8_t* row = ref.yPlane + r * ref.yRowStride;
-            float*         a   = acc.data() + r * w;
-            float*         ww  = wgt.data() + r * w;
-            for (int c = 0; c < w; ++c) {
-                a[c]  = static_cast<float>(row[c]);
-                ww[c] = 1.f;
+            std::copy(frame.yPlane + r * frame.yRowStride,
+                      frame.yPlane + r * frame.yRowStride + w,
+                      contiguousFrames.data() + f * w * h + r * w);
+        }
+    }
+    auto tPackY = std::chrono::high_resolution_clock::now();
+
+    // 2. Pack motion fields into contiguous 4D vector [2, blocksWide, blocksTall, numFrames - 1]
+    int blocksWide = motionFields[0].blocksWide;
+    int blocksTall = motionFields[0].blocksTall;
+    int blockSize = motionFields[0].blockSize;
+    int numFields = motionFields.size();
+    std::vector<float> contiguousMVs(2 * blocksWide * blocksTall * numFields);
+    for (int f = 0; f < numFields; ++f) {
+        const MotionField& mf = motionFields[f];
+        for (int y = 0; y < blocksTall; ++y) {
+            for (int x = 0; x < blocksWide; ++x) {
+                MotionVec mv = mf.vectors[y * blocksWide + x];
+                contiguousMVs[0 + x * 2 + y * blocksWide * 2 + f * blocksWide * blocksTall * 2] = mv.dx;
+                contiguousMVs[1 + x * 2 + y * blocksWide * 2 + f * blocksWide * blocksTall * 2] = mv.dy;
             }
         }
     }
+    auto tPackMV = std::chrono::high_resolution_clock::now();
 
-    // ── Remaining frames: warp + weighted accumulate in parallel ──────────────
-    int numThreads = 8;
-    int rowsPerThread = h / numThreads;
-
-    for (size_t fi = 1; fi < frames.size(); ++fi) {
-        const YuvFrame&   src = frames[fi];
-        const MotionField& mf = motionFields[fi - 1];
-        const std::vector<float>& inv_2sigma2_lut = inv_2sigma2_luts[fi];
-
-        std::vector<std::future<void>> futures;
-        futures.reserve(numThreads);
-
-        for (int t = 0; t < numThreads; ++t) {
-            int rStart = t * rowsPerThread;
-            int rEnd = (t == numThreads - 1) ? h : (t + 1) * rowsPerThread;
-
-            futures.push_back(std::async(std::launch::async, [&src, &mf, &inv_2sigma2_lut, &frames, &acc, &wgt, rStart, rEnd, w, h]() {
-                for (int r = rStart; r < rEnd; ++r) {
-                    const uint8_t* refRow = frames[0].yPlane + r * frames[0].yRowStride;
-                    float*         a      = acc.data() + r * w;
-                    float*         ww     = wgt.data() + r * w;
-
-                    for (int c = 0; c < w; ++c) {
-                        // Interpolate motion vector for smooth warping (prevents block artifacts)
-                        MotionVec mv = interpolateMotion(mf, r, c);
-
-                        float sx = static_cast<float>(c + mv.dx);
-                        float sy = static_cast<float>(r + mv.dy);
-                        float warped = sampleY(src, sx, sy);
-
-                        float ref_val = static_cast<float>(refRow[c]);
-                        float residual = warped - ref_val;
-
-                        int refLumaIdx = std::clamp(static_cast<int>(ref_val), 0, 255);
-                        float inv_2sigma2 = inv_2sigma2_lut[refLumaIdx];
-                        float w_val = std::exp(-residual * residual * inv_2sigma2);
-
-                        a[c]  += w_val * warped;
-                        ww[c] += w_val;
-                    }
-                }
-            }));
-        }
-        for (auto& fut : futures) {
-            fut.get();
-        }
+    // 3. Pack noise LUTs into contiguous 2D vector [256, numFrames]
+    std::vector<float> flatLuts(256 * numFrames);
+    for (int f = 0; f < numFrames; ++f) {
+        std::copy(inv_2sigma2_luts[f].begin(), inv_2sigma2_luts[f].end(), flatLuts.data() + f * 256);
     }
 
+    // 4. Set up output buffer
     outY.resize(static_cast<size_t>(w) * h);
-    for (size_t i = 0; i < acc.size(); ++i) {
-        float v = (wgt[i] > 1e-6f) ? acc[i] / wgt[i] : acc[i];
-        outY[i] = static_cast<uint8_t>(std::clamp(v, 0.f, 255.f));
+
+    // 5. Wrap in Halide::Runtime::Buffer objects
+    Halide::Runtime::Buffer<uint8_t, 3> halideFrames(contiguousFrames.data(), w, h, numFrames);
+    Halide::Runtime::Buffer<float, 4> halideMVs(contiguousMVs.data(), 2, blocksWide, blocksTall, numFields);
+    Halide::Runtime::Buffer<float, 2> halideLuts(flatLuts.data(), 256, numFrames);
+    Halide::Runtime::Buffer<uint8_t, 2> halideOutput(outY.data(), w, h);
+    auto tWrap = std::chrono::high_resolution_clock::now();
+
+    // 6. Execute AOT Halide pipeline
+    int result = temporal_fusion(
+        halideFrames.raw_buffer(),
+        halideMVs.raw_buffer(),
+        halideLuts.raw_buffer(),
+        blockSize, // block size (32 at full res)
+        halideOutput.raw_buffer()
+    );
+    auto tHalide = std::chrono::high_resolution_clock::now();
+
+    if (result != 0) {
+        LOGE("Halide temporal_fusion failed with code: %d", result);
     }
+
+    auto dPackY = std::chrono::duration_cast<std::chrono::milliseconds>(tPackY - tStart).count();
+    auto dPackMV = std::chrono::duration_cast<std::chrono::milliseconds>(tPackMV - tPackY).count();
+    auto dWrap = std::chrono::duration_cast<std::chrono::milliseconds>(tWrap - tPackMV).count();
+    auto dHalide = std::chrono::duration_cast<std::chrono::milliseconds>(tHalide - tWrap).count();
+    
+    LOGI("fuseYPlane: PackY=%lld ms, PackMV=%lld ms, Wrap=%lld ms, Halide=%lld ms",
+         dPackY, dPackMV, dWrap, dHalide);
 }
 
 /// Simple nearest-neighbour chroma fusion (average of all frames, no motion).
@@ -288,6 +312,7 @@ static void fuseChromaPlane(const std::vector<YuvFrame>& frames,
                              int uvW, int uvH,
                              const std::vector<std::vector<float>>& inv_2sigma2_luts)
 {
+    auto tStart = std::chrono::high_resolution_clock::now();
     std::vector<float> acc(static_cast<size_t>(uvW) * uvH, 0.f);
     std::vector<float> wgt(static_cast<size_t>(uvW) * uvH, 0.f);
 
@@ -305,45 +330,61 @@ static void fuseChromaPlane(const std::vector<YuvFrame>& frames,
         }
     }
 
-    // ── Remaining frames: warp + accumulate ──────────────────────────────────
+    // ── Remaining frames: warp + accumulate in parallel ──────────────────────
+    int numThreads = 8;
+    int rowsPerThread = uvH / numThreads;
+
     for (size_t fi = 1; fi < frames.size(); ++fi) {
         const YuvFrame&   src = frames[fi];
         const MotionField& mf = motionFields[fi - 1];
         const uint8_t* plane = isU ? src.uPlane : src.vPlane;
         const std::vector<float>& inv_2sigma2_lut = inv_2sigma2_luts[fi];
 
-        for (int r = 0; r < uvH; ++r) {
-            float* a = acc.data() + r * uvW;
-            float* ww = wgt.data() + r * uvW;
-            int lumaR = r * 2;
+        std::vector<std::future<void>> futures;
+        futures.reserve(numThreads);
 
-            for (int c = 0; c < uvW; ++c) {
-                int lumaC = c * 2;
+        for (int t = 0; t < numThreads; ++t) {
+            int rStart = t * rowsPerThread;
+            int rEnd = (t == numThreads - 1) ? uvH : (t + 1) * rowsPerThread;
 
-                // Interpolate motion vector at luma scale, then scale by 0.5x
-                MotionVec mv = interpolateMotion(mf, lumaR, lumaC);
+            futures.push_back(std::async(std::launch::async, [plane, &src, &mf, &inv_2sigma2_lut, &frames, &acc, &wgt, rStart, rEnd, uvW, uvH]() {
+                for (int r = rStart; r < rEnd; ++r) {
+                    float* a = acc.data() + r * uvW;
+                    float* ww = wgt.data() + r * uvW;
+                    int lumaR = r * 2;
 
-                // Compute ghosting rejection weight from Y plane residual
-                float sxLuma = static_cast<float>(lumaC + mv.dx);
-                float syLuma = static_cast<float>(lumaR + mv.dy);
-                float warpedY = sampleY(src, sxLuma, syLuma);
+                    for (int c = 0; c < uvW; ++c) {
+                        int lumaC = c * 2;
 
-                float refY = static_cast<float>(frames[0].yPlane[lumaR * frames[0].yRowStride + lumaC]);
-                float residual = warpedY - refY;
+                        // Interpolate motion vector at luma scale, then scale by 0.5x
+                        MotionVec mv = interpolateMotion(mf, lumaR, lumaC);
 
-                int refLumaIdx = std::clamp(static_cast<int>(refY), 0, 255);
-                float inv_2sigma2 = inv_2sigma2_lut[refLumaIdx];
-                float w_val = std::exp(-residual * residual * inv_2sigma2);
+                        // Compute ghosting rejection weight from Y plane residual
+                        float sxLuma = static_cast<float>(lumaC + mv.dx);
+                        float syLuma = static_cast<float>(lumaR + mv.dy);
+                        float warpedY = sampleY(src, sxLuma, syLuma);
 
-                // Scaled down motion vectors for half-resolution chroma
-                float sx = static_cast<float>(c) + mv.dx * 0.5f;
-                float sy = static_cast<float>(r) + mv.dy * 0.5f;
+                        float refY = static_cast<float>(frames[0].yPlane[lumaR * frames[0].yRowStride + lumaC]);
+                        float residual = warpedY - refY;
 
-                float warped = sampleUVBilinear(plane, src.uvRowStride, src.uvPixelStride, uvW, uvH, sx, sy);
+                        int refLumaIdx = std::clamp(static_cast<int>(refY), 0, 255);
+                        float inv_2sigma2 = inv_2sigma2_lut[refLumaIdx];
+                        float w_val = std::exp(-residual * residual * inv_2sigma2);
 
-                a[c]  += w_val * warped;
-                ww[c] += w_val;
-            }
+                        // Scaled down motion vectors for half-resolution chroma
+                        float sx = static_cast<float>(c) + mv.dx * 0.5f;
+                        float sy = static_cast<float>(r) + mv.dy * 0.5f;
+
+                        float warped = sampleUVBilinear(plane, src.uvRowStride, src.uvPixelStride, uvW, uvH, sx, sy);
+
+                        a[c]  += w_val * warped;
+                        ww[c] += w_val;
+                    }
+                }
+            }));
+        }
+        for (auto& fut : futures) {
+            fut.get();
         }
     }
 
@@ -352,6 +393,10 @@ static void fuseChromaPlane(const std::vector<YuvFrame>& frames,
         float v = (wgt[i] > 1e-6f) ? acc[i] / wgt[i] : acc[i];
         out[i] = static_cast<uint8_t>(std::clamp(v, 0.f, 255.f));
     }
+    
+    auto tEnd = std::chrono::high_resolution_clock::now();
+    auto dChroma = std::chrono::duration_cast<std::chrono::milliseconds>(tEnd - tStart).count();
+    LOGI("fuseChromaPlane (isU=%d): %lld ms", isU, dChroma);
 }
 
 static void fuseRawBayer(const std::vector<YuvFrame>& frames,
@@ -559,9 +604,9 @@ bool FusionStage::process(FrameContext& ctx) {
                     spatialStrength = std::any_cast<int>(ctx.metadata.at("spatial_denoise_strength"));
                 } catch (...) {}
             }
-            if (spatialStrength > 0) {
+            if (isNight && spatialStrength > 0) {
                 LOGI("FusionStage: applying spatial NL-Means luma denoise (h=%d)", spatialStrength);
-                spatialDenoiseLuma(ctx.fusedY, w, h, spatialStrength);
+                spatialDenoiseLuma(ctx.fusedY, w, h, spatialStrength, /*template_half=*/0, /*search_half=*/2);
             }
         }
     }
@@ -685,14 +730,20 @@ bool FusionStage::process(FrameContext& ctx) {
                     saveYuvAsJpeg(cropFusedY.data(), cropFusedU.data(), cropFusedV.data(), cropSize, cropSize, debugDir + "/stage_1_fusion/denoised_crop.jpg");
                 }
 
-                // Raw planar YUV
-                std::string yuvPath = debugDir + "/stage_1_fusion/fused.yuv";
-                std::ofstream out(yuvPath, std::ios::binary);
-                if (out) {
-                    out.write(reinterpret_cast<const char*>(ctx.fusedY.data()), ctx.fusedY.size());
-                    out.write(reinterpret_cast<const char*>(ctx.fusedU.data()), ctx.fusedU.size());
-                    out.write(reinterpret_cast<const char*>(ctx.fusedV.data()), ctx.fusedV.size());
-                    out.close();
+                // Raw planar YUV — only written when debug_raw_dumps is enabled
+                bool rawDumps = false;
+                if (ctx.metadata.count("debug_raw_dumps")) {
+                    try { rawDumps = std::any_cast<bool>(ctx.metadata.at("debug_raw_dumps")); } catch (...) {}
+                }
+                if (rawDumps) {
+                    std::string yuvPath = debugDir + "/stage_1_fusion/fused.yuv";
+                    std::ofstream out(yuvPath, std::ios::binary);
+                    if (out) {
+                        out.write(reinterpret_cast<const char*>(ctx.fusedY.data()), ctx.fusedY.size());
+                        out.write(reinterpret_cast<const char*>(ctx.fusedU.data()), ctx.fusedU.size());
+                        out.write(reinterpret_cast<const char*>(ctx.fusedV.data()), ctx.fusedV.size());
+                        out.close();
+                    }
                 }
 
                 // JPEG preview
