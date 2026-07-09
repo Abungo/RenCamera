@@ -21,38 +21,40 @@ static constexpr int REFINE_RANGE  =  4;  // ±pixels at finer levels
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Copy a Camera2 YUV_420_888 Y-plane to a packed FloatImage downsampled by 2x
-/// using a 2x2 average box filter. This speeds up alignment by 4x.
-static FloatImage yPlaneToFloatDownsampled2x(const YuvFrame& f, bool useRaw) {
+/// Copy a Camera2 YUV/RAW frame to a packed FloatImage downsampled by 4x
+/// using a 4x4 average box filter. This speeds up alignment by 16x.
+static FloatImage yPlaneToFloatDownsampled4x(const YuvFrame& f, bool useRaw) {
     FloatImage out;
-    int dw = f.width / 2;
-    int dh = f.height / 2;
+    int dw = f.width / 4;
+    int dh = f.height / 4;
     out.resize(dw, dh);
     
     if (useRaw) {
         int strideElements = f.yRowStride / 2;
         const uint16_t* rawBase = reinterpret_cast<const uint16_t*>(f.yPlane);
         for (int row = 0; row < dh; ++row) {
-            const uint16_t* src0 = rawBase + (2 * row) * strideElements;
-            const uint16_t* src1 = src0 + strideElements;
             float*         dst = out.ptr(row);
             for (int col = 0; col < dw; ++col) {
-                // Average the 2x2 Bayer quadrant pixels and scale from 12-bit (0-4095) to 8-bit (0-255) range
-                float sum = static_cast<float>(src0[2 * col]) + static_cast<float>(src0[2 * col + 1]) +
-                            static_cast<float>(src1[2 * col]) + static_cast<float>(src1[2 * col + 1]);
-                dst[col] = sum * 0.25f / 16.0f;
+                float sum = 0.0f;
+                for (int dy = 0; dy < 4; ++dy) {
+                    const uint16_t* srcRow = rawBase + (4 * row + dy) * strideElements;
+                    sum += static_cast<float>(srcRow[4 * col + 0]) + static_cast<float>(srcRow[4 * col + 1]) +
+                           static_cast<float>(srcRow[4 * col + 2]) + static_cast<float>(srcRow[4 * col + 3]);
+                }
+                dst[col] = sum * (1.0f / 16.0f) / 16.0f;
             }
         }
     } else {
         for (int row = 0; row < dh; ++row) {
-            const uint8_t* src0 = f.yPlane + (2 * row) * f.yRowStride;
-            const uint8_t* src1 = src0 + f.yRowStride;
             float*         dst = out.ptr(row);
             for (int col = 0; col < dw; ++col) {
-                // Average the 2x2 neighborhood
-                float sum = static_cast<float>(src0[2 * col]) + static_cast<float>(src0[2 * col + 1]) +
-                            static_cast<float>(src1[2 * col]) + static_cast<float>(src1[2 * col + 1]);
-                dst[col] = sum * 0.25f;
+                float sum = 0.0f;
+                for (int dy = 0; dy < 4; ++dy) {
+                    const uint8_t* srcRow = f.yPlane + (4 * row + dy) * f.yRowStride;
+                    sum += static_cast<float>(srcRow[4 * col + 0]) + static_cast<float>(srcRow[4 * col + 1]) +
+                           static_cast<float>(srcRow[4 * col + 2]) + static_cast<float>(srcRow[4 * col + 3]);
+                }
+                dst[col] = sum * (1.0f / 16.0f);
             }
         }
     }
@@ -372,7 +374,7 @@ bool AlignStage::process(FrameContext& ctx) {
 
     // Frame 0 is the reference (last captured = most recent, sharpest focus)
     const YuvFrame& refFrame = ctx.inputFrames[0];
-    Pyramid refPyr = buildPyramid(yPlaneToFloatDownsampled2x(refFrame, useRaw));
+    Pyramid refPyr = buildPyramid(yPlaneToFloatDownsampled4x(refFrame, useRaw));
 
     size_t numSrcFrames = ctx.inputFrames.size() - 1;
     ctx.motionFields.clear();
@@ -391,16 +393,16 @@ bool AlignStage::process(FrameContext& ctx) {
     for (size_t i = 0; i < numSrcFrames; ++i) {
         size_t srcIndex = i + 1;
         futures.push_back(std::async(std::launch::async, [&ctx, &refPyr, srcIndex, i, regFactor, useRaw]() {
-            Pyramid srcPyr = buildPyramid(yPlaneToFloatDownsampled2x(ctx.inputFrames[srcIndex], useRaw));
+            Pyramid srcPyr = buildPyramid(yPlaneToFloatDownsampled4x(ctx.inputFrames[srcIndex], useRaw));
             MotionField mf = alignFrame(refPyr, srcPyr, regFactor);
             
-            // Scale up the motion vectors and block size by 2x
-            // because the alignment was computed on a 2x downsampled image
+            // Scale up the motion vectors and block size by 4x
+            // because the alignment was computed on a 4x downsampled image
             for (auto& vec : mf.vectors) {
-                vec.dx *= 2;
-                vec.dy *= 2;
+                vec.dx *= 4;
+                vec.dy *= 4;
             }
-            mf.blockSize *= 2;
+            mf.blockSize *= 4;
             
             ctx.motionFields[i] = mf;
         }));
@@ -410,6 +412,6 @@ bool AlignStage::process(FrameContext& ctx) {
         fut.get();
     }
 
-    LOGI("AlignStage: aligned %zu frames in parallel (2x downsampled)", numSrcFrames);
+    LOGI("AlignStage: aligned %zu frames in parallel (4x downsampled)", numSrcFrames);
     return true;
 }
