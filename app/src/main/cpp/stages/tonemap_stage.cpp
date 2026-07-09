@@ -1,5 +1,6 @@
 #include "tonemap_stage.h"
 #include "../debug_utils.h"
+#include "../gl_helpers.h"
 
 #include <algorithm>
 #include <cmath>
@@ -334,124 +335,305 @@ bool ToneMapStage::process(FrameContext& ctx) {
 
     ctx.processedImage.resize(w, h);
 
-    // ── 1. Build bilateral grid in log-domain ───────────────────────────────
-    BilateralGrid grid;
-    grid.init(w, h);
+    // ── GPU HEADLESS COMPUTE SHADER TONE MAPPING ───────────────────────────
+    bool success = false;
+    std::string errorLog;
 
-    // Splat only 1 in 16 pixels (4x subsampling in both X and Y)
-    for (int r = 0; r < h; r += 4) {
-        const uint8_t* row = ctx.colorImage.rowPtr(r);
-        for (int c = 0; c < w; c += 4) {
-            float L = luma(row[c*3], row[c*3+1], row[c*3+2]);
-            // Working in log-domain matches human visual perception and reduces halos
-            float logL = std::log2f(L + 1.f);
-            grid.splat(c, r, logL * (255.f / 8.f)); // scale 0-8 log2 range to 0-255 JNI grid space
+    EglHeadlessSetup egl;
+    if (egl.init(errorLog)) {
+        const char* COMPUTE_TONEMAP_SRC = R"glsl(
+            #version 310 es
+            layout(local_size_x = 16, local_size_y = 16) in;
+
+            precision highp float;
+            precision highp sampler2D;
+
+            uniform sampler2D u_input_texture;
+            uniform int u_width;
+            uniform int u_height;
+            uniform float u_adaptive_gamma;
+            uniform float u_black_point_clamp;
+            uniform float u_detail_alpha;
+            uniform float u_saturation_boost;
+
+            layout(std430, binding = 0) writeonly buffer OutputBuffer {
+                uint outRGB[];
+            };
+
+            float luma(vec3 rgb) {
+                return 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
+            }
+
+            float acesFilm(float x) {
+                float a = 2.51;
+                float b = 0.03;
+                float c = 2.43;
+                float d = 0.59;
+                float e = 0.14;
+                return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+            }
+
+            void main() {
+                ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+                if (pos.x >= u_width || pos.y >= u_height) return;
+
+                vec3 rgbVal = texelFetch(u_input_texture, pos, 0).rgb;
+                float L = luma(rgbVal);
+
+                // Single-pass bilateral filter on the GPU to extract local low-frequency base layer
+                float sumVal = 0.0;
+                float sumW = 0.0;
+                
+                float spatial_sigma2 = 2.0 * 16.0 * 16.0;
+                float range_sigma2 = 2.0 * 38.25 * 38.25;
+
+                int radius = 12;
+                for (int dy = -radius; dy <= radius; dy += 2) {
+                    for (int dx = -radius; dx <= radius; dx += 2) {
+                        ivec2 nPos = clamp(pos + ivec2(dx, dy), ivec2(0), ivec2(u_width - 1, u_height - 1));
+                        vec3 nRgb = texelFetch(u_input_texture, nPos, 0).rgb;
+                        float nL = luma(nRgb);
+
+                        float dS2 = float(dx * dx + dy * dy);
+                        float dR = nL - L;
+                        float dR2 = dR * dR;
+
+                        float w = exp(-dS2 / spatial_sigma2) * exp(-dR2 / range_sigma2);
+                        sumVal += w * nL;
+                        sumW += w;
+                    }
+                }
+                float baseL = max(1.0, sumVal / sumW);
+                
+                float logL = log2(L + 1.0);
+                float logBase = log2(baseL + 1.0);
+                logBase = clamp(logBase, 0.0, 8.0);
+                
+                float normBase = (pow(2.0, logBase) - 1.0) / 255.0;
+                float boostedBase = pow(normBase, u_adaptive_gamma);
+                if (boostedBase < u_black_point_clamp) {
+                    boostedBase = (boostedBase * boostedBase) / u_black_point_clamp;
+                }
+                float compBase = acesFilm(boostedBase) * 255.0;
+
+                float currentDetailAlpha = u_detail_alpha;
+                if (baseL < 50.0) {
+                    float factor = baseL / 50.0;
+                    currentDetailAlpha = 1.0 + factor * (u_detail_alpha - 1.0);
+                }
+
+                float logDetail = logL - logBase;
+                float compLogL = log2(compBase + 1.0) + logDetail * currentDetailAlpha;
+                float compL = clamp(pow(2.0, compLogL) - 1.0, 0.0, 255.0);
+
+                float scale = (L > 0.1) ? compL / L : 1.0;
+                scale = min(scale, 10.0);
+
+                vec3 oRgb = rgbVal * scale;
+                float newL = luma(oRgb);
+
+                if (newL > 0.1) {
+                    float factor = u_saturation_boost;
+                    if (newL > 200.0) {
+                        float t = (newL - 200.0) / (255.0 - 200.0);
+                        factor = factor * (1.0 - clamp(t, 0.0, 1.0));
+                    }
+                    oRgb = newL + factor * (oRgb - newL);
+                }
+
+                float maxChan = max(oRgb.r, max(oRgb.g, oRgb.b));
+                if (maxChan > 255.0) {
+                    float blendL = luma(oRgb);
+                    if (maxChan - blendL > 1e-4) {
+                        float blend = clamp((255.0 - blendL) / (maxChan - blendL), 0.0, 1.0);
+                        oRgb = blendL + blend * (oRgb - blendL);
+                    }
+                }
+
+                uint uR = uint(clamp(oRgb.r, 0.0, 255.0));
+                uint uG = uint(clamp(oRgb.g, 0.0, 255.0));
+                uint uB = uint(clamp(oRgb.b, 0.0, 255.0));
+
+                uint packedVal = uR | (uG << 8) | (uB << 16) | (255u << 24);
+                outRGB[pos.y * u_width + pos.x] = packedVal;
+            }
+        )glsl";
+
+        GLuint program = createComputeProgram(COMPUTE_TONEMAP_SRC, errorLog);
+        if (program != 0) {
+            glUseProgram(program);
+
+            // Upload input RGB image as Texture
+            GLuint rgbTexture;
+            glGenTextures(1, &rgbTexture);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, rgbTexture);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGB8, w, h);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, ctx.colorImage.data.data());
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+            glUniform1i(glGetUniformLocation(program, "u_input_texture"), 0);
+            glUniform1i(glGetUniformLocation(program, "u_width"), w);
+            glUniform1i(glGetUniformLocation(program, "u_height"), h);
+            glUniform1f(glGetUniformLocation(program, "u_adaptive_gamma"), adaptiveGamma);
+            glUniform1f(glGetUniformLocation(program, "u_black_point_clamp"), blackPointClamp);
+            glUniform1f(glGetUniformLocation(program, "u_detail_alpha"), detailAlpha);
+            glUniform1f(glGetUniformLocation(program, "u_saturation_boost"), saturationBoost);
+
+            // Create output SSBO for packed RGB
+            GLuint outBuffer;
+            glGenBuffers(1, &outBuffer);
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, outBuffer);
+            glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(w) * h * sizeof(uint32_t), nullptr, GL_DYNAMIC_READ);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outBuffer);
+
+            // Dispatch compute shader
+            glDispatchCompute(static_cast<GLuint>((w + 15) / 16), static_cast<GLuint>((h + 15) / 16), 1);
+            glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+
+            // Read back output buffer
+            void* ptr = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, static_cast<GLsizeiptr>(w) * h * sizeof(uint32_t), GL_MAP_READ_BIT);
+            if (ptr != nullptr) {
+                uint8_t* dst = ctx.processedImage.data.data();
+                const uint32_t* src = static_cast<const uint32_t*>(ptr);
+                for (int i = 0; i < w * h; ++i) {
+                    uint32_t val = src[i];
+                    dst[i * 3 + 0] = val & 0xFF;
+                    dst[i * 3 + 1] = (val >> 8) & 0xFF;
+                    dst[i * 3 + 2] = (val >> 16) & 0xFF;
+                }
+                glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+                success = true;
+            } else {
+                errorLog += "GL: failed to map tonemap output buffer\n";
+            }
+
+            glDeleteBuffers(1, &outBuffer);
+            glDeleteTextures(1, &rgbTexture);
+            glDeleteProgram(program);
         }
     }
 
-    // ── 2. Blur grid ─────────────────────────────────────────────────────────
-    grid.blur();
-    grid.normalize();
+    if (!success) {
+        LOGE("GL Tone Mapping failed, falling back to CPU multi-threaded Bilateral Grid. GL Errors:\n%s", errorLog.c_str());
+        // CPU fallback: build bilateral grid in log-domain
+        BilateralGrid grid;
+        grid.init(w, h);
 
-    // ── 3. Sample + reconstruct in parallel in log-domain ─────────────────────
-    int numThreads = 8;
-    int rowsPerThread = h / numThreads;
-    std::vector<std::future<void>> futures;
-    futures.reserve(numThreads);
-
-    for (int t = 0; t < numThreads; ++t) {
-        int rStart = t * rowsPerThread;
-        int rEnd = (t == numThreads - 1) ? h : (t + 1) * rowsPerThread;
-
-        futures.push_back(std::async(std::launch::async, [&ctx, &grid, rStart, rEnd, w, h, adaptiveGamma, isNight, blackPointClamp, detailAlpha, saturationBoost]() {
-            for (int r = rStart; r < rEnd; ++r) {
-                const uint8_t* src = ctx.colorImage.rowPtr(r);
-                uint8_t*       dst = ctx.processedImage.rowPtr(r);
-
-                for (int c = 0; c < w; ++c) {
-                    float R = src[c*3];
-                    float G = src[c*3+1];
-                    float B = src[c*3+2];
-                    
-                    float L = luma(R, G, B);
-                    float logL = std::log2f(L + 1.f);
-
-                    // Retrieve base illumination (local low-frequency contrast)
-                    float gridVal = grid.sample(c, r, logL * (255.f / 8.f));
-                    float logBase = gridVal * (8.f / 255.f);
-                    logBase = std::clamp(logBase, 0.f, 8.f);
-                    float baseL = std::exp2f(logBase) - 1.f;
-                    baseL = std::max(1.f, baseL);
-
-                    // Compress base layer (dynamic range compression)
-                    float normBase = baseL / 255.f;
-                    float boostedBase = std::powf(normBase, adaptiveGamma);
-                    
-                    // Soft black-point compression (preserves deep blacks and mutes background noise)
-                    if (boostedBase < blackPointClamp) {
-                        boostedBase = (boostedBase * boostedBase) / blackPointClamp;
-                    }
-                    
-                    float compBase = acesFilm(boostedBase) * 255.f;
-
-                    // Suppress detail boost in dark areas to prevent noise/grain amplification
-                    float currentDetailAlpha = detailAlpha;
-                    if (baseL < 50.f) {
-                        float factor = baseL / 50.f;
-                        currentDetailAlpha = 1.0f + factor * (detailAlpha - 1.0f);
-                    }
-
-                    // Add log details back (Log detail = logL - logBase)
-                    float logDetail = logL - logBase;
-                    float compLogL = std::log2f(compBase + 1.f) + logDetail * currentDetailAlpha;
-                    float compL = std::exp2f(compLogL) - 1.f;
-                    compL = std::clamp(compL, 0.f, 65535.f);
-
-                    // Scale RGB channels to match the local tone mapped luminance
-                    float scale = (L > 0.1f) ? compL / L : 1.f;
-                    scale = std::min(scale, 10.0f); // cap noise amplification to allow low-light boosting
-                    
-                    float oR = R * scale;
-                    float oG = G * scale;
-                    float oB = B * scale;
-
-                    // Apply desaturation / saturation boost
-                    float newL = luma(oR, oG, oB);
-                    if (newL > 0.1f) {
-                        float factor = saturationBoost;
-                        // Softly desaturate bright highlights towards white to prevent color distortion/clipping
-                        if (newL > 200.f) {
-                            float t = (newL - 200.f) / (255.f - 200.f);
-                            factor = factor * (1.f - std::clamp(t, 0.f, 1.f));
-                        }
-                        oR = newL + factor * (oR - newL);
-                        oG = newL + factor * (oG - newL);
-                        oB = newL + factor * (oB - newL);
-                    }
-
-                    // Soft highlight roll-off (Desaturate to white if a channel clips, matching high-end film/GCam look)
-                    float maxChan = std::max({oR, oG, oB});
-                    if (maxChan > 255.f) {
-                        float blendL = luma(oR, oG, oB);
-                        if (maxChan - blendL > 1e-4f) {
-                            float blend = (255.f - blendL) / (maxChan - blendL);
-                            blend = std::clamp(blend, 0.f, 1.f);
-                            oR = blendL + blend * (oR - blendL);
-                            oG = blendL + blend * (oG - blendL);
-                            oB = blendL + blend * (oB - blendL);
-                        }
-                    }
-
-                    dst[c*3]   = static_cast<uint8_t>(std::clamp(oR, 0.f, 255.f));
-                    dst[c*3+1] = static_cast<uint8_t>(std::clamp(oG, 0.f, 255.f));
-                    dst[c*3+2] = static_cast<uint8_t>(std::clamp(oB, 0.f, 255.f));
-                }
+        // Splat only 1 in 16 pixels
+        for (int r = 0; r < h; r += 4) {
+            const uint8_t* row = ctx.colorImage.rowPtr(r);
+            for (int c = 0; c < w; c += 4) {
+                float L = luma(row[c*3], row[c*3+1], row[c*3+2]);
+                float logL = std::log2f(L + 1.f);
+                grid.splat(c, r, logL * (255.f / 8.f));
             }
-        }));
-    }
+        }
 
-    for (auto& fut : futures) {
-        fut.get();
+        // Blur grid
+        grid.blur();
+        grid.normalize();
+
+        // Sample + reconstruct in parallel in log-domain
+        int numThreads = 8;
+        int rowsPerThread = h / numThreads;
+        std::vector<std::future<void>> futures;
+        futures.reserve(numThreads);
+
+        for (int t = 0; t < numThreads; ++t) {
+            int rStart = t * rowsPerThread;
+            int rEnd = (t == numThreads - 1) ? h : (t + 1) * rowsPerThread;
+
+            futures.push_back(std::async(std::launch::async, [&ctx, &grid, rStart, rEnd, w, h, adaptiveGamma, isNight, blackPointClamp, detailAlpha, saturationBoost]() {
+                for (int r = rStart; r < rEnd; ++r) {
+                    const uint8_t* src = ctx.colorImage.rowPtr(r);
+                    uint8_t*       dst = ctx.processedImage.rowPtr(r);
+
+                    for (int c = 0; c < w; ++c) {
+                        float R = src[c*3];
+                        float G = src[c*3+1];
+                        float B = src[c*3+2];
+                        
+                        float L = luma(R, G, B);
+                        float logL = std::log2f(L + 1.f);
+
+                        // Retrieve base illumination (local low-frequency contrast)
+                        float gridVal = grid.sample(c, r, logL * (255.f / 8.f));
+                        float logBase = gridVal * (8.f / 255.f);
+                        logBase = std::clamp(logBase, 0.f, 8.f);
+                        float baseL = std::exp2f(logBase) - 1.f;
+                        baseL = std::max(1.f, baseL);
+
+                        // Compress base layer (dynamic range compression)
+                        float normBase = baseL / 255.f;
+                        float boostedBase = std::powf(normBase, adaptiveGamma);
+                        
+                        // Soft black-point compression
+                        if (boostedBase < blackPointClamp) {
+                            boostedBase = (boostedBase * boostedBase) / blackPointClamp;
+                        }
+                        
+                        float compBase = acesFilm(boostedBase) * 255.f;
+
+                        // Suppress detail boost in dark areas to prevent noise/grain amplification
+                        float currentDetailAlpha = detailAlpha;
+                        if (baseL < 50.f) {
+                            float factor = baseL / 50.f;
+                            currentDetailAlpha = 1.0f + factor * (detailAlpha - 1.0f);
+                        }
+
+                        // Add log details back (Log detail = logL - logBase)
+                        float logDetail = logL - logBase;
+                        float compLogL = std::log2f(compBase + 1.f) + logDetail * currentDetailAlpha;
+                        float compL = std::exp2f(compLogL) - 1.f;
+                        compL = std::clamp(compL, 0.f, 65535.f);
+
+                        // Scale RGB channels to match the local tone mapped luminance
+                        float scale = (L > 0.1f) ? compL / L : 1.f;
+                        scale = std::min(scale, 10.0f);
+                        
+                        float oR = R * scale;
+                        float oG = G * scale;
+                        float oB = B * scale;
+
+                        // Apply desaturation / saturation boost
+                        float newL = luma(oR, oG, oB);
+                        if (newL > 0.1f) {
+                            float factor = saturationBoost;
+                            if (newL > 200.f) {
+                                float t = (newL - 200.f) / (255.f - 200.f);
+                                factor = factor * (1.f - std::clamp(t, 0.f, 1.f));
+                            }
+                            oR = newL + factor * (oR - newL);
+                            oG = newL + factor * (oG - newL);
+                            oB = newL + factor * (oB - newL);
+                        }
+
+                        // Soft highlight roll-off
+                        float maxChan = std::max({oR, oG, oB});
+                        if (maxChan > 255.f) {
+                            float blendL = luma(oR, oG, oB);
+                            if (maxChan - blendL > 1e-4f) {
+                                float blend = (255.f - blendL) / (maxChan - blendL);
+                                blend = std::clamp(blend, 0.f, 1.f);
+                                oR = blendL + blend * (oR - blendL);
+                                oG = blendL + blend * (oG - blendL);
+                                oB = blendL + blend * (oB - blendL);
+                            }
+                        }
+
+                        dst[c*3]   = static_cast<uint8_t>(std::clamp(oR, 0.f, 255.f));
+                        dst[c*3+1] = static_cast<uint8_t>(std::clamp(oG, 0.f, 255.f));
+                        dst[c*3+2] = static_cast<uint8_t>(std::clamp(oB, 0.f, 255.f));
+                    }
+                }
+            }));
+        }
+
+        for (auto& fut : futures) {
+            fut.get();
+        }
     }
 
     // Save intermediate tonemapped RGB + JPEG
