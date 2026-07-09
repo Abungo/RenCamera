@@ -33,12 +33,25 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     val pipelineConfig: StateFlow<PipelineConfig> = _pipelineConfig.asStateFlow()
 
     init {
-        // Shutter isProcessing is now controlled dynamically per capture phase.
+        // Load config from SharedPreferences
+        val prefs = application.getSharedPreferences("RenCameraPrefs", android.content.Context.MODE_PRIVATE)
+        val savedXml = prefs.getString("pipeline_config", null)
+        if (savedXml != null) {
+            runCatching {
+                val loaded = PipelineConfig.fromXml(savedXml)
+                _pipelineConfig.value = loaded
+                controller.setRawCaptureEnabled(loaded.useRawCapture)
+            }
+        }
     }
 
     fun updateConfig(config: PipelineConfig) {
         _pipelineConfig.value = config
         controller.setRawCaptureEnabled(config.useRawCapture)
+
+        // Save config to SharedPreferences
+        val prefs = getApplication<Application>().getSharedPreferences("RenCameraPrefs", android.content.Context.MODE_PRIVATE)
+        prefs.edit().putString("pipeline_config", config.toXml()).apply()
     }
 
     fun exportConfigToUri(uri: Uri) {

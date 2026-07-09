@@ -40,7 +40,10 @@ data class PipelineConfig(
 
     // Debug: master switch — enables all per-stage debug image writing (frame JPEGs +
     // pipeline-step JPEGs). When off, no debug images are written at all (fastest path).
-    val debugImagesEnabled: Boolean = true
+    val debugImagesEnabled: Boolean = true,
+
+    // Normal mode ISO reduction factor (e.g. 2.0f halves ISO and doubles exposure time)
+    val normalModeIsoReductionFactor: Float = 2.0f
 ) : Serializable {
 
     companion object {
@@ -74,6 +77,7 @@ data class PipelineConfig(
             var useRawCapture = true
             var debugRawDumps = false
             var debugImagesEnabled = true
+            var normalModeIsoReductionFactor = 2.0f
 
             val tagRegex = "<([^>]+)>([^<]*)</\\1>".toRegex()
             val matches = tagRegex.findAll(xml)
@@ -97,6 +101,7 @@ data class PipelineConfig(
                     "useRawCapture" -> useRawCapture = value.toBooleanStrictOrNull() ?: false
                     "debugRawDumps" -> debugRawDumps = value.toBooleanStrictOrNull() ?: false
                     "debugImagesEnabled" -> debugImagesEnabled = value.toBooleanStrictOrNull() ?: true
+                    "normalModeIsoReductionFactor" -> normalModeIsoReductionFactor = value.toFloatOrNull() ?: 2.0f
                     else -> {
                         if (tag.startsWith("stage_")) {
                             val stageName = tag.substringAfter("stage_")
@@ -122,7 +127,8 @@ data class PipelineConfig(
                 isoOverride = isoOverride,
                 useRawCapture = useRawCapture,
                 debugRawDumps = debugRawDumps,
-                debugImagesEnabled = debugImagesEnabled
+                debugImagesEnabled = debugImagesEnabled,
+                normalModeIsoReductionFactor = normalModeIsoReductionFactor
             )
         }
     }
@@ -141,7 +147,8 @@ data class PipelineConfig(
             isoOverride.toFloat(),                     // 9
             if (useRawCapture) 1.0f else 0.0f,   // 10
             if (debugRawDumps) 1.0f else 0.0f,    // 11
-            if (debugImagesEnabled) 1.0f else 0.0f // 12
+            if (debugImagesEnabled) 1.0f else 0.0f, // 12
+            normalModeIsoReductionFactor               // 13
         )
     }
 
@@ -172,6 +179,7 @@ data class PipelineConfig(
         sb.append("  <useRawCapture>${useRawCapture}</useRawCapture>\n")
         sb.append("  <debugRawDumps>${debugRawDumps}</debugRawDumps>\n")
         sb.append("  <debugImagesEnabled>${debugImagesEnabled}</debugImagesEnabled>\n")
+        sb.append("  <normalModeIsoReductionFactor>${normalModeIsoReductionFactor}</normalModeIsoReductionFactor>\n")
         stageEnabled.forEach { (k, v) ->
             sb.append("  <stage_${k}>${v}</stage_${k}>\n")
         }

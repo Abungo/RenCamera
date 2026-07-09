@@ -589,7 +589,8 @@ private fun SettingsScreen(
                             jpegQuality = 95,
                             exposureBias = -1.5f,
                             isoOverride = 0,
-                            useRawCapture = true
+                            useRawCapture = true,
+                            normalModeIsoReductionFactor = 2.0f
                         ))
                     }
                 ) {
@@ -624,6 +625,17 @@ private fun SettingsScreen(
                         description = "Override the ISO used by the noise model. 'Auto' uses the actual capture ISO. Lower values = less aggressive denoising (more texture detail). Set to 200 for daylight shots.",
                         onValueChange = { onConfigChange(config.copy(isoOverride = it.toInt())) },
                         onShowInfo = { infoDialogText = "ISO Override" to "The noise model uses ISO to compute the expected sensor noise floor (sigma). At 'Auto' it reads the actual capture ISO from metadata. For daylight shots (bright scenes), setting this to 100-400 prevents over-aggressive denoising that can wash out fine texture." }
+                    )
+
+                    SliderSetting(
+                        label = "Normal ISO Reduction Factor",
+                        value = config.normalModeIsoReductionFactor,
+                        valueRange = 1.0f..4.0f,
+                        steps = 30,
+                        valueFormatter = { String.format("%.1fx", it) },
+                        description = "Factor to reduce ISO and increase shutter speed in low-light normal mode captures. 1.0x disables shift. 2.0x halves ISO and doubles shutter time.",
+                        onValueChange = { onConfigChange(config.copy(normalModeIsoReductionFactor = it)) },
+                        onShowInfo = { infoDialogText = "Normal ISO Reduction Factor" to "In normal mode under lower lighting (viewfinder ISO > 400), this factor divides the ISO and multiplies the exposure time. Helps trade high-ISO digital noise for real physical photon capture." }
                     )
 
                     SwitchSetting(

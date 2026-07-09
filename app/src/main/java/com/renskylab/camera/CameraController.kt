@@ -435,8 +435,8 @@ class CameraController(
                     val calculatedIso = (currentIso * (currentExposureTime.toDouble() / targetExposureTime.toDouble())).toInt()
                     targetIso = calculatedIso.coerceIn(50, currentIso)
                 } else {
-                    // Normal mode: divide viewfinder ISO by a factor of 2.0 and scale exposure time by 2.0
-                    val factor = 2.0
+                    // Normal mode: divide viewfinder ISO by the configured factor and scale exposure time proportionally
+                    val factor = config.normalModeIsoReductionFactor.toDouble()
                     numFrames = 12
                     targetIso = (currentIso / factor).toInt().coerceIn(50, currentIso)
                     targetExposureTime = (currentExposureTime * factor).toLong()
