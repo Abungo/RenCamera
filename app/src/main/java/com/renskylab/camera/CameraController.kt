@@ -412,8 +412,8 @@ class CameraController(
                         set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
                         // Request 125ms per-frame exposure time (1/8s)
                         set(CaptureRequest.SENSOR_EXPOSURE_TIME, 125_000_000L)
-                        // Target a high ISO range [1600, 3200]
-                        set(CaptureRequest.SENSOR_SENSITIVITY, currentIso.coerceIn(1600, 3200))
+                        // Target ISO based on scene exposure, minimum ISO 50
+                        set(CaptureRequest.SENSOR_SENSITIVITY, currentIso.coerceAtLeast(50))
                         set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                     }.build()
                 }
