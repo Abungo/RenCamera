@@ -509,6 +509,7 @@ class CameraController(
             val width = burst[0].image.width
             val height = burst[0].image.height
             val frameIsos = IntArray(count)
+            val frameExposures = LongArray(count)
 
             burst.forEachIndexed { idx, frame ->
                 val planes = frame.image.planes
@@ -554,6 +555,7 @@ class CameraController(
                     uvPixelStrides[idx] = planes[1].pixelStride
                 }
                 frameIsos[idx] = frame.iso
+                frameExposures[idx] = frame.exposureTimeNs
             }
 
             var nativeHandle: Long = 0
@@ -597,6 +599,7 @@ class CameraController(
                 timestamp = timestamp,
                 iso = currentIso,
                 frameIsos = frameIsos,
+                frameExposures = frameExposures,
                 nativeBurstHandle = nativeHandle,
                 config = config.copy(useRawCapture = isRaw),
                 onSaved = onSaved,

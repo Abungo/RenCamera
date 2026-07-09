@@ -14,6 +14,7 @@ data class ProcessingJob(
     val timestamp: Long,
     val iso: Int,
     val frameIsos: IntArray,
+    val frameExposures: LongArray? = null,
     val nativeBurstHandle: Long,
     val config: PipelineConfig,
     val onSaved: (Uri) -> Unit,

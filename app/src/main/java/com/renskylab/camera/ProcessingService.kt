@@ -185,7 +185,32 @@ class ProcessingService : Service() {
                 }
 
                 saveDeferred?.await()
-                pipelineDeferred.await()
+                val res = pipelineDeferred.await()
+                
+                // Append exact capture parameters to pipeline timing log
+                if (job.config.debugImagesEnabled && res != null) {
+                    try {
+                        val logFile = java.io.File(rawDir, "pipeline_timing_log.txt")
+                        val averageExposure = job.frameExposures?.average() ?: 0.0
+                        val averageExposureMs = averageExposure / 1_000_000.0
+                        val details = """
+                            
+                            === CAPTURE PARAMETERS ===
+                            Night Mode: ${job.config.nightMode}
+                            Use RAW: ${job.config.useRawCapture}
+                            JPEG Quality: ${job.config.jpegQuality}
+                            Target ISO: ${job.iso}
+                            Frame ISOs: ${job.frameIsos.joinToString(", ")}
+                            Frame Exposure Times (ms): ${job.frameExposures?.map { String.format("%.2f", it / 1_000_000.0) }?.joinToString(", ")}
+                            Average Exposure Time: ${String.format("%.2f", averageExposureMs)} ms
+                            
+                        """.trimIndent()
+                        logFile.appendText(details)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to write capture parameters to pipeline log", e)
+                    }
+                }
+                res
             }
             if (jpegBytes != null) {
                 val uri = PhotoSaver.save(this, jpegBytes, filename)
