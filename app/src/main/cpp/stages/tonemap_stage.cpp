@@ -488,25 +488,127 @@ bool ToneMapStage::process(FrameContext& ctx) {
             glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(w) * h * sizeof(uint32_t), nullptr, GL_DYNAMIC_READ);
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outBuffer);
 
-            // Dispatch compute shader
+            // Dispatch tone map compute shader
             glDispatchCompute(static_cast<GLuint>((w + 15) / 16), static_cast<GLuint>((h + 15) / 16), 1);
-            glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-            // Read back output buffer
-            void* ptr = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, static_cast<GLsizeiptr>(w) * h * sizeof(uint32_t), GL_MAP_READ_BIT);
-            if (ptr != nullptr) {
-                uint8_t* dst = ctx.processedImage.data.data();
-                const uint32_t* src = static_cast<const uint32_t*>(ptr);
-                for (int i = 0; i < w * h; ++i) {
-                    uint32_t val = src[i];
-                    dst[i * 3 + 0] = val & 0xFF;
-                    dst[i * 3 + 1] = (val >> 8) & 0xFF;
-                    dst[i * 3 + 2] = (val >> 16) & 0xFF;
+            // ── GPU DENOISE COMPUTE SHADER PASS ──────────────────────────────────
+            const char* COMPUTE_DENOISE_SRC = R"glsl(
+                #version 310 es
+                layout(local_size_x = 16, local_size_y = 16) in;
+
+                precision highp float;
+
+                layout(std430, binding = 0) readonly buffer InputBuffer {
+                    uint inRGB[];
+                };
+
+                layout(std430, binding = 1) writeonly buffer OutputBuffer {
+                    uint outRGB[];
+                };
+
+                uniform int u_width;
+                uniform int u_height;
+                uniform float u_spatial_sigma;
+                uniform float u_range_sigma;
+
+                vec3 unpackRGB(uint val) {
+                    float r = float(val & 0xFFu);
+                    float g = float((val >> 8) & 0xFFu);
+                    float b = float((val >> 16) & 0xFFu);
+                    return vec3(r, g, b);
                 }
-                glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
-                success = true;
-            } else {
-                errorLog += "GL: failed to map tonemap output buffer\n";
+
+                float luma(vec3 rgb) {
+                    return 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
+                }
+
+                void main() {
+                    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+                    if (pos.x >= u_width || pos.y >= u_height) return;
+
+                    uint centerVal = inRGB[pos.y * u_width + pos.x];
+                    vec3 centerRgb = unpackRGB(centerVal);
+                    float centerL = luma(centerRgb);
+
+                    float sumR = 0.0;
+                    float sumG = 0.0;
+                    float sumB = 0.0;
+                    float sumW = 0.0;
+
+                    float spatial_sigma2 = 2.0 * u_spatial_sigma * u_spatial_sigma;
+                    float range_sigma2 = 2.0 * u_range_sigma * u_range_sigma;
+
+                    int radius = 3;
+                    for (int dy = -radius; dy <= radius; ++dy) {
+                        for (int dx = -radius; dx <= radius; ++dx) {
+                            ivec2 nPos = clamp(pos + ivec2(dx, dy), ivec2(0), ivec2(u_width - 1, u_height - 1));
+                            uint nVal = inRGB[nPos.y * u_width + nPos.x];
+                            vec3 nRgb = unpackRGB(nVal);
+                            float nL = luma(nRgb);
+
+                            float dS2 = float(dx * dx + dy * dy);
+                            float dR = nL - centerL;
+                            float dR2 = dR * dR;
+
+                            float w = exp(-dS2 / spatial_sigma2) * exp(-dR2 / range_sigma2);
+                            sumR += w * nRgb.r;
+                            sumG += w * nRgb.g;
+                            sumB += w * nRgb.b;
+                            sumW += w;
+                        }
+                    }
+
+                    uint uR = uint(clamp(sumR / sumW, 0.0, 255.0));
+                    uint uG = uint(clamp(sumG / sumW, 0.0, 255.0));
+                    uint uB = uint(clamp(sumB / sumW, 0.0, 255.0));
+
+                    outRGB[pos.y * u_width + pos.x] = uR | (uG << 8) | (uB << 16) | (255u << 24);
+                }
+            )glsl";
+
+            GLuint denoiseProgram = createComputeProgram(COMPUTE_DENOISE_SRC, errorLog);
+            if (denoiseProgram != 0) {
+                glUseProgram(denoiseProgram);
+
+                // Create denoised output SSBO
+                GLuint denoiseOutBuffer;
+                glGenBuffers(1, &denoiseOutBuffer);
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, denoiseOutBuffer);
+                glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(w) * h * sizeof(uint32_t), nullptr, GL_DYNAMIC_READ);
+
+                // Bind outBuffer (from tone map) to binding 0, and denoiseOutBuffer to binding 1
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outBuffer);
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, denoiseOutBuffer);
+
+                glUniform1i(glGetUniformLocation(denoiseProgram, "u_width"), w);
+                glUniform1i(glGetUniformLocation(denoiseProgram, "u_height"), h);
+                glUniform1f(glGetUniformLocation(denoiseProgram, "u_spatial_sigma"), 3.0f);
+                glUniform1f(glGetUniformLocation(denoiseProgram, "u_range_sigma"), 15.0f);
+
+                // Dispatch denoise compute shader
+                glDispatchCompute(static_cast<GLuint>((w + 15) / 16), static_cast<GLuint>((h + 15) / 16), 1);
+                glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+
+                // Read back final denoised output buffer
+                void* ptr = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, static_cast<GLsizeiptr>(w) * h * sizeof(uint32_t), GL_MAP_READ_BIT);
+                if (ptr != nullptr) {
+                    uint8_t* dst = ctx.processedImage.data.data();
+                    const uint32_t* src = static_cast<const uint32_t*>(ptr);
+                    for (int i = 0; i < w * h; ++i) {
+                        uint32_t val = src[i];
+                        dst[i * 3 + 0] = val & 0xFF;
+                        dst[i * 3 + 1] = (val >> 8) & 0xFF;
+                        dst[i * 3 + 2] = (val >> 16) & 0xFF;
+                    }
+                    glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+                    success = true;
+                } else {
+                    errorLog += "GL: failed to map denoise output buffer\n";
+                }
+
+                glDeleteBuffers(1, &denoiseOutBuffer);
+                glDeleteProgram(denoiseProgram);
             }
 
             glDeleteBuffers(1, &outBuffer);
