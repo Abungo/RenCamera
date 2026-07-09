@@ -7,21 +7,6 @@
 #include <jpeglib.h>
 
 inline bool saveRgbAsJpeg(const uint8_t* rgbData, int width, int height, const std::string& filePath, int quality = 90) {
-    if (width > 1500) {
-        int dw = width / 4;
-        int dh = height / 4;
-        std::vector<uint8_t> downsampled(static_cast<size_t>(dw) * dh * 3);
-        for (int r = 0; r < dh; ++r) {
-            const uint8_t* srcRow = rgbData + (r * 4) * width * 3;
-            uint8_t* dstRow = downsampled.data() + r * dw * 3;
-            for (int c = 0; c < dw; ++c) {
-                dstRow[c * 3 + 0] = srcRow[(c * 4) * 3 + 0];
-                dstRow[c * 3 + 1] = srcRow[(c * 4) * 3 + 1];
-                dstRow[c * 3 + 2] = srcRow[(c * 4) * 3 + 2];
-            }
-        }
-        return saveRgbAsJpeg(downsampled.data(), dw, dh, filePath, quality);
-    }
 
     struct jpeg_compress_struct cinfo{};
     struct jpeg_error_mgr jerr{};
@@ -55,36 +40,6 @@ inline bool saveRgbAsJpeg(const uint8_t* rgbData, int width, int height, const s
 }
 
 inline bool saveYuvAsJpeg(const uint8_t* y, const uint8_t* u, const uint8_t* v, int width, int height, const std::string& filePath, int quality = 90) {
-    if (width > 1500) {
-        int dw = width / 4;
-        int dh = height / 4;
-        std::vector<uint8_t> rgb(static_cast<size_t>(dw) * dh * 3);
-        int uvW = width / 2;
-        for (int r = 0; r < dh; ++r) {
-            int srcR = r * 4;
-            const uint8_t* yRow = y + srcR * width;
-            const uint8_t* uRow = u + (srcR / 2) * uvW;
-            const uint8_t* vRow = v + (srcR / 2) * uvW;
-            uint8_t* rgbRow = rgb.data() + r * dw * 3;
-
-            for (int x = 0; x < dw; ++x) {
-                int srcX = x * 4;
-                int Y = static_cast<int>(yRow[srcX]);
-                int U = static_cast<int>(uRow[srcX >> 1]) - 128;
-                int V = static_cast<int>(vRow[srcX >> 1]) - 128;
-
-                // BT.601 YUV -> RGB conversion
-                int R = Y + (179 * V + 64) / 128;
-                int G = Y - (44 * U + 91 * V + 64) / 128;
-                int B = Y + (227 * U + 64) / 128;
-
-                rgbRow[x*3 + 0] = static_cast<uint8_t>(std::clamp(R, 0, 255));
-                rgbRow[x*3 + 1] = static_cast<uint8_t>(std::clamp(G, 0, 255));
-                rgbRow[x*3 + 2] = static_cast<uint8_t>(std::clamp(B, 0, 255));
-            }
-        }
-        return saveRgbAsJpeg(rgb.data(), dw, dh, filePath, quality);
-    }
 
     std::vector<uint8_t> rgb(static_cast<size_t>(width) * height * 3);
     int uvW = width / 2;
@@ -119,35 +74,6 @@ inline bool saveStridedYuvAsJpeg(
     int width, int height,
     const std::string& filePath, int quality = 90)
 {
-    if (width > 1500) {
-        int dw = width / 4;
-        int dh = height / 4;
-        std::vector<uint8_t> rgb(static_cast<size_t>(dw) * dh * 3);
-        for (int r = 0; r < dh; ++r) {
-            int srcR = r * 4;
-            const uint8_t* yRow = y + srcR * yRowStride;
-            const uint8_t* uRow = u + (srcR / 2) * uvRowStride;
-            const uint8_t* vRow = v + (srcR / 2) * uvRowStride;
-            uint8_t* rgbRow = rgb.data() + r * dw * 3;
-
-            for (int x = 0; x < dw; ++x) {
-                int srcX = x * 4;
-                int Y = static_cast<int>(yRow[srcX]);
-                int U = static_cast<int>(uRow[(srcX >> 1) * uvPixelStride]) - 128;
-                int V = static_cast<int>(vRow[(srcX >> 1) * uvPixelStride]) - 128;
-
-                // BT.601 YUV -> RGB
-                int R = Y + (179 * V + 64) / 128;
-                int G = Y - (44 * U + 91 * V + 64) / 128;
-                int B = Y + (227 * U + 64) / 128;
-
-                rgbRow[x*3 + 0] = static_cast<uint8_t>(std::clamp(R, 0, 255));
-                rgbRow[x*3 + 1] = static_cast<uint8_t>(std::clamp(G, 0, 255));
-                rgbRow[x*3 + 2] = static_cast<uint8_t>(std::clamp(B, 0, 255));
-            }
-        }
-        return saveRgbAsJpeg(rgb.data(), dw, dh, filePath, quality);
-    }
 
     std::vector<uint8_t> rgb(static_cast<size_t>(width) * height * 3);
     for (int r = 0; r < height; ++r) {
