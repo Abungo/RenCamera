@@ -1,5 +1,6 @@
 #include "debayer_stage.h"
 #include "../debug_utils.h"
+#include "../gl_helpers.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -108,73 +109,221 @@ bool DebayerStage::process(FrameContext& ctx) {
         float bGain = 1.9f;
         float gGain = 1.0f;
 
-        // Bilinear Demosaicing (RGGB layout) - Multi-threaded
-        int numThreads = 8;
-        int rowsPerThread = h / numThreads;
-        std::vector<std::future<void>> futures;
-        futures.reserve(numThreads);
+        // ── GPU HEADLESS COMPUTE SHADER DEMOSAICING ────────────────────────────
+        bool success = false;
+        std::string errorLog;
+        
+        EglHeadlessSetup egl;
+        if (egl.init(errorLog)) {
+            const char* COMPUTE_DEMOSAIC_SRC = R"glsl(
+                #version 310 es
+                layout(local_size_x = 16, local_size_y = 16) in;
 
-        for (int t = 0; t < numThreads; ++t) {
-            int rStart = t * rowsPerThread;
-            int rEnd = (t == numThreads - 1) ? h : (t + 1) * rowsPerThread;
+                precision highp float;
+                precision highp usampler2D;
 
-            futures.push_back(std::async(std::launch::async, [&ctx, &fusedRaw, rStart, rEnd, w, h, blackLevel, scale, rGain, gGain, bGain]() {
-                auto getRaw = [&](int r, int cc) -> float {
-                    int cr = std::clamp(r, 0, h - 1);
-                    int c_clamped = std::clamp(cc, 0, w - 1);
-                    float val = static_cast<float>(fusedRaw[cr * w + c_clamped]);
-                    float cleanVal = std::max(0.f, (val - blackLevel) * scale);
-                    
-                    // Determine Bayer color filter grid position (BGGR pattern)
-                    bool isEvenRow = (cr % 2 == 0);
-                    bool isEvenCol = (c_clamped % 2 == 0);
-                    if (isEvenRow && isEvenCol) {
-                        return cleanVal * bGain; // Blue
-                    } else if (!isEvenRow && !isEvenCol) {
-                        return cleanVal * rGain; // Red
-                    } else {
-                        return cleanVal * gGain; // Green
-                    }
+                uniform usampler2D u_raw_texture;
+                uniform int u_width;
+                uniform int u_height;
+                uniform float u_black_level;
+                uniform float u_scale;
+                uniform float u_r_gain;
+                uniform float u_g_gain;
+                uniform float u_b_gain;
+
+                layout(std430, binding = 0) writeonly buffer OutputBuffer {
+                    uint outRGB[];
                 };
 
-                for (int r = rStart; r < rEnd; ++r) {
-                    uint8_t* rgbRow = ctx.colorImage.rowPtr(r);
-                    for (int c = 0; c < w; ++c) {
-                        float R = 0.f, G = 0.f, B = 0.f;
-                        bool isEvenRow = (r % 2 == 0);
-                        bool isEvenCol = (c % 2 == 0);
+                float getRaw(int x, int y) {
+                    int cx = clamp(x, 0, u_width - 1);
+                    int cy = clamp(y, 0, u_height - 1);
+                    uint val = texelFetch(u_raw_texture, ivec2(cx, cy), 0).r;
+                    float cleanVal = max(0.0, (float(val) - u_black_level) * u_scale);
 
-                        if (isEvenRow && isEvenCol) {
-                            // Blue pixel
-                            R = (getRaw(r-1, c-1) + getRaw(r-1, c+1) + getRaw(r+1, c-1) + getRaw(r+1, c+1)) * 0.25f;
-                            G = (getRaw(r-1, c) + getRaw(r+1, c) + getRaw(r, c-1) + getRaw(r, c+1)) * 0.25f;
-                            B = getRaw(r, c);
-                        } else if (!isEvenRow && !isEvenCol) {
-                            // Red pixel
-                            R = getRaw(r, c);
-                            G = (getRaw(r-1, c) + getRaw(r+1, c) + getRaw(r, c-1) + getRaw(r, c+1)) * 0.25f;
-                            B = (getRaw(r-1, c-1) + getRaw(r-1, c+1) + getRaw(r+1, c-1) + getRaw(r+1, c+1)) * 0.25f;
-                        } else if (isEvenRow && !isEvenCol) {
-                            // Green pixel on Blue row
-                            R = (getRaw(r-1, c) + getRaw(r+1, c)) * 0.5f;
-                            G = getRaw(r, c);
-                            B = (getRaw(r, c-1) + getRaw(r, c+1)) * 0.5f;
-                        } else {
-                            // Green pixel on Red row
-                            R = (getRaw(r, c-1) + getRaw(r, c+1)) * 0.5f;
-                            G = getRaw(r, c);
-                            B = (getRaw(r-1, c) + getRaw(r+1, c)) * 0.5f;
-                        }
-
-                        rgbRow[c * 3 + 0] = static_cast<uint8_t>(std::clamp(R, 0.f, 255.f));
-                        rgbRow[c * 3 + 1] = static_cast<uint8_t>(std::clamp(G, 0.f, 255.f));
-                        rgbRow[c * 3 + 2] = static_cast<uint8_t>(std::clamp(B, 0.f, 255.f));
+                    bool isEvenRow = (cy % 2 == 0);
+                    bool isEvenCol = (cx % 2 == 0);
+                    if (isEvenRow && isEvenCol) {
+                        return cleanVal * u_b_gain; // Blue (BGGR)
+                    } else if (!isEvenRow && !isEvenCol) {
+                        return cleanVal * u_r_gain; // Red
+                    } else {
+                        return cleanVal * u_g_gain; // Green
                     }
                 }
-            }));
+
+                void main() {
+                    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+                    if (pos.x >= u_width || pos.y >= u_height) return;
+
+                    int r = pos.y;
+                    int c = pos.x;
+
+                    float R = 0.0;
+                    float G = 0.0;
+                    float B = 0.0;
+
+                    bool isEvenRow = (r % 2 == 0);
+                    bool isEvenCol = (c % 2 == 0);
+
+                    if (isEvenRow && isEvenCol) {
+                        // Blue pixel
+                        R = (getRaw(c-1, r-1) + getRaw(c+1, r-1) + getRaw(c-1, r+1) + getRaw(c+1, r+1)) * 0.25;
+                        G = (getRaw(c, r-1) + getRaw(c, r+1) + getRaw(c-1, r) + getRaw(c+1, r)) * 0.25;
+                        B = getRaw(c, r);
+                    } else if (!isEvenRow && !isEvenCol) {
+                        // Red pixel
+                        R = getRaw(c, r);
+                        G = (getRaw(c, r-1) + getRaw(c, r+1) + getRaw(c-1, r) + getRaw(c+1, r)) * 0.25;
+                        B = (getRaw(c-1, r-1) + getRaw(c+1, r-1) + getRaw(c-1, r+1) + getRaw(c+1, r+1)) * 0.25;
+                    } else if (isEvenRow && !isEvenCol) {
+                        // Green pixel on Blue row
+                        R = (getRaw(c, r-1) + getRaw(c, r+1)) * 0.5;
+                        G = getRaw(c, r);
+                        B = (getRaw(c-1, r) + getRaw(c+1, r)) * 0.5;
+                    } else {
+                        // Green pixel on Red row
+                        R = (getRaw(c-1, r) + getRaw(c+1, r)) * 0.5;
+                        G = getRaw(c, r);
+                        B = (getRaw(c, r-1) + getRaw(c, r+1)) * 0.5;
+                    }
+
+                    uint uR = uint(clamp(R, 0.0, 255.0));
+                    uint uG = uint(clamp(G, 0.0, 255.0));
+                    uint uB = uint(clamp(B, 0.0, 255.0));
+
+                    uint packedVal = uR | (uG << 8) | (uB << 16) | (255u << 24);
+                    outRGB[r * u_width + c] = packedVal;
+                }
+            )glsl";
+
+            GLuint program = createComputeProgram(COMPUTE_DEMOSAIC_SRC, errorLog);
+            if (program != 0) {
+                glUseProgram(program);
+
+                // Upload 16-bit RAW buffer as R16UI Texture
+                GLuint rawTexture;
+                glGenTextures(1, &rawTexture);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, rawTexture);
+                glTexStorage2D(GL_TEXTURE_2D, 1, GL_R16UI, w, h);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RED_INTEGER, GL_UNSIGNED_SHORT, fusedRaw.data());
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+                glUniform1i(glGetUniformLocation(program, "u_raw_texture"), 0);
+                glUniform1i(glGetUniformLocation(program, "u_width"), w);
+                glUniform1i(glGetUniformLocation(program, "u_height"), h);
+                glUniform1f(glGetUniformLocation(program, "u_black_level"), blackLevel);
+                glUniform1f(glGetUniformLocation(program, "u_scale"), scale);
+                glUniform1f(glGetUniformLocation(program, "u_r_gain"), rGain);
+                glUniform1f(glGetUniformLocation(program, "u_g_gain"), gGain);
+                glUniform1f(glGetUniformLocation(program, "u_b_gain"), bGain);
+
+                // Create output SSBO for packed RGB
+                GLuint outBuffer;
+                glGenBuffers(1, &outBuffer);
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, outBuffer);
+                glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(w) * h * sizeof(uint32_t), nullptr, GL_DYNAMIC_READ);
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outBuffer);
+
+                // Dispatch compute shader
+                glDispatchCompute(static_cast<GLuint>((w + 15) / 16), static_cast<GLuint>((h + 15) / 16), 1);
+                glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+
+                // Read back output buffer
+                void* ptr = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, static_cast<GLsizeiptr>(w) * h * sizeof(uint32_t), GL_MAP_READ_BIT);
+                if (ptr != nullptr) {
+                    ctx.colorImage.resize(w, h);
+                    uint8_t* dst = ctx.colorImage.data.data();
+                    const uint32_t* src = static_cast<const uint32_t*>(ptr);
+                    for (int i = 0; i < w * h; ++i) {
+                        uint32_t val = src[i];
+                        dst[i * 3 + 0] = val & 0xFF;
+                        dst[i * 3 + 1] = (val >> 8) & 0xFF;
+                        dst[i * 3 + 2] = (val >> 16) & 0xFF;
+                    }
+                    glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+                    success = true;
+                } else {
+                    errorLog += "GL: failed to map demosaic output buffer\n";
+                }
+
+                glDeleteBuffers(1, &outBuffer);
+                glDeleteTextures(1, &rawTexture);
+                glDeleteProgram(program);
+            }
         }
-        for (auto& fut : futures) {
-            fut.get();
+
+        if (!success) {
+            LOGE("GL Demosaicing failed, falling back to CPU multi-threaded Bilinear demosaicing. GL Errors:\n%s", errorLog.c_str());
+            // Bilinear Demosaicing (BGGR layout) - Multi-threaded CPU Fallback
+            int numThreads = 8;
+            int rowsPerThread = h / numThreads;
+            std::vector<std::future<void>> futures;
+            futures.reserve(numThreads);
+
+            for (int t = 0; t < numThreads; ++t) {
+                int rStart = t * rowsPerThread;
+                int rEnd = (t == numThreads - 1) ? h : (t + 1) * rowsPerThread;
+
+                futures.push_back(std::async(std::launch::async, [&ctx, &fusedRaw, rStart, rEnd, w, h, blackLevel, scale, rGain, gGain, bGain]() {
+                    auto getRaw = [&](int r, int cc) -> float {
+                        int cr = std::clamp(r, 0, h - 1);
+                        int c_clamped = std::clamp(cc, 0, w - 1);
+                        float val = static_cast<float>(fusedRaw[cr * w + c_clamped]);
+                        float cleanVal = std::max(0.f, (val - blackLevel) * scale);
+
+                        bool isEvenRow = (cr % 2 == 0);
+                        bool isEvenCol = (c_clamped % 2 == 0);
+                        if (isEvenRow && isEvenCol) {
+                            return cleanVal * bGain; // Blue
+                        } else if (!isEvenRow && !isEvenCol) {
+                            return cleanVal * rGain; // Red
+                        } else {
+                            return cleanVal * gGain; // Green
+                        }
+                    };
+
+                    for (int r = rStart; r < rEnd; ++r) {
+                        uint8_t* rgbRow = ctx.colorImage.rowPtr(r);
+                        for (int c = 0; c < w; ++c) {
+                            float R = 0.f, G = 0.f, B = 0.f;
+                            bool isEvenRow = (r % 2 == 0);
+                            bool isEvenCol = (c % 2 == 0);
+
+                            if (isEvenRow && isEvenCol) {
+                                // Blue pixel
+                                R = (getRaw(r-1, c-1) + getRaw(r-1, c+1) + getRaw(r+1, c-1) + getRaw(r+1, c+1)) * 0.25f;
+                                G = (getRaw(r-1, c) + getRaw(r+1, c) + getRaw(r, c-1) + getRaw(r, c+1)) * 0.25f;
+                                B = getRaw(r, c);
+                            } else if (!isEvenRow && !isEvenCol) {
+                                // Red pixel
+                                R = getRaw(r, c);
+                                G = (getRaw(r-1, c) + getRaw(r+1, c) + getRaw(r, c-1) + getRaw(r, c+1)) * 0.25f;
+                                B = (getRaw(r-1, c-1) + getRaw(r-1, c+1) + getRaw(r+1, c-1) + getRaw(r+1, c+1)) * 0.25f;
+                            } else if (isEvenRow && !isEvenCol) {
+                                // Green pixel on Blue row
+                                R = (getRaw(r-1, c) + getRaw(r+1, c)) * 0.5f;
+                                G = getRaw(r, c);
+                                B = (getRaw(r, c-1) + getRaw(r, c+1)) * 0.5f;
+                            } else {
+                                // Green pixel on Red row
+                                R = (getRaw(r, c-1) + getRaw(r, c+1)) * 0.5f;
+                                G = getRaw(r, c);
+                                B = (getRaw(r-1, c) + getRaw(r+1, c)) * 0.5f;
+                            }
+
+                            rgbRow[c * 3 + 0] = static_cast<uint8_t>(std::clamp(R, 0.f, 255.f));
+                            rgbRow[c * 3 + 1] = static_cast<uint8_t>(std::clamp(G, 0.f, 255.f));
+                            rgbRow[c * 3 + 2] = static_cast<uint8_t>(std::clamp(B, 0.f, 255.f));
+                        }
+                    }
+                }));
+            }
+            for (auto& fut : futures) {
+                fut.get();
+            }
         }
     } else {
         if (ctx.fusedY.empty()) {
