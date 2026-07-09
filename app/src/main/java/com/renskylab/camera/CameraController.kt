@@ -62,12 +62,19 @@ class CameraController(
     private val pendingImages = java.util.concurrent.ConcurrentHashMap<Long, Image>()
     private val pendingMetadata = java.util.concurrent.ConcurrentHashMap<Long, TotalCaptureResult>()
 
+    private val burstTimestamps = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+
     private fun tryMatchAndPushFrame(timestamp: Long) {
         val img = pendingImages[timestamp]
         val meta = pendingMetadata[timestamp]
         if (img != null && meta != null) {
             pendingImages.remove(timestamp)
             pendingMetadata.remove(timestamp)
+            
+            if (isCapturingPsl && !burstTimestamps.contains(timestamp)) {
+                img.close()
+                return
+            }
             
             if (_isProcessing.value && !isCapturingPsl) {
                 img.close()
@@ -84,6 +91,11 @@ class CameraController(
             val toEvictCount = pendingImages.size - 2
             for (i in 0 until toEvictCount) {
                 val k = sortedKeys.getOrNull(i) ?: break
+                if (isCapturingPsl && !burstTimestamps.contains(k)) {
+                    pendingImages.remove(k)?.close()
+                    pendingMetadata.remove(k)
+                    continue
+                }
                 pendingImages.remove(k)?.close()
                 pendingMetadata.remove(k)
             }
@@ -405,11 +417,13 @@ class CameraController(
             val surface = lastPreviewSurface
             runCatching { session?.stopRepeating() }
 
+            var captureIso = currentIso
             val isNight = config.nightMode
             val forceBurst = !isNight && currentIso > 400
             val burst = if (isNight || forceBurst) {
                 isCapturingPsl = true
                 ringBuffer.flush() // Clear preview frames
+                burstTimestamps.clear()
 
                 val targetExposureTime: Long
                 val targetIso: Int
@@ -427,6 +441,7 @@ class CameraController(
                     val calculatedExp = (currentExposureTime * (currentIso.toDouble() / 400.0)).toLong()
                     targetExposureTime = calculatedExp.coerceIn(12_000_000L, 80_000_000L) // 1/80s to 1/12s
                 }
+                captureIso = targetIso
                 Log.i(TAG, "Still capture burst: isNight=$isNight, forceBurst=$forceBurst -> targetIso=$targetIso, targetExp=${targetExposureTime / 1_000_000}ms")
 
                 // Create a manual still capture burst to collect clean frames
@@ -437,6 +452,7 @@ class CameraController(
                         set(CaptureRequest.SENSOR_EXPOSURE_TIME, targetExposureTime)
                         set(CaptureRequest.SENSOR_SENSITIVITY, targetIso)
                         set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                        setTag("BURST")
                     }.build()
                 }
 
@@ -449,6 +465,7 @@ class CameraController(
                     ) {
                         val ts = result.get(CaptureResult.SENSOR_TIMESTAMP)
                         if (ts != null) {
+                            burstTimestamps.add(ts)
                             pendingMetadata[ts] = result
                             tryMatchAndPushFrame(ts)
                         }
@@ -608,7 +625,7 @@ class CameraController(
             val job = ProcessingJob(
                 id = jobId,
                 timestamp = timestamp,
-                iso = currentIso,
+                iso = captureIso,
                 frameIsos = frameIsos,
                 frameExposures = frameExposures,
                 nativeBurstHandle = nativeHandle,
