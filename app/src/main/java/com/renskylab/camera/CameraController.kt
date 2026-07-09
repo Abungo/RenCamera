@@ -435,11 +435,12 @@ class CameraController(
                     val calculatedIso = (currentIso * (currentExposureTime.toDouble() / targetExposureTime.toDouble())).toInt()
                     targetIso = calculatedIso.coerceIn(50, currentIso)
                 } else {
-                    // Normal mode: divide viewfinder ISO by the configured factor and scale exposure time proportionally
+                    // Normal mode: divide viewfinder ISO by the configured factor and keep shutter fast to prevent blur
                     val factor = config.normalModeIsoReductionFactor.toDouble()
                     numFrames = 12
                     targetIso = (currentIso / factor).toInt().coerceIn(50, currentIso)
-                    targetExposureTime = (currentExposureTime * factor).toLong()
+                    // Cap shutter speed at 1/60s (16.6ms) to prevent motion blur and handshake
+                    targetExposureTime = currentExposureTime.coerceAtMost(16_666_667L)
                 }
                 captureIso = targetIso
                 Log.i(TAG, "Still capture burst: isNight=$isNight, forceBurst=$forceBurst -> targetIso=$targetIso, targetExp=${targetExposureTime / 1_000_000}ms")
