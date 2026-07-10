@@ -186,8 +186,8 @@ bool DebayerStage::process(FrameContext& ctx) {
                     float gUp = getRawCorrected(pos + ivec2(0, -1), 0);
                     float gDown = getRawCorrected(pos + ivec2(0, 1), 0);
                     float edgeStrength = abs(gLeft - gRight) + abs(gUp - gDown);
-                    // Ramps from 2.0 (flat regions, strong denoising) to 8.0 (sharp edges, detail preservation)
-                    float kExponent = mix(2.0, 8.0, clamp(edgeStrength / 15.0, 0.0, 1.0));
+                    // Ramps from 3.5 (flat regions, strong denoising) to 8.0 (sharp edges, detail preservation)
+                    float kExponent = mix(3.5, 8.0, clamp(edgeStrength / 15.0, 0.0, 1.0));
 
                     float sumR = 0.0, weightR = 0.0;
                     float sumG = 0.0, weightG = 0.0;
@@ -218,7 +218,8 @@ bool DebayerStage::process(FrameContext& ctx) {
                         }
                     }
 
-                    // 2. Subpixel multi-frame accumulation
+                    // 2. Subpixel multi-frame accumulation (with noise weight filtering)
+                    float noiseTolerance = 12.f / u_scale; // scaled to RAW pixel domain (12.f out of 255.f)
                     for (int f = 1; f < u_num_frames; ++f) {
                         float bx = (float(pos.x) - u_block_size * 0.5) / u_block_size;
                         float by = (float(pos.y) - u_block_size * 0.5) / u_block_size;
@@ -233,11 +234,21 @@ bool DebayerStage::process(FrameContext& ctx) {
                                 ivec2 samplePos = centerIdx + ivec2(dx, dy);
                                 if (samplePos.x >= 0 && samplePos.x < u_width && samplePos.y >= 0 && samplePos.y < u_height) {
                                     float val = getRawCorrected(samplePos, f);
+                                    
+                                    // Compare against reference pixel to reject noise and motion mismatches
+                                    ivec2 refSamplePos = pos + ivec2(dx, dy);
+                                    float refVal = getRawCorrected(clamp(refSamplePos, ivec2(0), ivec2(u_width - 1, u_height - 1)), 0);
+                                    float diff = abs(val - refVal);
+                                    
+                                    // Smoothly reject unaligned/noisy pixels
+                                    float weightFactor = exp(-diff * diff / (2.f * noiseTolerance * noiseTolerance));
+                                    if (weightFactor < 0.2) continue; // Tightened threshold from 0.1 to 0.2
+
                                     int color = getPixelColor(samplePos);
 
                                     vec2 delta = vec2(samplePos) - targetPos;
                                     float dist2 = dot(delta, delta);
-                                    float spatialW = exp(-dist2 * kExponent);
+                                    float spatialW = exp(-dist2 * kExponent) * weightFactor;
 
                                     if (color == 0) {
                                         sumR += val * spatialW;

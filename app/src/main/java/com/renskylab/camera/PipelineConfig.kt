@@ -2,10 +2,37 @@ package com.renskylab.camera
 
 import java.io.Serializable
 
+/**
+ * Configuration parameters for the computational camera pipeline.
+ * Contains tuning values for frame capture, alignment, fusion, denoising, auto white balance,
+ * tone mapping, and diagnostics. Implements [Serializable] to allow state saving.
+ *
+ * @property stageEnabled Map indicating whether specific pipeline stages (e.g., "align", "fuse") are enabled.
+ * @property jpegQuality Target compression quality for output JPEGs (50 to 100).
+ * @property exposureBias EV compensation value applied on capture request (e.g. -1.5f).
+ * @property nightExposureBias EV compensation value applied in night mode capture requests (e.g. -0.5f).
+ * @property nightMode Indicates if night processing mode optimizations should be used.
+ * @property alignmentRegularization Penalty scaling factor to constrain block displacements in alignment.
+ * @property fusionNoiseMultiplier Standard deviation multiplier threshold for temporal fusion merging.
+ * @property chromaDenoiseEnabled Toggle for spatial chroma denoising filter.
+ * @property spatialDenoiseStrength Value representing Non-Local Means luma denoiser strength (0 = disabled).
+ * @property awbSoftnessNormal Damping factor for Auto White Balance gains in normal daylight mode.
+ * @property awbSoftnessNight Damping factor for Auto White Balance gains in night mode.
+ * @property detailAlpha Local micro-contrast detail boost exponent (greater than 1.0 amplifies texture).
+ * @property saturationBoost Linear scaling factor for color saturation.
+ * @property blackPointClamp Threshold below which luminance values are quadratically clamped to dark.
+ * @property isoOverride Manual ISO override used for the noise model calibration (0 = use capture metadata).
+ * @property useRawCapture Enables raw Bayer 16-bit format captures instead of 8-bit YUV images.
+ * @property debugRawDumps Enables writing heavy raw intermediate binary dumps per stage.
+ * @property debugImagesEnabled Master toggle for exporting stage-wise debugging JPEGs.
+ * @property normalModeIsoReductionFactor Factor used to shift ISO lower and shutter longer in normal low-light modes.
+ * @property captureFrameCount The total number of burst frames captured.
+ */
 data class PipelineConfig(
     val stageEnabled: Map<String, Boolean> = DEFAULT_STAGES,
     val jpegQuality: Int = 95,
     val exposureBias: Float = -1.5f,
+    val nightExposureBias: Float = -0.5f,
     val nightMode: Boolean = false,
 
     // Alignment parameters
@@ -62,10 +89,17 @@ data class PipelineConfig(
             "encode"  to true,
         )
 
+        /**
+         * Parses a PipelineConfig object from an XML string representation.
+         *
+         * @param xml The XML formatted configuration string.
+         * @return A parsed [PipelineConfig] instance with settings extracted from XML.
+         */
         fun fromXml(xml: String): PipelineConfig {
             val stages = DEFAULT_STAGES.toMutableMap()
             var jpegQuality = 95
             var exposureBias = -1.5f
+            var nightExposureBias = -0.5f
             var nightMode = false
             var alignmentRegularization = 5.0f
             var fusionNoiseMultiplier = 3.0f
@@ -91,6 +125,7 @@ data class PipelineConfig(
                 when (tag) {
                     "jpegQuality" -> jpegQuality = value.toIntOrNull() ?: 95
                     "exposureBias" -> exposureBias = value.toFloatOrNull() ?: -1.5f
+                    "nightExposureBias" -> nightExposureBias = value.toFloatOrNull() ?: -0.5f
                     "nightMode" -> nightMode = value.toBooleanStrictOrNull() ?: false
                     "alignmentRegularization" -> alignmentRegularization = value.toFloatOrNull() ?: 5.0f
                     "fusionNoiseMultiplier" -> fusionNoiseMultiplier = value.toFloatOrNull() ?: 3.0f
@@ -102,7 +137,7 @@ data class PipelineConfig(
                     "saturationBoost" -> saturationBoost = value.toFloatOrNull() ?: 1.15f
                     "blackPointClamp" -> blackPointClamp = value.toFloatOrNull() ?: 0.08f
                     "isoOverride" -> isoOverride = value.toIntOrNull() ?: 0
-                    "useRawCapture" -> useRawCapture = value.toBooleanStrictOrNull() ?: false
+                    "useRawCapture" -> useRawCapture = value.toBooleanStrictOrNull() ?: true
                     "debugRawDumps" -> debugRawDumps = value.toBooleanStrictOrNull() ?: false
                     "debugImagesEnabled" -> debugImagesEnabled = value.toBooleanStrictOrNull() ?: true
                     "normalModeIsoReductionFactor" -> normalModeIsoReductionFactor = value.toFloatOrNull() ?: 2.0f
@@ -119,6 +154,7 @@ data class PipelineConfig(
                 stageEnabled = stages,
                 jpegQuality = jpegQuality,
                 exposureBias = exposureBias,
+                nightExposureBias = nightExposureBias,
                 nightMode = nightMode,
                 alignmentRegularization = alignmentRegularization,
                 fusionNoiseMultiplier = fusionNoiseMultiplier,
@@ -139,6 +175,12 @@ data class PipelineConfig(
         }
     }
 
+    /**
+     * Converts configuration parameters to a flat float array.
+     * This format is easily digestible by JNI / C++ processing engines.
+     *
+     * @return FloatArray mapping all relevant configuration settings.
+     */
     fun toFloatArray(): FloatArray {
         return floatArrayOf(
             alignmentRegularization,                   // 0
@@ -159,19 +201,37 @@ data class PipelineConfig(
         )
     }
 
+    /**
+     * Maps the enabled stages to a BooleanArray ordered by execution priority.
+     *
+     * @return BooleanArray representing execution states of pipeline stages.
+     */
     fun toStageFlagArray(): BooleanArray =
         BooleanArray(stageOrder.size) { i ->
             stageEnabled[stageOrder[i]] ?: true
         }
 
+    /**
+     * Helper to duplicate config with a specific pipeline stage altered.
+     *
+     * @param name The stage name.
+     * @param enabled Set to true if the stage should be run.
+     * @return A new duplicate [PipelineConfig] with modified stage settings.
+     */
     fun withStage(name: String, enabled: Boolean): PipelineConfig =
         copy(stageEnabled = stageEnabled + (name to enabled))
 
+    /**
+     * Serializes this config object into an XML structure.
+     *
+     * @return The XML formatted configuration string.
+     */
     fun toXml(): String {
         val sb = java.lang.StringBuilder()
         sb.append("<RenCameraConfig>\n")
         sb.append("  <jpegQuality>${jpegQuality}</jpegQuality>\n")
         sb.append("  <exposureBias>${exposureBias}</exposureBias>\n")
+        sb.append("  <nightExposureBias>${nightExposureBias}</nightExposureBias>\n")
         sb.append("  <nightMode>${nightMode}</nightMode>\n")
         sb.append("  <alignmentRegularization>${alignmentRegularization}</alignmentRegularization>\n")
         sb.append("  <fusionNoiseMultiplier>${fusionNoiseMultiplier}</fusionNoiseMultiplier>\n")

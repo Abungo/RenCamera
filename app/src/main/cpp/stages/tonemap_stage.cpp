@@ -432,6 +432,49 @@ bool ToneMapStage::process(FrameContext& ctx) {
                 vec3 oRgb = rgbVal * scale;
                 float newL = luma(oRgb);
 
+                // Convert to YUV (YPbPr) space to isolate U and V chroma channels
+                float uVal = -0.1687 * oRgb.r - 0.3313 * oRgb.g + 0.5 * oRgb.b;
+                float vVal = 0.5 * oRgb.r - 0.4187 * oRgb.g - 0.0813 * oRgb.b;
+
+                // Wide-radius chroma denoiser: Bilateral blur on U & V channels across ALL regions (dark and light)
+                float sumU = 0.0;
+                float sumV = 0.0;
+                float sumChromaW = 0.0;
+                
+                int chromaRadius = 6; // Large window to wash out splotchy high/low-frequency color noise
+                
+                for (int dy = -chromaRadius; dy <= chromaRadius; ++dy) {
+                    for (int dx = -chromaRadius; dx <= chromaRadius; ++dx) {
+                        ivec2 nPos = clamp(pos + ivec2(dx, dy), ivec2(0), ivec2(u_width - 1, u_height - 1));
+                        
+                        // Sample neighboring RGB and compute its luma
+                        vec3 nRgb = texelFetch(u_input_texture, nPos, 0).rgb * 255.0;
+                        float nL = luma(nRgb);
+                        
+                        // Range weight based on luma difference to preserve colors on boundaries
+                        float diffL = nL - L;
+                        float wChroma = exp(-float(dx*dx + dy*dy) / 18.0) * exp(-diffL*diffL / (2.0 * 35.0 * 35.0));
+                        
+                        vec3 nRgbScaled = nRgb * scale;
+                        float nU = -0.1687 * nRgbScaled.r - 0.3313 * nRgbScaled.g + 0.5 * nRgbScaled.b;
+                        float nV = 0.5 * nRgbScaled.r - 0.4187 * nRgbScaled.g - 0.0813 * nRgbScaled.b;
+                        
+                        sumU += wChroma * nU;
+                        sumV += wChroma * nV;
+                        sumChromaW += wChroma;
+                    }
+                }
+                
+                if (sumChromaW > 1e-4) {
+                    uVal = sumU / sumChromaW;
+                    vVal = sumV / sumChromaW;
+                }
+
+                // Convert back from YUV to RGB space using denoised U & V
+                oRgb.r = newL + 1.402 * vVal;
+                oRgb.g = newL - 0.34414 * uVal - 0.71414 * vVal;
+                oRgb.b = newL + 1.772 * uVal;
+
                 if (newL > 0.1) {
                     float factor = u_saturation_boost;
                     if (newL > 200.0) {

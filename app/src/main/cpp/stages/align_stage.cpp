@@ -23,7 +23,7 @@ static constexpr int REFINE_RANGE  =  4;  // ±pixels at finer levels
 
 /// Copy a Camera2 YUV/RAW frame to a packed FloatImage downsampled by 4x
 /// using a 4x4 average box filter. This speeds up alignment by 16x.
-static FloatImage yPlaneToFloatDownsampled4x(const YuvFrame& f, bool useRaw, float digitalGain) {
+static FloatImage yPlaneToFloatDownsampled4x(const YuvFrame& f, bool useRaw, float digitalGain, float exposureScale) {
     FloatImage out;
     int dw = f.width / 4;
     int dh = f.height / 4;
@@ -32,8 +32,36 @@ static FloatImage yPlaneToFloatDownsampled4x(const YuvFrame& f, bool useRaw, flo
     if (useRaw) {
         int strideElements = f.yRowStride / 2;
         const uint16_t* rawBase = reinterpret_cast<const uint16_t*>(f.yPlane);
-        // Normalize 12-bit RAW range after subtracting black level of 1024, and apply digital exposure gain
-        float scale = (255.f / 3071.f) * digitalGain;
+        
+        // Dynamically detect range/black level of raw frame
+        float blackLevel = 1024.f;
+        float whiteLevel = 4095.f;
+        
+        uint16_t minVal = 65535;
+        uint16_t maxVal = 0;
+        int testPixels = std::min(f.width * f.height, 20000);
+        for (int p = 0; p < testPixels; ++p) {
+            uint16_t v = rawBase[p];
+            if (v < minVal) minVal = v;
+            if (v > maxVal) maxVal = v;
+        }
+        
+        if (maxVal <= 1023) {
+            blackLevel = 64.f;
+            whiteLevel = 1023.f;
+        } else if (maxVal <= 4095) {
+            blackLevel = 1024.f;
+            if (minVal < 300) blackLevel = 256.f;
+            if (minVal < 100) blackLevel = 64.f;
+            whiteLevel = 4095.f;
+        } else {
+            blackLevel = 1024.f;
+            if (minVal < 500) blackLevel = 256.f;
+            whiteLevel = static_cast<float>(maxVal);
+        }
+
+        // Normalize RAW range after subtracting dynamic black level, and apply digital exposure gain & exposure bracket scaling
+        float scale = (255.f / std::max(1.f, whiteLevel - blackLevel)) * digitalGain * exposureScale;
         for (int row = 0; row < dh; ++row) {
             float*         dst = out.ptr(row);
             for (int col = 0; col < dw; ++col) {
@@ -44,8 +72,8 @@ static FloatImage yPlaneToFloatDownsampled4x(const YuvFrame& f, bool useRaw, flo
                            static_cast<float>(srcRow[4 * col + 2]) + static_cast<float>(srcRow[4 * col + 3]);
                 }
                 float avgRaw = sum * (1.0f / 16.0f);
-                float cleanVal = std::max(0.f, avgRaw - 1024.f);
-                dst[col] = cleanVal * scale;
+                float cleanVal = std::max(0.f, avgRaw - blackLevel);
+                dst[col] = std::clamp(cleanVal * scale, 0.f, 255.f);
             }
         }
     } else {
@@ -58,7 +86,7 @@ static FloatImage yPlaneToFloatDownsampled4x(const YuvFrame& f, bool useRaw, flo
                     sum += static_cast<float>(srcRow[4 * col + 0]) + static_cast<float>(srcRow[4 * col + 1]) +
                            static_cast<float>(srcRow[4 * col + 2]) + static_cast<float>(srcRow[4 * col + 3]);
                 }
-                dst[col] = sum * (1.0f / 16.0f);
+                dst[col] = std::clamp(sum * (1.0f / 16.0f) * exposureScale, 0.f, 255.f);
             }
         }
     }
@@ -381,9 +409,21 @@ bool AlignStage::process(FrameContext& ctx) {
         try { digitalGain = std::any_cast<float>(ctx.metadata.at("digital_gain")); } catch (...) {}
     }
 
+    std::vector<double> exposures;
+    if (ctx.metadata.count("frame_exposures")) {
+        try { exposures = std::any_cast<std::vector<double>>(ctx.metadata.at("frame_exposures")); } catch (...) {}
+    }
+    std::vector<int> isos;
+    if (ctx.metadata.count("frame_isos")) {
+        try { isos = std::any_cast<std::vector<int>>(ctx.metadata.at("frame_isos")); } catch (...) {}
+    }
+
+    float refExposure = (exposures.size() > 0) ? static_cast<float>(exposures[0]) : 33333333.f;
+    float refIso = (isos.size() > 0) ? static_cast<float>(isos[0]) : 100.f;
+
     // Frame 0 is the reference (last captured = most recent, sharpest focus)
     const YuvFrame& refFrame = ctx.inputFrames[0];
-    Pyramid refPyr = buildPyramid(yPlaneToFloatDownsampled4x(refFrame, useRaw, digitalGain));
+    Pyramid refPyr = buildPyramid(yPlaneToFloatDownsampled4x(refFrame, useRaw, digitalGain, 1.0f));
 
     size_t numSrcFrames = ctx.inputFrames.size() - 1;
     ctx.motionFields.clear();
@@ -401,8 +441,16 @@ bool AlignStage::process(FrameContext& ctx) {
 
     for (size_t i = 0; i < numSrcFrames; ++i) {
         size_t srcIndex = i + 1;
-        futures.push_back(std::async(std::launch::async, [&ctx, &refPyr, srcIndex, i, regFactor, useRaw, digitalGain]() {
-            Pyramid srcPyr = buildPyramid(yPlaneToFloatDownsampled4x(ctx.inputFrames[srcIndex], useRaw, digitalGain));
+        float srcExposure = (exposures.size() > srcIndex) ? static_cast<float>(exposures[srcIndex]) : 33333333.f;
+        float srcIso = (isos.size() > srcIndex) ? static_cast<float>(isos[srcIndex]) : 100.f;
+        
+        float exposureScale = 1.0f;
+        if (srcExposure > 0.f && srcIso > 0.f) {
+            exposureScale = (refExposure * refIso) / (srcExposure * srcIso);
+        }
+
+        futures.push_back(std::async(std::launch::async, [&ctx, &refPyr, srcIndex, i, regFactor, useRaw, digitalGain, exposureScale]() {
+            Pyramid srcPyr = buildPyramid(yPlaneToFloatDownsampled4x(ctx.inputFrames[srcIndex], useRaw, digitalGain, exposureScale));
             MotionField mf = alignFrame(refPyr, srcPyr, regFactor);
             
             // Scale up the motion vectors and block size by 4x

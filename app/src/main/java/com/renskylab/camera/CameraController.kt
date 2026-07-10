@@ -42,7 +42,10 @@ class CameraController(
     // ── Public state ───────────────────────────────────────────────────────────
     private val _isProcessing = MutableStateFlow(false)
     val isProcessing: StateFlow<Boolean> = _isProcessing
+    private val _captureProgress = MutableStateFlow(0f)
+    val captureProgress: StateFlow<Float> = _captureProgress
     var isNightMode: Boolean = false
+    private var activeExposureBias: Float = -0.5f
 
     // ── Camera hardware ────────────────────────────────────────────────────────
     private val manager by lazy {
@@ -64,6 +67,13 @@ class CameraController(
 
     private val burstTimestamps = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
 
+    /**
+     * Attempts to pair an incoming [Image] buffer with its matching [TotalCaptureResult] metadata.
+     * When both become available for a given hardware sensor timestamp, they are packaged into a
+     * [CapturedFrame] and pushed to the FIFO ring buffer. Also implements leak prevention on unmatched buffers.
+     *
+     * @param timestamp The hardware sensor timestamp of the frame.
+     */
     private fun tryMatchAndPushFrame(timestamp: Long) {
         val img = pendingImages[timestamp]
         val meta = pendingMetadata[timestamp]
@@ -116,7 +126,7 @@ class CameraController(
     // ── Remembered preview surface (needed to restart repeating request) ───────
     @Volatile private var lastPreviewSurface: Surface? = null
     @Volatile private var lastTexture: android.graphics.SurfaceTexture? = null
-    @Volatile private var useRawCapture: Boolean = false
+    @Volatile private var useRawCapture: Boolean = true  // Always start in RAW mode; YUV path is hardware fallback only
     @Volatile private var currentIso: Int = 400
     @Volatile private var currentExposureTime: Long = 33_333_333L
     @Volatile private var isCapturingPsl = false
@@ -130,6 +140,11 @@ class CameraController(
     // Lifecycle
     // ─────────────────────────────────────────────────────────────────────────
 
+    /**
+     * Starts the background handler thread and opens the back-facing camera device to start the preview.
+     *
+     * @param texture The [android.graphics.SurfaceTexture] to draw the camera preview onto.
+     */
     fun startCamera(texture: android.graphics.SurfaceTexture) {
         lastTexture = texture
         startBackgroundThread()
@@ -142,6 +157,10 @@ class CameraController(
         }
     }
 
+    /**
+     * Stops the active capture session, closes the camera device, flushes all buffers, and kills the
+     * background thread handler.
+     */
     fun stopCamera() {
         lastPreviewSurface = null
         lastTexture = null
@@ -158,6 +177,12 @@ class CameraController(
         stopBackgroundThread()
     }
 
+    /**
+     * Enables or disables Night capture mode. Restarts the repeating capture session request to apply
+     * the new EV compensation levels.
+     *
+     * @param enabled Set to true to optimize exposure settings for low light conditions.
+     */
     fun setNightModeEnabled(enabled: Boolean) {
         if (isNightMode == enabled) return
         isNightMode = enabled
@@ -172,6 +197,32 @@ class CameraController(
         }
     }
 
+    /**
+     * Updates the current exposure compensation bias value (in EV steps).
+     * Restarts the repeating capture session request to apply the new exposure targets.
+     *
+     * @param bias The exposure bias to apply.
+     */
+    fun setExposureBias(bias: Float) {
+        if (activeExposureBias == bias) return
+        activeExposureBias = bias
+        Log.i(TAG, "setExposureBias: $bias")
+
+        val session = captureSession
+        val surface = lastPreviewSurface
+        if (session != null && surface != null) {
+            scope.launch(Dispatchers.IO) {
+                runCatching { startRepeatingRequest(session, surface) }
+            }
+        }
+    }
+
+    /**
+     * Configures the camera pipeline to capture either raw 16-bit Bayer data or standard 8-bit YUV buffers.
+     * Recreates the [ImageReader] and current active capture session with the requested hardware format.
+     *
+     * @param enabled Set to true to request raw Bayer format; false for standard YUV.
+     */
     fun setRawCaptureEnabled(enabled: Boolean) {
         if (useRawCapture == enabled) return
         useRawCapture = enabled
@@ -256,6 +307,13 @@ class CameraController(
     // Open camera + create session
     // ─────────────────────────────────────────────────────────────────────────
 
+    /**
+     * Finds and opens the primary rear-facing camera sensor.
+     * Configures the preview texture aspect ratio, initializes the [ImageReader] with target formats,
+     * and sets up hardware callbacks.
+     *
+     * @param texture The drawing surface texture.
+     */
     private fun openCamera(texture: android.graphics.SurfaceTexture) {
         val cameraId = pickBackCamera() ?: run {
             Log.e(TAG, "No back camera found"); return
@@ -339,6 +397,12 @@ class CameraController(
         }, cameraHandler)
     }
 
+    /**
+     * Builds and configures a dual-output [CameraCaptureSession] with both preview and ImageReader surfaces.
+     *
+     * @param device The opened hardware camera device.
+     * @param previewSurface The surface utilized for live viewfinder previews.
+     */
     private fun createCaptureSession(device: CameraDevice, previewSurface: Surface) {
         val targets = listOf(previewSurface, imageReader!!.surface)
         device.createCaptureSession(targets, object : CameraCaptureSession.StateCallback() {
@@ -352,6 +416,13 @@ class CameraController(
         }, cameraHandler)
     }
 
+    /**
+     * Builds and starts a continuous repeating capture request.
+     * Sets target exposure bias/compensation parameters, AF modes, and frames-per-second constraints.
+     *
+     * @param session The active camera capture session.
+     * @param previewSurface The rendering surface.
+     */
     private fun startRepeatingRequest(session: CameraCaptureSession, previewSurface: Surface) {
         val characteristics = manager.getCameraCharacteristics(
             pickBackCamera() ?: return
@@ -361,7 +432,7 @@ class CameraController(
         val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
         val aeStep  = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)
         val stepSize = aeStep?.toFloat() ?: (1f / 3f)
-        val bias = if (isNightMode) 1.5f else -1.5f
+        val bias = if (isNightMode) 1.5f else activeExposureBias
         val evSteps = (bias / stepSize).toInt()
             .coerceIn(aeRange?.lower ?: -6, aeRange?.upper ?: 0)
 
@@ -373,10 +444,11 @@ class CameraController(
                 set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
                 set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
 
-                // Select target FPS range with lowest minimum to support longer exposure times
+                // Select target FPS range with lowest minimum to support longer exposure times, preferring 30fps max to avoid capping exposure at 16.6ms
                 val fpsRanges = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
-                val bestRange = fpsRanges?.filter { it.upper >= 30 }
+                val bestRange = fpsRanges?.filter { it.upper == 30 }
                     ?.minByOrNull { it.lower }
+                    ?: fpsRanges?.filter { it.upper >= 30 }?.minByOrNull { it.lower }
                 if (bestRange != null) {
                     set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, bestRange)
                     Log.i(TAG, "Selected AE FPS range for preview: $bestRange")
@@ -426,6 +498,7 @@ class CameraController(
      */
     fun captureBurst(
         config: PipelineConfig = PipelineConfig(),
+        hdrMode: HdrMode = HdrMode.HDR_ON,
         onDispatched: () -> Unit,
         onSaved: (android.net.Uri) -> Unit,
         onError: (String) -> Unit,
@@ -442,9 +515,11 @@ class CameraController(
             var captureIso = currentIso
             var calculatedDigitalGain = 1.0f
             val isNight = config.nightMode
-            val forceBurst = !isNight && currentIso > 400
-            val burst = if (isNight || forceBurst) {
+            val isHdrEnhanced = hdrMode == HdrMode.HDR_ENHANCED
+            val forceBurst = !isNight && !isHdrEnhanced && currentIso > 400
+            val burst = if (isNight || forceBurst || isHdrEnhanced) {
                 isCapturingPsl = true
+                _captureProgress.value = 0f
                 ringBuffer.flush() // Clear preview frames
                 burstTimestamps.clear()
 
@@ -457,25 +532,38 @@ class CameraController(
                     targetExposureTime = 125_000_000L // 125ms
                     val calculatedIso = (currentIso * (currentExposureTime.toDouble() / targetExposureTime.toDouble())).toInt()
                     targetIso = calculatedIso.coerceIn(50, currentIso)
+                } else if (isHdrEnhanced) {
+                    numFrames = config.captureFrameCount
+                    // HDR+ Enhanced: Base exposure target (normal frames)
+                    targetExposureTime = currentExposureTime.coerceAtMost(50_000_000L) // Limit to 50ms to prevent extreme handshake blur
+                    targetIso = currentIso
                 } else {
                     // Normal mode: divide viewfinder ISO by the configured factor and keep shutter fast to prevent blur
                     val factor = config.normalModeIsoReductionFactor.toDouble()
                     numFrames = config.captureFrameCount
                     targetIso = (currentIso / factor).toInt().coerceIn(50, currentIso)
-                    // Cap shutter speed at 1/60s (16.6ms) to prevent motion blur and handshake
-                    targetExposureTime = currentExposureTime.coerceAtMost(16_666_667L)
+                    // Cap shutter speed at 1/30s (33.3ms) to prevent motion blur and handshake
+                    targetExposureTime = currentExposureTime.coerceAtMost(33_333_333L)
                 }
-                captureIso = targetIso
-                calculatedDigitalGain = ((currentIso.toDouble() * currentExposureTime.toDouble()) / (targetIso.toDouble() * targetExposureTime.toDouble())).toFloat()
-                Log.i(TAG, "Still capture burst: isNight=$isNight, forceBurst=$forceBurst -> targetIso=$targetIso, targetExp=${targetExposureTime / 1_000_000}ms, digitalGain=$calculatedDigitalGain")
+                            captureIso = targetIso
+                val exposureBoost = Math.pow(2.0, -config.exposureBias.toDouble()).toFloat()
+                calculatedDigitalGain = (((currentIso.toDouble() * currentExposureTime.toDouble()) / (targetIso.toDouble() * targetExposureTime.toDouble())) * exposureBoost).toFloat()
+                Log.i(TAG, "Still capture burst: isNight=$isNight, forceBurst=$forceBurst, isHdrEnhanced=$isHdrEnhanced -> targetIso=$targetIso, targetExp=${targetExposureTime / 1_000_000}ms, digitalGain=$calculatedDigitalGain, exposureBoost=$exposureBoost")
 
                 // Create a manual still capture burst using TEMPLATE_MANUAL to guarantee hardware register gains are applied
-                val requests = List(numFrames) {
+                val requests = List(numFrames) { idx ->
+                    // Alternate between Normal exposure and Short exposure (exposing 4x shorter / -2.0 EV)
+                    // Frame 0 is always base normal exposure to act as reference frame
+                    val frameExp = if (isHdrEnhanced && idx % 2 == 1) {
+                        targetExposureTime / 4
+                    } else {
+                        targetExposureTime
+                    }
                     cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_MANUAL).apply {
                         addTarget(imageReader!!.surface)
                         set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
                         set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-                        set(CaptureRequest.SENSOR_EXPOSURE_TIME, targetExposureTime)
+                        set(CaptureRequest.SENSOR_EXPOSURE_TIME, frameExp)
                         set(CaptureRequest.SENSOR_SENSITIVITY, targetIso)
                         set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                         setTag("BURST")
@@ -514,8 +602,10 @@ class CameraController(
                 val timeoutMs = 6000L
                 val startTime = System.currentTimeMillis()
                 while (ringBuffer.size < numFrames && (System.currentTimeMillis() - startTime) < timeoutMs) {
+                    _captureProgress.value = ringBuffer.size.toFloat() / numFrames.toFloat()
                     delay(50)
                 }
+                _captureProgress.value = 1.0f
 
                 isCapturingPsl = false
                 val pslFrames = ringBuffer.snapshot()
@@ -526,6 +616,9 @@ class CameraController(
                 }
                 pslFrames
             } else {
+                _captureProgress.value = 1.0f
+                val exposureBoost = Math.pow(2.0, -config.exposureBias.toDouble()).toFloat()
+                calculatedDigitalGain = exposureBoost
                 val fullDrained = ringBuffer.snapshot()
                 if (fullDrained.isEmpty()) {
                     _isProcessing.value = false
@@ -539,11 +632,10 @@ class CameraController(
                     return@launch
                 }
 
-                val needed = config.captureFrameCount
+                val needed = if (hdrMode == HdrMode.OFF) 1 else config.captureFrameCount
                 if (fullDrained.size > needed) {
                     val discard = fullDrained.size - needed
                     fullDrained.subList(0, discard).forEach { runCatching { it.image.close() } }
-                    fullDrained.subList(discard, fullDrained.size)
                     fullDrained.subList(discard, fullDrained.size)
                 } else {
                     fullDrained
@@ -711,6 +803,12 @@ class CameraController(
     // Helpers
     // ─────────────────────────────────────────────────────────────────────────
 
+    /**
+     * Picks the back-facing camera device ID. If raw capture is requested, prioritizes camera sensors
+     * that explicitly expose raw capture capabilities.
+     *
+     * @return The camera ID string of the chosen back camera, or null if none is found.
+     */
     private fun pickBackCamera(): String? {
         val backCameras = manager.cameraIdList.filter { id ->
             manager.getCameraCharacteristics(id)
@@ -735,6 +833,9 @@ class CameraController(
         return defaultCamera
     }
 
+    /**
+     * Starts the dedicated background thread for processing camera callbacks to avoid blocking the main UI thread.
+     */
     private fun startBackgroundThread() {
         cameraThread = HandlerThread("CameraBackground").also {
             it.start()
@@ -742,6 +843,9 @@ class CameraController(
         }
     }
 
+    /**
+     * Stops the background callback thread safely.
+     */
     private fun stopBackgroundThread() {
         cameraThread?.quitSafely()
         cameraThread?.join()

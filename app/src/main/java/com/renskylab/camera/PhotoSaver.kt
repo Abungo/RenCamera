@@ -16,8 +16,13 @@ import java.io.IOException
 object PhotoSaver {
 
     /**
-     * Save [jpegBytes] as a JPEG file in MediaStore.
-     * @return the [Uri] of the saved image, or null on failure.
+     * Saves the provided JPEG byte array as an image file in the shared MediaStore Pictures collection.
+     * Writes output to a sub-folder under `Pictures/RenCamera/` (or standard DCIM/Camera path depending on API version).
+     *
+     * @param context The application or activity context.
+     * @param jpegBytes The compressed JPEG image data to be saved.
+     * @param filename The target display name for the saved image file.
+     * @return The [Uri] pointing to the saved image in the MediaStore, or null if the operation fails.
      */
     suspend fun save(context: Context, jpegBytes: ByteArray, filename: String): Uri? =
         withContext(Dispatchers.IO) {

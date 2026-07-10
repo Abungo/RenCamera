@@ -12,6 +12,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -54,11 +55,20 @@ private val ErrorRed     = Color(0xFFFF4560)
 // ─────────────────────────────────────────────────────────────────────────────
 // Root composable
 // ─────────────────────────────────────────────────────────────────────────────
+/**
+ * The main UI layout of the RenCamera application.
+ * Manages the camera viewfinder, bottom capture controls, top utility controls, settings screen overlays,
+ * and background progress indicators.
+ *
+ * @param viewModel The shared state and action controller.
+ */
 @Composable
 fun RenCameraApp(viewModel: CameraViewModel) {
     val uiState by viewModel.uiState.collectAsState()
     val config by viewModel.pipelineConfig.collectAsState()
+    val captureProgress by viewModel.controller.captureProgress.collectAsState()
     var showSettings by remember { mutableStateOf(false) }
+    var showDropdownSettings by remember { mutableStateOf(false) }
 
     // Launcher for XML Config Export
     val exportLauncher = rememberLauncherForActivityResult(
@@ -90,11 +100,67 @@ fun RenCameraApp(viewModel: CameraViewModel) {
             modifier = Modifier
                 .fillMaxWidth()
                 .aspectRatio(3f / 4f)
-                .align(Alignment.Center),
+                .align(Alignment.Center)
+                .pointerInput(showDropdownSettings) {
+                    detectVerticalDragGestures { change, dragAmount ->
+                        if (dragAmount > 12f && !showDropdownSettings) {
+                            showDropdownSettings = true
+                        } else if (dragAmount < -12f && showDropdownSettings) {
+                            showDropdownSettings = false
+                        }
+                    }
+                },
             onTextureReady = { st ->
                 viewModel.controller.startCamera(st)
             }
         )
+
+        // ── Viewfinder capture progress ring (GCam-style) ──────────────────────
+        if (uiState.isProcessing && captureProgress < 1.0f && uiState.timerCountdownValue <= 0) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(3f / 4f)
+                    .align(Alignment.Center),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    Box(
+                        contentAlignment = Alignment.Center
+                    ) {
+                        // Background track ring
+                        CircularProgressIndicator(
+                            progress = 1.0f,
+                            color = White60.copy(alpha = 0.2f),
+                            strokeWidth = 4.dp,
+                            modifier = Modifier.size(96.dp)
+                        )
+                        // Sweeping progress indicator
+                        CircularProgressIndicator(
+                            progress = captureProgress,
+                            color = Color.White,
+                            strokeWidth = 4.dp,
+                            modifier = Modifier.size(96.dp)
+                        )
+                    }
+                    Text(
+                        text = "Hold still",
+                        color = Color.White,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Normal,
+                        style = MaterialTheme.typography.bodyMedium.copy(
+                            shadow = androidx.compose.ui.graphics.Shadow(
+                                color = Color.Black.copy(alpha = 0.6f),
+                                blurRadius = 4f
+                            )
+                        )
+                    )
+                }
+            }
+        }
 
         // ── Gradient scrim — bottom controls ──────────────────────────────────
         Box(
@@ -123,15 +189,80 @@ fun RenCameraApp(viewModel: CameraViewModel) {
         )
 
         // ── Top controls bar ──────────────────────────────────────────────────
-        TopControlsBar(
-            flashMode    = uiState.flashMode,
-            onFlashCycle = { viewModel.setFlashMode(uiState.flashMode.next()) },
-            onSettingsClick = { showSettings = true },
-            modifier     = Modifier
+        Row(
+            modifier = Modifier
                 .align(Alignment.TopCenter)
                 .statusBarsPadding()
-                .padding(top = 4.dp, start = 16.dp, end = 16.dp),
-        )
+                .padding(top = 8.dp)
+                .fillMaxWidth(),
+            horizontalArrangement = Arrangement.Center
+        ) {
+            IconButton(
+                onClick = { showDropdownSettings = !showDropdownSettings },
+                modifier = Modifier
+                    .clip(CircleShape)
+                    .background(SurfaceGlass)
+                    .size(48.dp)
+            ) {
+                Icon(
+                    imageVector = if (showDropdownSettings) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                    contentDescription = "Quick Settings",
+                    tint = AccentCyan
+                )
+            }
+        }
+
+        // ── Scrim to close settings when tapping outside ──────────────────────
+        if (showDropdownSettings) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clickable(
+                        interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                        indication = null
+                    ) {
+                        showDropdownSettings = false
+                    }
+            )
+        }
+
+        // ── Dropdown settings sheet overlay ──────────────────────────────────
+        AnimatedVisibility(
+            visible = showDropdownSettings,
+            enter = slideInVertically(initialOffsetY = { -it }) + fadeIn(),
+            exit = slideOutVertically(targetOffsetY = { -it }) + fadeOut(),
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .statusBarsPadding()
+                .padding(top = 64.dp, start = 16.dp, end = 16.dp)
+        ) {
+            DropdownSettingsSheet(
+                uiState = uiState,
+                viewModel = viewModel,
+                onClose = { showDropdownSettings = false },
+                onMoreSettingsClick = {
+                    showDropdownSettings = false
+                    showSettings = true
+                }
+            )
+        }
+
+        // ── Countdown timer overlay ───────────────────────────────────────────
+        if (uiState.timerCountdownValue > 0) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Black.copy(alpha = 0.4f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = uiState.timerCountdownValue.toString(),
+                    color = AccentCyan,
+                    fontSize = 120.sp,
+                    fontWeight = FontWeight.Black
+                )
+            }
+        }
 
         // ── Bottom controls bar ───────────────────────────────────────────────
         Column(
@@ -148,6 +279,7 @@ fun RenCameraApp(viewModel: CameraViewModel) {
             // Main controls: gallery | shutter | (placeholder for front cam)
             BottomControlsRow(
                 isProcessing    = uiState.isProcessing,
+                captureProgress = captureProgress,
                 lastCapturedUri = uiState.lastCapturedUri,
                 onShutter       = viewModel::onShutterPressed,
                 modifier        = Modifier
@@ -195,6 +327,12 @@ fun RenCameraApp(viewModel: CameraViewModel) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Camera preview — AndroidView wrapping TextureView
 // ─────────────────────────────────────────────────────────────────────────────
+/**
+ * Renders the live camera viewfinder using an Android [TextureView].
+ *
+ * @param modifier Layout modifiers.
+ * @param onTextureReady Callback triggered when the underlying [SurfaceTexture] is initialized.
+ */
 @Composable
 private fun CameraPreview(
     modifier: Modifier,
@@ -220,38 +358,165 @@ private fun CameraPreview(
 // ─────────────────────────────────────────────────────────────────────────────
 // Top controls bar
 // ─────────────────────────────────────────────────────────────────────────────
+data class SettingOption<T>(
+    val value: T,
+    val label: String,
+    val icon: ImageVector? = null
+)
+
 @Composable
-private fun TopControlsBar(
-    flashMode: FlashMode,
-    onFlashCycle: () -> Unit,
-    onSettingsClick: () -> Unit,
-    modifier: Modifier = Modifier,
+private fun <T> SettingSelectionRow(
+    title: String,
+    options: List<SettingOption<T>>,
+    selected: T,
+    onSelect: (T) -> Unit,
 ) {
     Row(
-        modifier            = modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment   = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
     ) {
-        // Flash
-        IconButton(onClick = onFlashCycle) {
-            Icon(
-                imageVector = when (flashMode) {
-                    FlashMode.OFF  -> Icons.Default.FlashOff
-                    FlashMode.AUTO -> Icons.Default.FlashAuto
-                    FlashMode.ON   -> Icons.Default.FlashOn
-                },
-                contentDescription = "Flash: $flashMode",
-                tint   = if (flashMode == FlashMode.ON) AccentCyan else White90,
-            )
-        }
+        Text(
+            text = title,
+            color = White60,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.width(60.dp)
+        )
 
-        // Settings
-        IconButton(onClick = onSettingsClick) {
-            Icon(
-                imageVector        = Icons.Default.Settings,
-                contentDescription = "Settings",
-                tint               = White60,
+        Row(
+            modifier = Modifier
+                .weight(1f)
+                .clip(RoundedCornerShape(12.dp))
+                .background(Black.copy(alpha = 0.4f))
+                .padding(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            options.forEach { option ->
+                val isSelected = option.value == selected
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(if (isSelected) AccentCyan else Color.Transparent)
+                        .clickable { onSelect(option.value) }
+                        .padding(vertical = 8.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        if (option.icon != null) {
+                            Icon(
+                                imageVector = option.icon,
+                                contentDescription = option.label,
+                                tint = if (isSelected) Black else White90,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                        Text(
+                            text = option.label,
+                            color = if (isSelected) Black else White90,
+                            fontSize = 12.sp,
+                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DropdownSettingsSheet(
+    uiState: com.renskylab.camera.CameraUiState,
+    viewModel: CameraViewModel,
+    onClose: () -> Unit,
+    onMoreSettingsClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(24.dp))
+            .background(SurfaceGlass)
+            .border(
+                width = 1.dp,
+                brush = Brush.verticalGradient(listOf(White60.copy(alpha = 0.2f), Color.Transparent)),
+                shape = RoundedCornerShape(24.dp)
             )
+            .padding(horizontal = 20.dp, vertical = 20.dp)
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            // Flash Row
+            SettingSelectionRow(
+                title = "FLASH",
+                options = listOf(
+                    SettingOption(FlashMode.OFF, "Off", Icons.Default.FlashOff),
+                    SettingOption(FlashMode.AUTO, "Auto", Icons.Default.FlashAuto),
+                    SettingOption(FlashMode.ON, "On", Icons.Default.FlashOn)
+                ),
+                selected = uiState.flashMode,
+                onSelect = { viewModel.setFlashMode(it) }
+            )
+
+            // HDR Row (only applicable in PHOTO mode)
+            if (uiState.captureMode == CaptureMode.PHOTO) {
+                SettingSelectionRow(
+                    title = "HDR+",
+                    options = listOf(
+                        SettingOption(com.renskylab.camera.HdrMode.OFF, "Off", Icons.Default.Close),
+                        SettingOption(com.renskylab.camera.HdrMode.HDR_ON, "On", Icons.Default.Check),
+                        SettingOption(com.renskylab.camera.HdrMode.HDR_ENHANCED, "Enhanced", Icons.Default.Star)
+                    ),
+                    selected = uiState.hdrMode,
+                    onSelect = { viewModel.setHdrMode(it) }
+                )
+            }
+
+            // Timer Row
+            SettingSelectionRow(
+                title = "TIMER",
+                options = listOf(
+                    SettingOption(com.renskylab.camera.TimerMode.OFF, "Off", Icons.Default.Timer),
+                    SettingOption(com.renskylab.camera.TimerMode.SEC_3, "3s", Icons.Default.Timer),
+                    SettingOption(com.renskylab.camera.TimerMode.SEC_10, "10s", Icons.Default.Timer)
+                ),
+                selected = uiState.timerMode,
+                onSelect = { viewModel.setTimerMode(it) }
+            )
+
+            HorizontalDivider(color = White60.copy(alpha = 0.1f))
+
+            // Footer
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable(onClick = onMoreSettingsClick)
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(Icons.Default.Settings, contentDescription = "Advanced Settings", tint = White90, modifier = Modifier.size(16.dp))
+                    Text("Advanced Settings", color = White90, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                }
+
+                IconButton(onClick = onClose, modifier = Modifier.size(36.dp)) {
+                    Icon(Icons.Default.KeyboardArrowUp, contentDescription = "Close", tint = White60)
+                }
+            }
         }
     }
 }
@@ -259,6 +524,13 @@ private fun TopControlsBar(
 // ─────────────────────────────────────────────────────────────────────────────
 // Mode selector
 // ─────────────────────────────────────────────────────────────────────────────
+/**
+ * Selector row containing buttons to switch capture modes.
+ *
+ * @param selected The currently active mode.
+ * @param onSelect Callback invoked when a mode is chosen.
+ * @param modifier Layout modifiers.
+ */
 @Composable
 private fun ModeSelectorRow(
     selected: CaptureMode,
@@ -293,18 +565,28 @@ private fun ModeSelectorRow(
 }
 
 private val CaptureMode.label get() = when (this) {
-    CaptureMode.PHOTO    -> "PHOTO"
-    CaptureMode.NIGHT    -> "NIGHT"
-    CaptureMode.PORTRAIT -> "PORTRAIT"
-    CaptureMode.VIDEO    -> "VIDEO"
+    CaptureMode.PHOTO        -> "PHOTO"
+    CaptureMode.NIGHT        -> "NIGHT"
+    CaptureMode.PORTRAIT     -> "PORTRAIT"
+    CaptureMode.VIDEO        -> "VIDEO"
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bottom controls row: [gallery thumbnail] [shutter] [front cam]
 // ─────────────────────────────────────────────────────────────────────────────
+/**
+ * Renders the bottom control row containing the gallery thumbnail, the primary shutter button,
+ * and the camera flip button placeholder.
+ *
+ * @param isProcessing Indicates if a capture is currently being processed.
+ * @param lastCapturedUri The URI of the last saved photo.
+ * @param onShutter Callback triggered when the shutter is pressed.
+ * @param modifier Layout modifiers.
+ */
 @Composable
 private fun BottomControlsRow(
     isProcessing: Boolean,
+    captureProgress: Float,
     lastCapturedUri: android.net.Uri?,
     onShutter: () -> Unit,
     modifier: Modifier = Modifier,
@@ -326,11 +608,21 @@ private fun BottomControlsRow(
             contentAlignment = Alignment.Center,
         ) {
             if (isBackgroundProcessing) {
-                CircularProgressIndicator(
-                    color = AccentCyan,
-                    strokeWidth = 2.dp,
-                    modifier = Modifier.size(24.dp)
-                )
+                val processingProgress by ProcessingManager.processingProgress.collectAsState()
+                if (processingProgress > 0) {
+                    CircularProgressIndicator(
+                        progress = processingProgress.toFloat() / 100f,
+                        color = AccentCyan,
+                        strokeWidth = 2.dp,
+                        modifier = Modifier.size(24.dp)
+                    )
+                } else {
+                    CircularProgressIndicator(
+                        color = AccentCyan,
+                        strokeWidth = 2.dp,
+                        modifier = Modifier.size(24.dp)
+                    )
+                }
             } else {
                 Icon(
                     imageVector        = Icons.Default.PhotoLibrary,
@@ -344,6 +636,7 @@ private fun BottomControlsRow(
         // Shutter button
         ShutterButton(
             isProcessing = isProcessing,
+            captureProgress = captureProgress,
             onPress      = onShutter,
         )
 
@@ -368,9 +661,16 @@ private fun BottomControlsRow(
 // ─────────────────────────────────────────────────────────────────────────────
 // Shutter button with press animation
 // ─────────────────────────────────────────────────────────────────────────────
+/**
+ * The primary shutter button UI component. Supports click scaling animations and active status pulsing.
+ *
+ * @param isProcessing If true, disables clicks and runs processing animations.
+ * @param onPress Callback triggered when tapped.
+ */
 @Composable
 private fun ShutterButton(
     isProcessing: Boolean,
+    captureProgress: Float,
     onPress: () -> Unit,
 ) {
     var pressed by remember { mutableStateOf(false) }
@@ -410,19 +710,28 @@ private fun ShutterButton(
                 }
             },
     ) {
-        // Outer pulsing ring
-        Box(
-            modifier = Modifier
-                .size(84.dp)
-                .border(
-                    width  = 3.dp,
-                    color  = if (isProcessing)
-                        AccentCyan.copy(alpha = ringAlpha)
-                    else
-                        White90.copy(alpha = 0.85f),
-                    shape  = CircleShape,
-                )
-        )
+        // Outer pulsing ring or circular progress indicator
+        if (isProcessing && captureProgress < 1.0f) {
+            CircularProgressIndicator(
+                progress = captureProgress,
+                color = AccentCyan,
+                strokeWidth = 3.dp,
+                modifier = Modifier.size(84.dp)
+            )
+        } else {
+            Box(
+                modifier = Modifier
+                    .size(84.dp)
+                    .border(
+                        width  = 3.dp,
+                        color  = if (isProcessing)
+                            AccentCyan.copy(alpha = ringAlpha)
+                        else
+                            White90.copy(alpha = 0.85f),
+                        shape  = CircleShape,
+                    )
+            )
+        }
 
         // Inner filled circle
         Box(
@@ -442,6 +751,9 @@ private fun ShutterButton(
 // ─────────────────────────────────────────────────────────────────────────────
 // Processing overlay
 // ─────────────────────────────────────────────────────────────────────────────
+/**
+ * Semi-transparent loading overlay screen shown when processing in the foreground.
+ */
 @Composable
 private fun ProcessingOverlay() {
     Box(
@@ -473,6 +785,13 @@ private fun ProcessingOverlay() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Error banner
 // ─────────────────────────────────────────────────────────────────────────────
+/**
+ * Banner widget detailing camera exception errors or file saving failures.
+ *
+ * @param message The error detail string.
+ * @param onDismiss Callback to clear/dismiss the error.
+ * @param modifier Layout modifiers.
+ */
 @Composable
 private fun ErrorBanner(
     message: String,
@@ -522,6 +841,10 @@ private val EaseInOutSine = CubicBezierEasing(0.37f, 0f, 0.63f, 1f)
 // Settings Screen UI Composables
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Comprehensive settings sheet overlay allowing users to tune various steps of the HDR+ pipeline,
+ * reset defaults, or import/export parameter presets as XML files.
+ */
 @Composable
 private fun SettingsScreen(
     config: PipelineConfig,
@@ -588,6 +911,7 @@ private fun SettingsScreen(
                         onConfigChange(config.copy(
                             jpegQuality = 95,
                             exposureBias = -1.5f,
+                            nightExposureBias = -0.5f,
                             isoOverride = 0,
                             useRawCapture = true,
                             normalModeIsoReductionFactor = 2.0f,
@@ -607,14 +931,25 @@ private fun SettingsScreen(
                     )
 
                     SliderSetting(
-                        label = "Exposure Bias",
+                        label = "Exposure Bias (Normal)",
                         value = config.exposureBias,
                         valueRange = -3.0f..3.0f,
                         steps = 60,
                         valueFormatter = { String.format("%.1f EV", it) },
-                        description = "Exposure compensation in normal modes. Negative values protect highlights from clipping.",
+                        description = "Exposure compensation in normal/HDR modes. Negative values protect highlights from clipping.",
                         onValueChange = { onConfigChange(config.copy(exposureBias = it)) },
-                        onShowInfo = { infoDialogText = "Exposure Bias" to "Controls how aggressively the camera hardware underexposes the preview ring buffer. Lower EV values protect the sensor highlight channels from saturation." }
+                        onShowInfo = { infoDialogText = "Exposure Bias (Normal)" to "Controls how aggressively the camera hardware underexposes in normal and HDR+ modes. Lower EV values protect the sensor highlight channels from saturation. The pipeline digitally recovers the lost brightness." }
+                    )
+
+                    SliderSetting(
+                        label = "Exposure Bias (Night)",
+                        value = config.nightExposureBias,
+                        valueRange = -3.0f..3.0f,
+                        steps = 60,
+                        valueFormatter = { String.format("%.1f EV", it) },
+                        description = "Exposure compensation used in Night mode only. Less negative than normal to allow more light in low-light scenes.",
+                        onValueChange = { onConfigChange(config.copy(nightExposureBias = it)) },
+                        onShowInfo = { infoDialogText = "Exposure Bias (Night)" to "Controls the highlight bias specifically in Night mode captures. A less negative value (e.g. -0.5) lets more light in since night scenes don't have bright highlights that clip." }
                     )
 
                     SliderSetting(
@@ -650,13 +985,7 @@ private fun SettingsScreen(
                         onShowInfo = { infoDialogText = "Capture Frame Count" to "Sets the number of frames to capture and align. Google Camera uses 15 frames by default. More frames yield higher signal-to-noise ratios in shadows, but require more processing time and memory." }
                     )
 
-                    SwitchSetting(
-                        label = "Use RAW Capture",
-                        checked = config.useRawCapture,
-                        description = "Capture 16-bit Bayer RAW sensor data instead of 8-bit YUV. Vastly improves dynamic range, texture clarity, and reduces grain, but increases processing time.",
-                        onCheckedChange = { onConfigChange(config.copy(useRawCapture = it)) },
-                        onShowInfo = { infoDialogText = "Use RAW Capture" to "Configures the camera sensor to output RAW_SENSOR format instead of YUV_420_888. RAW contains unprocessed 10/12-bit linear values directly from the sensor. Operating on RAW yields cleaner noise model performance and better highlight recovery." }
-                    )
+
                 }
 
                 // 2. Alignment Settings Category
@@ -908,6 +1237,9 @@ private fun SettingsScreen(
     }
 }
 
+/**
+ * Card container widget utilized for groupings inside the settings sheet.
+ */
 @Composable
 private fun CategoryCard(
     title: String,
@@ -985,6 +1317,9 @@ private fun CategoryCard(
     }
 }
 
+/**
+ * Custom slider settings row component, supporting description tips and info request dialogs.
+ */
 @Composable
 private fun SliderSetting(
     label: String,
@@ -1033,6 +1368,9 @@ private fun SliderSetting(
     }
 }
 
+/**
+ * Custom switch toggle settings row component, supporting description tips and info request dialogs.
+ */
 @Composable
 private fun SwitchSetting(
     label: String,

@@ -4,6 +4,11 @@ import android.media.Image
 
 /**
  * Wraps a Camera2 [Image] along with its capture metadata (ISO, exposure time).
+ * 
+ * @property image The raw Android [Image] frame reference.
+ * @property iso The ISO speed value calculated for this specific captured frame.
+ * @property exposureTimeNs The sensor exposure integration duration in nanoseconds.
+ * @property noiseProfile Float array containing sensor calibration coefficients used for noise reduction.
  */
 data class CapturedFrame(
     val image: Image,
@@ -25,8 +30,11 @@ class FrameRingBuffer(private val maxSize: Int = 12) {
     private val queue = ArrayDeque<CapturedFrame>(maxSize)
 
     /**
-     * Add a new frame to the buffer.
-     * If the buffer is already at capacity, the oldest frame is closed and evicted.
+     * Adds a new frame to the buffer.
+     * If the buffer is already at capacity, the oldest frame is closed and evicted
+     * to return the hardware buffer slot back to the ImageReader pool.
+     *
+     * @param frame The captured frame to add.
      */
     fun push(frame: CapturedFrame) {
         val evicted: CapturedFrame?
@@ -38,12 +46,14 @@ class FrameRingBuffer(private val maxSize: Int = 12) {
     }
 
     /**
-     * Drain all frames from the buffer and return them.
+     * Drains all frames from the buffer and returns them.
      *
      * Unlike a plain copy, this **removes** the images from the queue so that
      * concurrent [push] calls cannot evict and close them while the caller is
      * still processing pixel data. Ownership transfers to the caller; the
      * caller MUST call [Image.close] on every returned image when done.
+     *
+     * @return List of all buffered [CapturedFrame] frames.
      */
     fun snapshot(): List<CapturedFrame> {
         synchronized(lock) {
@@ -54,7 +64,8 @@ class FrameRingBuffer(private val maxSize: Int = 12) {
     }
 
     /**
-     * Discard all buffered frames, closing each one.
+     * Discards all currently buffered frames, invoking close() on each of their
+     * associated hardware images to release references.
      */
     fun flush() {
         val toClose: List<CapturedFrame>
@@ -65,5 +76,8 @@ class FrameRingBuffer(private val maxSize: Int = 12) {
         toClose.forEach { runCatching { it.image.close() } }
     }
 
+    /**
+     * The current number of frames stored in the buffer.
+     */
     val size: Int get() = synchronized(lock) { queue.size }
 }

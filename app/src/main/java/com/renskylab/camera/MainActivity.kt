@@ -24,20 +24,35 @@ import android.os.Build
 import androidx.core.content.ContextCompat
 import com.renskylab.camera.ui.RenCameraApp
 
+/**
+ * The main application entry point activity.
+ * Sets up compose UI, requests required hardware permissions (Camera & Post Notifications),
+ * and links state/events to the shared [CameraViewModel].
+ */
 class MainActivity : ComponentActivity() {
 
     private val viewModel: CameraViewModel by viewModels()
 
     // ── Permission launcher ────────────────────────────────────────────────────
+    /**
+     * ActivityResultLauncher to handle asynchronous multi-permission request results.
+     */
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
         permissionGranted.value = permissions[Manifest.permission.CAMERA] ?: false
     }
 
+    /**
+     * State representing whether Camera permission has been successfully granted by the user.
+     */
     private val permissionGranted = mutableStateOf(false)
 
     // ─────────────────────────────────────────────────────────────────────────
+    /**
+     * Called when the activity is starting.
+     * Initializes permission states, requests system permissions if needed, and sets content view.
+     */
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -78,6 +93,9 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Re-checks and updates camera permissions when the activity is brought back to the foreground.
+     */
     override fun onResume() {
         super.onResume()
         // Re-check permission in case the user granted it from Settings
@@ -90,6 +108,12 @@ class MainActivity : ComponentActivity() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Permission rationale screen
 // ─────────────────────────────────────────────────────────────────────────────
+/**
+ * Renders an explaining layout that motivates why camera permissions are needed.
+ * Displays a button prompting the user to grant access.
+ *
+ * @param onRequest Callback triggered when the user requests camera access permission.
+ */
 @Composable
 private fun PermissionRationale(onRequest: () -> Unit) {
     Box(

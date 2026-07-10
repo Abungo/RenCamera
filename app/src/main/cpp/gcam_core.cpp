@@ -363,6 +363,7 @@ Java_com_renskylab_camera_NativeEngine_processCopiedBurst(
     jboolean nightMode,
     jint iso,
     jintArray frameIsos,
+    jlongArray frameExposures,
     jfloatArray frameNoiseProfiles,
     jfloatArray configParams,
     jstring debugDirStr,
@@ -390,6 +391,17 @@ Java_com_renskylab_camera_NativeEngine_processCopiedBurst(
         env->ReleaseIntArrayElements(frameIsos, isos, JNI_ABORT);
     }
     ctx.metadata["frame_isos"] = cFrameIsos;
+
+    std::vector<double> cFrameExposures(count, 33333333.0);
+    if (frameExposures) {
+        jlong* exposures = env->GetLongArrayElements(frameExposures, nullptr);
+        jsize len = env->GetArrayLength(frameExposures);
+        for (int i = 0; i < std::min(static_cast<int>(count), static_cast<int>(len)); ++i) {
+            cFrameExposures[i] = static_cast<double>(exposures[i]);
+        }
+        env->ReleaseLongArrayElements(frameExposures, exposures, JNI_ABORT);
+    }
+    ctx.metadata["frame_exposures"] = cFrameExposures;
 
     std::vector<float> noiseProfiles;
     if (frameNoiseProfiles) {
@@ -478,20 +490,96 @@ Java_com_renskylab_camera_NativeEngine_processCopiedBurst(
     env->ReleaseBooleanArrayElements(stageFlags, flags, JNI_ABORT);
 
     // ── Reference Frame Selection (Sharpest frame as base canvas) ──────────────
+    // To prevent handshake blur, we find the frame with the highest gradient variance.
+    // In HDR+ Enhanced, we MUST only select from normal-exposure frames (even indices)
+    // because odd frames are underexposed for highlights and cannot serve as the base canvas.
     if (count > 1) {
         size_t bestIdx = 0;
         float maxSharpness = -1.f;
-        for (size_t i = 0; i < count; ++i) {
-            float s = computeSharpness(ctx.inputFrames[i]);
+        
+        // Dynamically determine black level of the first frame to threshold noise
+        float blackLevel = 64.f;
+        {
+            const YuvFrame& f0 = ctx.inputFrames[0];
+            const uint16_t* rawData = reinterpret_cast<const uint16_t*>(f0.yPlane);
+            uint16_t minVal = 65535, maxVal = 0;
+            int testPixels = std::min(f0.width * f0.height, 10000);
+            for (int p = 0; p < testPixels; ++p) {
+                uint16_t v = rawData[p];
+                if (v < minVal) minVal = v;
+                if (v > maxVal) maxVal = v;
+            }
+            if (maxVal > 1023 && maxVal <= 4095) {
+                blackLevel = 1024.f;
+                if (minVal < 300) blackLevel = 256.f;
+                if (minVal < 100) blackLevel = 64.f;
+            } else if (maxVal > 4095) {
+                blackLevel = 1024.f;
+                if (minVal < 500) blackLevel = 256.f;
+            }
+        }
+
+        // Noise threshold: ignore gradients smaller than 4% of sensor dynamic range
+        float noiseFloor = (blackLevel > 500.f) ? 120.f : 30.f;
+
+        for (size_t i = 0; i < count; i += 2) { // Increment by 2 to strictly check normal-exposure frames
+            const YuvFrame& f = ctx.inputFrames[i];
+            const uint16_t* rawBase = reinterpret_cast<const uint16_t*>(f.yPlane);
+            int strideElements = f.yRowStride / 2;
+            
+            // Perform a fast sharpness evaluation on a central 512x512 region
+            int cropSize = 512;
+            int startX = std::max(0, (f.width - cropSize) / 2);
+            int startY = std::max(0, (f.height - cropSize) / 2);
+            
+            double gradSum = 0;
+            int pixelCount = 0;
+            
+            for (int r = startY; r < startY + cropSize - 1; r += 4) { // Subsampled for speed
+                const uint16_t* row = rawBase + r * strideElements;
+                const uint16_t* nextRow = rawBase + (r + 1) * strideElements;
+                for (int c = startX; c < startX + cropSize - 1; c += 4) {
+                    float val = std::max(0.f, static_cast<float>(row[c]) - blackLevel);
+                    float right = std::max(0.f, static_cast<float>(row[c + 1]) - blackLevel);
+                    float down = std::max(0.f, static_cast<float>(nextRow[c]) - blackLevel);
+                    
+                    float diffX = std::abs(val - right);
+                    float diffY = std::abs(val - down);
+                    
+                    // Filter out noise fluctuations (noise floor thresholding)
+                    if (diffX > noiseFloor) gradSum += diffX;
+                    if (diffY > noiseFloor) gradSum += diffY;
+                    pixelCount++;
+                }
+            }
+            
+            float s = pixelCount > 0 ? static_cast<float>(gradSum / pixelCount) : 0.f;
             if (s > maxSharpness) {
                 maxSharpness = s;
                 bestIdx = i;
             }
         }
-        LOGI("Reference Frame Selection: Selected frame %zu as sharpest (score: %.3f)", bestIdx, maxSharpness);
+        
+        LOGI("Reference Frame Selection: Selected frame %zu as sharpest normal frame (score: %.3f)", bestIdx, maxSharpness);
+        ctx.metadata["selected_base_frame_index"] = static_cast<int>(bestIdx);
         if (bestIdx > 0) {
             std::swap(ctx.inputFrames[0], ctx.inputFrames[bestIdx]);
+            // Also swap corresponding metadata so exposures, ISOs, and noise profiles match the new frame 0
+            if (ctx.metadata.count("frame_isos")) {
+                try {
+                    auto& isos = std::any_cast<std::vector<int>&>(ctx.metadata["frame_isos"]);
+                    std::swap(isos[0], isos[bestIdx]);
+                } catch(...) {}
+            }
+            if (ctx.metadata.count("frame_exposures")) {
+                try {
+                    auto& exposures = std::any_cast<std::vector<double>&>(ctx.metadata["frame_exposures"]);
+                    std::swap(exposures[0], exposures[bestIdx]);
+                } catch(...) {}
+            }
         }
+    } else {
+        ctx.metadata["selected_base_frame_index"] = 0;
     }
 
     // ── Run pipeline ──────────────────────────────────────────────────────────

@@ -575,7 +575,8 @@ void main() {
 
         float residual = warped_val - ref_val;
 
-        int ref_idx = clamp(int(ref_val / 16.0), 0, 255);
+        // Normalize ref_val by the actual sensor max range and map to 0-255 LUT index
+        int ref_idx = clamp(int((ref_val / u_sensor_max) * 255.0), 0, 255);
         float inv_2sigma2 = texelFetch(u_noise_luts, ivec2(ref_idx, f), 0).r;
 
         float w_val = exp(-residual * residual * inv_2sigma2);
@@ -601,7 +602,8 @@ static void fuseRawBayer(const std::vector<YuvFrame>& frames,
                          const std::vector<MotionField>& motionFields,
                          std::vector<uint16_t>& outRaw,
                          int w, int h,
-                         const std::vector<std::vector<float>>& inv_2sigma2_luts)
+                         const std::vector<std::vector<float>>& inv_2sigma2_luts,
+                         float sensorMax)
 {
     auto tStart = std::chrono::high_resolution_clock::now();
     int numFrames = frames.size();
@@ -675,7 +677,6 @@ static void fuseRawBayer(const std::vector<YuvFrame>& frames,
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
-            // Set uniforms
             glUniform1i(glGetUniformLocation(program, "u_input_frames"), 0);
             glUniform1i(glGetUniformLocation(program, "u_motion_fields"), 1);
             glUniform1i(glGetUniformLocation(program, "u_noise_luts"), 2);
@@ -685,6 +686,7 @@ static void fuseRawBayer(const std::vector<YuvFrame>& frames,
             glUniform1i(glGetUniformLocation(program, "u_blocks_wide"), blocksWide);
             glUniform1i(glGetUniformLocation(program, "u_blocks_tall"), blocksTall);
             glUniform1f(glGetUniformLocation(program, "u_block_size"), static_cast<float>(blockSize));
+            glUniform1f(glGetUniformLocation(program, "u_sensor_max"), sensorMax);
 
             // Set up output SSBO (4 bytes std430 uint elements for maximum driver compatibility)
             GLuint outBuffer;
@@ -920,7 +922,22 @@ bool FusionStage::process(FrameContext& ctx) {
     if (useRaw) {
         LOGI("FusionStage: fusing 16-bit RAW Bayer frames");
         std::vector<uint16_t> fusedRaw;
-        fuseRawBayer(ctx.inputFrames, ctx.motionFields, fusedRaw, w, h, inv_2sigma2_luts);
+        
+        // Dynamically measure raw sensor max range of the reference frame
+        float sensorMax = 1023.f;
+        const uint16_t* rawData = reinterpret_cast<const uint16_t*>(ctx.inputFrames[0].yPlane);
+        uint16_t maxVal = 0;
+        int testPixels = std::min(w * h, 10000);
+        for (int p = 0; p < testPixels; ++p) {
+            if (rawData[p] > maxVal) maxVal = rawData[p];
+        }
+        if (maxVal > 1023 && maxVal <= 4095) {
+            sensorMax = 4095.f;
+        } else if (maxVal > 4095) {
+            sensorMax = static_cast<float>(maxVal);
+        }
+        
+        fuseRawBayer(ctx.inputFrames, ctx.motionFields, fusedRaw, w, h, inv_2sigma2_luts, sensorMax);
         ctx.metadata["fused_raw"] = fusedRaw;
     } else {
         std::string debugDir = "";
@@ -981,10 +998,42 @@ bool FusionStage::process(FrameContext& ctx) {
                     if (ctx.metadata.count("digital_gain")) {
                         try { digitalGain = std::any_cast<float>(ctx.metadata.at("digital_gain")); } catch (...) {}
                     }
-                    float previewScale = (255.f / 3071.f) * digitalGain; // normalized to 12-bit range after black-level subtraction
+                    
+                    // Dynamically determine range/black level of reference RAW frame
+                    float blackLevel = 1024.f;
+                    float whiteLevel = 4095.f;
+                    
+                    uint16_t minVal = 65535;
+                    uint16_t maxVal = 0;
+                    const uint16_t* rawDataPtr = reinterpret_cast<const uint16_t*>(ctx.inputFrames[0].yPlane);
+                    int testPixels = std::min(w * h, 20000);
+                    for (int p = 0; p < testPixels; ++p) {
+                        uint16_t v = rawDataPtr[p];
+                        if (v < minVal) minVal = v;
+                        if (v > maxVal) maxVal = v;
+                    }
+                    
+                    if (maxVal <= 1023) {
+                        blackLevel = 64.f;
+                        whiteLevel = 1023.f;
+                    } else if (maxVal <= 4095) {
+                        blackLevel = 1024.f;
+                        if (minVal < 300) blackLevel = 256.f;
+                        if (minVal < 100) blackLevel = 64.f;
+                        whiteLevel = 4095.f;
+                    } else {
+                        blackLevel = 1024.f;
+                        if (minVal < 500) blackLevel = 256.f;
+                        whiteLevel = static_cast<float>(maxVal);
+                    }
+
+                    // For the preview generation, let's NOT multiply by digitalGain if it makes it too bright compared to other stages.
+                    // Let's use a dynamic previewScale that maps the detected sensor range to 255.
+                    float previewScale = 255.f / std::max(1.f, whiteLevel - blackLevel);
 
                     // Gamma correction lambda to make shadows visible on linear RAW previews
-                    auto mapTo8Bit = [previewScale](float cleanVal) -> uint8_t {
+                    auto mapTo8Bit = [previewScale, blackLevel](float rawVal) -> uint8_t {
+                        float cleanVal = std::max(0.f, rawVal - blackLevel);
                         float norm = std::clamp(cleanVal * previewScale / 255.f, 0.f, 1.f);
                         float gamma = std::sqrt(norm); // square root acts as gamma ~2.0
                         return static_cast<uint8_t>(std::clamp(gamma * 255.f, 0.f, 255.f));
@@ -993,24 +1042,27 @@ bool FusionStage::process(FrameContext& ctx) {
                     // Save 8-bit exposure-boosted grayscale preview JPEG of fused RAW plane
                     std::vector<uint8_t> previewY(w * h);
                     for (size_t i = 0; i < previewY.size(); ++i) {
-                        float cleanVal = std::max(0.f, static_cast<float>(fusedRaw[i]) - 1024.f);
-                        previewY[i] = mapTo8Bit(cleanVal);
+                        previewY[i] = mapTo8Bit(static_cast<float>(fusedRaw[i]));
                     }
                     std::vector<uint8_t> uvGray(w * h / 2, 128);
                     saveYuvAsJpeg(previewY.data(), uvGray.data(), uvGray.data(), w, h, debugDir + "/stage_1_fusion/fused.jpg");
 
-                    // Save full reference RAW frame preview
+                    int baseIdx = 0;
+                    if (ctx.metadata.count("selected_base_frame_index")) {
+                        try { baseIdx = std::any_cast<int>(ctx.metadata.at("selected_base_frame_index")); } catch(...) {}
+                    }
+
+                    // Save full reference RAW frame preview (labeled with original burst index)
                     const uint16_t* refRaw = reinterpret_cast<const uint16_t*>(ctx.inputFrames[0].yPlane);
                     int refStride = ctx.inputFrames[0].yRowStride / 2;
                     std::vector<uint8_t> refPreviewY(w * h);
                     for (int r = 0; r < h; ++r) {
                         for (int c = 0; c < w; ++c) {
                             uint16_t val = refRaw[r * refStride + c];
-                            float cleanVal = std::max(0.f, static_cast<float>(val) - 1024.f);
-                            refPreviewY[r * w + c] = mapTo8Bit(cleanVal);
+                            refPreviewY[r * w + c] = mapTo8Bit(static_cast<float>(val));
                         }
                     }
-                    saveYuvAsJpeg(refPreviewY.data(), uvGray.data(), uvGray.data(), w, h, debugDir + "/stage_1_fusion/ref_frame.jpg");
+                    saveYuvAsJpeg(refPreviewY.data(), uvGray.data(), uvGray.data(), w, h, debugDir + "/stage_1_fusion/ref_frame_index_" + std::to_string(baseIdx) + ".jpg");
 
                     // Save full source RAW frame 1 preview (if present)
                     if (ctx.inputFrames.size() > 1) {
@@ -1020,8 +1072,7 @@ bool FusionStage::process(FrameContext& ctx) {
                         for (int r = 0; r < h; ++r) {
                             for (int c = 0; c < w; ++c) {
                                 uint16_t val = srcRaw[r * srcStride + c];
-                                float cleanVal = std::max(0.f, static_cast<float>(val) - 1024.f);
-                                srcPreviewY[r * w + c] = mapTo8Bit(cleanVal);
+                                srcPreviewY[r * w + c] = mapTo8Bit(static_cast<float>(val));
                             }
                         }
                         saveYuvAsJpeg(srcPreviewY.data(), uvGray.data(), uvGray.data(), w, h, debugDir + "/stage_1_fusion/src_frame_1.jpg");
@@ -1038,8 +1089,7 @@ bool FusionStage::process(FrameContext& ctx) {
                     for (int r = 0; r < cropSize; ++r) {
                         for (int c = 0; c < cropSize; ++c) {
                             uint16_t val = refRaw[(startY + r) * refStride + (startX + c)];
-                            float cleanVal = std::max(0.f, static_cast<float>(val) - 1024.f);
-                            cropRefY[r * cropSize + c] = mapTo8Bit(cleanVal);
+                            cropRefY[r * cropSize + c] = mapTo8Bit(static_cast<float>(val));
                         }
                     }
                     std::vector<uint8_t> cropUvGray(cropSize * cropSize / 2, 128);
@@ -1050,8 +1100,7 @@ bool FusionStage::process(FrameContext& ctx) {
                     for (int r = 0; r < cropSize; ++r) {
                         for (int c = 0; c < cropSize; ++c) {
                             uint16_t val = fusedRaw[(startY + r) * w + (startX + c)];
-                            float cleanVal = std::max(0.f, static_cast<float>(val) - 1024.f);
-                            cropFusedY[r * cropSize + c] = mapTo8Bit(cleanVal);
+                            cropFusedY[r * cropSize + c] = mapTo8Bit(static_cast<float>(val));
                         }
                     }
                     saveYuvAsJpeg(cropFusedY.data(), cropUvGray.data(), cropUvGray.data(), cropSize, cropSize, debugDir + "/stage_1_fusion/denoised_crop.jpg");
@@ -1063,6 +1112,9 @@ bool FusionStage::process(FrameContext& ctx) {
                         const uint16_t* srcRaw = reinterpret_cast<const uint16_t*>(ctx.inputFrames[1].yPlane);
                         int srcStride = ctx.inputFrames[1].yRowStride / 2;
 
+                        // Use a normalized difference scale mapping maximum sensor difference
+                        float diffScale = 255.f / std::max(1.f, whiteLevel - blackLevel);
+
                         // Difference Before Alignment
                         std::vector<uint8_t> diffBefore(dw * dh);
                         for (int r = 0; r < dh; ++r) {
@@ -1070,7 +1122,7 @@ bool FusionStage::process(FrameContext& ctx) {
                                 uint16_t refVal = refRaw[(r * 4) * refStride + (c * 4)];
                                 uint16_t srcVal = srcRaw[(r * 4) * srcStride + (c * 4)];
                                 float diff = std::abs(static_cast<float>(refVal) - static_cast<float>(srcVal));
-                                diffBefore[r * dw + c] = static_cast<uint8_t>(std::clamp(diff * previewScale * 10.f, 0.f, 255.f));
+                                diffBefore[r * dw + c] = static_cast<uint8_t>(std::clamp(diff * diffScale * 8.f, 0.f, 255.f));
                             }
                         }
                         std::vector<uint8_t> uvGrayDiff(dw * dh / 2, 128);
@@ -1089,10 +1141,18 @@ bool FusionStage::process(FrameContext& ctx) {
                                 uint16_t refVal = refRaw[(r * 4) * refStride + (c * 4)];
                                 uint16_t warpedVal = srcRaw[sr * srcStride + sc];
                                 float diff = std::abs(static_cast<float>(refVal) - static_cast<float>(warpedVal));
-                                diffAfter[r * dw + c] = static_cast<uint8_t>(std::clamp(diff * previewScale * 10.f, 0.f, 255.f));
+                                diffAfter[r * dw + c] = static_cast<uint8_t>(std::clamp(diff * diffScale * 8.f, 0.f, 255.f));
                             }
                         }
                         saveYuvAsJpeg(diffAfter.data(), uvGrayDiff.data(), uvGrayDiff.data(), dw, dh, debugDir + "/stage_1_fusion/diff_after_alignment.jpg");
+                    }
+                    
+                    // Save selected base frame index to a plain text log file
+                    std::string infoPath = debugDir + "/stage_1_fusion/selected_base_frame.txt";
+                    std::ofstream infoFile(infoPath);
+                    if (infoFile) {
+                        infoFile << "Selected Base Frame Index (from original burst sequence): " << baseIdx << "\n";
+                        infoFile.close();
                     }
                 }
             } else {

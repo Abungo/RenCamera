@@ -14,6 +14,11 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import java.nio.ByteBuffer
 
+/**
+ * Foreground Service that handles the CPU/GPU-intensive image processing pipeline sequentially.
+ * Running in a foreground service ensures that the OS does not terminate the process when the user
+ * backgrounds the application during long-running JNI HDR+ computations.
+ */
 class ProcessingService : Service() {
 
     companion object {
@@ -31,6 +36,10 @@ class ProcessingService : Service() {
     // Channel for sequential processing
     private val jobChannel = Channel<String>(Channel.UNLIMITED)
 
+    /**
+     * Initializes the service, creates the system notification channel, and starts the sequential worker
+     * coroutine loop to process incoming job requests.
+     */
     override fun onCreate() {
         super.onCreate()
         Log.i(TAG, "ProcessingService created")
@@ -45,6 +54,10 @@ class ProcessingService : Service() {
         }
     }
 
+    /**
+     * Handles service start intents. Reads the job ID from the intent extras and sends it to the
+     * sequential job queue channel.
+     */
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_PROCESS) {
             val jobId = intent.getStringExtra(EXTRA_JOB_ID)
@@ -57,14 +70,24 @@ class ProcessingService : Service() {
         return START_NOT_STICKY
     }
 
+    /**
+     * Binds the service to an activity. Since this service operates as a start service without binding,
+     * it returns null.
+     */
     override fun onBind(intent: Intent?): IBinder? = null
 
+    /**
+     * Called when the service is destroyed. Cancels the coroutine job hierarchy to stop active execution.
+     */
     override fun onDestroy() {
         Log.i(TAG, "ProcessingService destroyed")
         serviceJob.cancel()
         super.onDestroy()
     }
 
+    /**
+     * Starts the foreground service by displaying a sticky notification explaining the background processing state.
+     */
     private fun startForegroundServiceNotification() {
         val intent = Intent(this, MainActivity::class.java)
         val pendingIntent = PendingIntent.getActivity(
@@ -93,6 +116,9 @@ class ProcessingService : Service() {
         }
     }
 
+    /**
+     * Configures the system notification channel for Android O and above.
+     */
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
@@ -109,6 +135,12 @@ class ProcessingService : Service() {
         }
     }
 
+    /**
+     * Updates the persistent notification with the current pipeline execution step and progress percentage.
+     *
+     * @param step The active pipeline stage name.
+     * @param percentage The completion progress (0 to 100).
+     */
     private fun updateNotification(step: String, percentage: Int) {
         val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         
@@ -142,6 +174,12 @@ class ProcessingService : Service() {
         notificationManager.notify(NOTIFICATION_ID, notification)
     }
 
+    /**
+     * Retrieves the specified job parameters, runs JNI processing stages sequentially,
+     * saves output, updates progress notifications, and stops service when no jobs remain.
+     *
+     * @param jobId The unique ID of the job to process.
+     */
     private suspend fun processJobInternal(jobId: String) {
         val job = ProcessingManager.getJob(jobId) ?: return
         Log.i(TAG, "Starting JNI processing for job: $jobId")
@@ -175,12 +213,14 @@ class ProcessingService : Service() {
                         job.config,
                         job.iso,
                         job.frameIsos,
+                        job.frameExposures ?: LongArray(job.frameIsos.size),
                         job.frameNoiseProfiles ?: FloatArray(0),
                         job.digitalGain,
                         if (job.config.debugImagesEnabled) rawDir.absolutePath else "", // master debug toggle
                         object : NativeEngine.ProgressListener {
                             override fun onProgress(step: String, percentage: Int) {
                                 updateNotification(step, percentage)
+                                ProcessingManager.updateProgress(percentage)
                             }
                         }
                     )
@@ -264,11 +304,17 @@ class ProcessingService : Service() {
         }
     }
 
+    /**
+     * Configures tuning float array parameters and triggers JNI processing execution.
+     *
+     * @return Processed JPEG ByteArray, or null if native execution fails.
+     */
     private fun runNativeEngine(
         nativeBurstHandle: Long,
         config: PipelineConfig,
         iso: Int,
         frameIsos: IntArray,
+        frameExposures: LongArray,
         frameNoiseProfiles: FloatArray,
         digitalGain: Float,
         debugDir: String,
@@ -285,6 +331,7 @@ class ProcessingService : Service() {
             nightMode   = config.nightMode,
             iso         = iso,
             frameIsos   = frameIsos,
+            frameExposures = frameExposures,
             frameNoiseProfiles = frameNoiseProfiles,
             configParams = mergedParams,
             debugDir    = debugDir,
