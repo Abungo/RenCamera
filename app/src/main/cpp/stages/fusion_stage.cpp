@@ -963,6 +963,44 @@ bool FusionStage::process(FrameContext& ctx) {
                     }
                     std::vector<uint8_t> uvGray(w * h / 2, 128);
                     saveYuvAsJpeg(previewY.data(), uvGray.data(), uvGray.data(), w, h, debugDir + "/stage_1_fusion/fused.jpg");
+
+                    // Extract and save exposure-boosted center crops for RAW detail comparison
+                    float digitalGain = 1.0f;
+                    if (ctx.metadata.count("digital_gain")) {
+                        try { digitalGain = std::any_cast<float>(ctx.metadata.at("digital_gain")); } catch (...) {}
+                    }
+                    float previewScale = (255.f / 3071.f) * digitalGain; // normalized to 12-bit range after black-level subtraction
+
+                    int cy = h / 2;
+                    int cx = w / 2;
+                    int cropSize = 400; // 400x400 crop
+                    int startX = ((cx - cropSize / 2) / 2) * 2;
+                    int startY = ((cy - cropSize / 2) / 2) * 2;
+
+                    // Reference noisy RAW crop (Grayscale representation)
+                    std::vector<uint8_t> cropRefY(cropSize * cropSize);
+                    const uint16_t* refRaw = reinterpret_cast<const uint16_t*>(ctx.inputFrames[0].yPlane);
+                    int strideElements = ctx.inputFrames[0].yRowStride / 2;
+                    for (int r = 0; r < cropSize; ++r) {
+                        for (int c = 0; c < cropSize; ++c) {
+                            uint16_t val = refRaw[(startY + r) * strideElements + (startX + c)];
+                            float cleanVal = std::max(0.f, static_cast<float>(val) - 1024.f);
+                            cropRefY[r * cropSize + c] = static_cast<uint8_t>(std::clamp(cleanVal * previewScale, 0.f, 255.f));
+                        }
+                    }
+                    std::vector<uint8_t> cropUvGray(cropSize * cropSize / 2, 128);
+                    saveYuvAsJpeg(cropRefY.data(), cropUvGray.data(), cropUvGray.data(), cropSize, cropSize, debugDir + "/stage_1_fusion/noisy_crop.jpg");
+
+                    // Fused denoised RAW crop
+                    std::vector<uint8_t> cropFusedY(cropSize * cropSize);
+                    for (int r = 0; r < cropSize; ++r) {
+                        for (int c = 0; c < cropSize; ++c) {
+                            uint16_t val = fusedRaw[(startY + r) * w + (startX + c)];
+                            float cleanVal = std::max(0.f, static_cast<float>(val) - 1024.f);
+                            cropFusedY[r * cropSize + c] = static_cast<uint8_t>(std::clamp(cleanVal * previewScale, 0.f, 255.f));
+                        }
+                    }
+                    saveYuvAsJpeg(cropFusedY.data(), cropUvGray.data(), cropUvGray.data(), cropSize, cropSize, debugDir + "/stage_1_fusion/denoised_crop.jpg");
                 }
             } else {
                 // Save Reference Frame
