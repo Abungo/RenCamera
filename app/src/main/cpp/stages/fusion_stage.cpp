@@ -983,11 +983,18 @@ bool FusionStage::process(FrameContext& ctx) {
                     }
                     float previewScale = (255.f / 3071.f) * digitalGain; // normalized to 12-bit range after black-level subtraction
 
+                    // Gamma correction lambda to make shadows visible on linear RAW previews
+                    auto mapTo8Bit = [previewScale](float cleanVal) -> uint8_t {
+                        float norm = std::clamp(cleanVal * previewScale / 255.f, 0.f, 1.f);
+                        float gamma = std::sqrt(norm); // square root acts as gamma ~2.0
+                        return static_cast<uint8_t>(std::clamp(gamma * 255.f, 0.f, 255.f));
+                    };
+
                     // Save 8-bit exposure-boosted grayscale preview JPEG of fused RAW plane
                     std::vector<uint8_t> previewY(w * h);
                     for (size_t i = 0; i < previewY.size(); ++i) {
                         float cleanVal = std::max(0.f, static_cast<float>(fusedRaw[i]) - 1024.f);
-                        previewY[i] = static_cast<uint8_t>(std::clamp(cleanVal * previewScale, 0.f, 255.f));
+                        previewY[i] = mapTo8Bit(cleanVal);
                     }
                     std::vector<uint8_t> uvGray(w * h / 2, 128);
                     saveYuvAsJpeg(previewY.data(), uvGray.data(), uvGray.data(), w, h, debugDir + "/stage_1_fusion/fused.jpg");
@@ -1000,7 +1007,7 @@ bool FusionStage::process(FrameContext& ctx) {
                         for (int c = 0; c < w; ++c) {
                             uint16_t val = refRaw[r * refStride + c];
                             float cleanVal = std::max(0.f, static_cast<float>(val) - 1024.f);
-                            refPreviewY[r * w + c] = static_cast<uint8_t>(std::clamp(cleanVal * previewScale, 0.f, 255.f));
+                            refPreviewY[r * w + c] = mapTo8Bit(cleanVal);
                         }
                     }
                     saveYuvAsJpeg(refPreviewY.data(), uvGray.data(), uvGray.data(), w, h, debugDir + "/stage_1_fusion/ref_frame.jpg");
@@ -1014,7 +1021,7 @@ bool FusionStage::process(FrameContext& ctx) {
                             for (int c = 0; c < w; ++c) {
                                 uint16_t val = srcRaw[r * srcStride + c];
                                 float cleanVal = std::max(0.f, static_cast<float>(val) - 1024.f);
-                                srcPreviewY[r * w + c] = static_cast<uint8_t>(std::clamp(cleanVal * previewScale, 0.f, 255.f));
+                                srcPreviewY[r * w + c] = mapTo8Bit(cleanVal);
                             }
                         }
                         saveYuvAsJpeg(srcPreviewY.data(), uvGray.data(), uvGray.data(), w, h, debugDir + "/stage_1_fusion/src_frame_1.jpg");
@@ -1032,7 +1039,7 @@ bool FusionStage::process(FrameContext& ctx) {
                         for (int c = 0; c < cropSize; ++c) {
                             uint16_t val = refRaw[(startY + r) * refStride + (startX + c)];
                             float cleanVal = std::max(0.f, static_cast<float>(val) - 1024.f);
-                            cropRefY[r * cropSize + c] = static_cast<uint8_t>(std::clamp(cleanVal * previewScale, 0.f, 255.f));
+                            cropRefY[r * cropSize + c] = mapTo8Bit(cleanVal);
                         }
                     }
                     std::vector<uint8_t> cropUvGray(cropSize * cropSize / 2, 128);
@@ -1044,7 +1051,7 @@ bool FusionStage::process(FrameContext& ctx) {
                         for (int c = 0; c < cropSize; ++c) {
                             uint16_t val = fusedRaw[(startY + r) * w + (startX + c)];
                             float cleanVal = std::max(0.f, static_cast<float>(val) - 1024.f);
-                            cropFusedY[r * cropSize + c] = static_cast<uint8_t>(std::clamp(cleanVal * previewScale, 0.f, 255.f));
+                            cropFusedY[r * cropSize + c] = mapTo8Bit(cleanVal);
                         }
                     }
                     saveYuvAsJpeg(cropFusedY.data(), cropUvGray.data(), cropUvGray.data(), cropSize, cropSize, debugDir + "/stage_1_fusion/denoised_crop.jpg");
