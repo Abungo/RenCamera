@@ -81,7 +81,18 @@ class CameraController(
             } else {
                 val iso = meta.get(CaptureResult.SENSOR_SENSITIVITY) ?: 400
                 val expTime = meta.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 30_000_000L
-                ringBuffer.push(CapturedFrame(img, iso, expTime))
+                val rawProfile: Array<out android.util.Pair<Double, Double>>? = meta.get(CaptureResult.SENSOR_NOISE_PROFILE)
+                val noiseProfile = if (rawProfile != null && rawProfile.size >= 4) {
+                    floatArrayOf(
+                        rawProfile[0].first.toFloat(), rawProfile[0].second.toFloat(),
+                        rawProfile[1].first.toFloat(), rawProfile[1].second.toFloat(),
+                        rawProfile[2].first.toFloat(), rawProfile[2].second.toFloat(),
+                        rawProfile[3].first.toFloat(), rawProfile[3].second.toFloat()
+                    )
+                } else {
+                    staticNoiseProfile
+                }
+                ringBuffer.push(CapturedFrame(img, iso, expTime, noiseProfile))
             }
         }
         
@@ -109,6 +120,7 @@ class CameraController(
     @Volatile private var currentIso: Int = 400
     @Volatile private var currentExposureTime: Long = 33_333_333L
     @Volatile private var isCapturingPsl = false
+    @Volatile private var staticNoiseProfile: FloatArray? = null
     private val rawBufferPool = ArrayList<ByteBuffer>()
 
     // ── Semaphore to guard cameraDevice opening (Camera2 requirement) ──────────
@@ -377,6 +389,16 @@ class CameraController(
                 request: CaptureRequest,
                 result: TotalCaptureResult
             ) {
+                val rawProfile: Array<out android.util.Pair<Double, Double>>? = result.get(CaptureResult.SENSOR_NOISE_PROFILE)
+                if (rawProfile != null && rawProfile.size >= 4 && staticNoiseProfile == null) {
+                    staticNoiseProfile = floatArrayOf(
+                        rawProfile[0].first.toFloat(), rawProfile[0].second.toFloat(),
+                        rawProfile[1].first.toFloat(), rawProfile[1].second.toFloat(),
+                        rawProfile[2].first.toFloat(), rawProfile[2].second.toFloat(),
+                        rawProfile[3].first.toFloat(), rawProfile[3].second.toFloat()
+                    )
+                    Log.i(TAG, "Cached static device noise profile from preview frame")
+                }
                 val iso = result.get(CaptureResult.SENSOR_SENSITIVITY)
                 if (iso != null) {
                     currentIso = iso

@@ -892,15 +892,10 @@ bool FusionStage::process(FrameContext& ctx) {
         }
 
         if (!hasDynamicNoise || (S <= 0.0 && O <= 0.0)) {
-            // Fallback to IMX882 noise model parameters
-            double A = 1.210813e-06;
-            double B = 9.711493e-06;
-            double C = 1.376002e-12;
-            double D = 1.901007e-07;
-
-            S = A * fIso + B;
-            double digital_gain = (fIso / 3200.0) < 1.0 ? 1.0 : (fIso / 3200.0);
-            O = C * fIso * fIso + D * digital_gain * digital_gain;
+            LOGI("FusionStage: Dynamic/static device noise profile missing! Using generic CMOS model fallback.");
+            // Standard generic CMOS noise model scaling with ISO
+            S = 1.0e-5 * (fIso / 100.0);
+            O = 1.0e-6 * (fIso / 100.0) * (fIso / 100.0);
         }
 
         LOGI("FusionStage: Frame %zu (ISO %d) Noise Model -> S = %.4e, O = %.4e", fi, fIso, S, O);
