@@ -109,22 +109,32 @@ bool DebayerStage::process(FrameContext& ctx) {
         float bGain = 1.9f;
         float gGain = 1.0f;
 
-        // ── GPU HEADLESS COMPUTE SHADER DEMOSAICING ────────────────────────────
+        // ── GPU HEADLESS COMPUTE SHADER SABRE MULTI-FRAME DEMOSAICING ────────────────────────────
         bool success = false;
         std::string errorLog;
         
+        int numFrames = ctx.inputFrames.size();
+
         EglHeadlessSetup egl;
         if (egl.init(errorLog)) {
-            const char* COMPUTE_DEMOSAIC_SRC = R"glsl(
+            const char* COMPUTE_SABRE_SRC = R"glsl(
                 #version 310 es
                 layout(local_size_x = 16, local_size_y = 16) in;
 
                 precision highp float;
-                precision highp usampler2D;
+                precision highp usampler2DArray;
+                precision highp sampler2DArray;
 
-                uniform usampler2D u_raw_texture;
+                uniform usampler2DArray u_raw_frames;
+                uniform sampler2DArray u_motion_fields;
+
+                uniform int u_num_frames;
                 uniform int u_width;
                 uniform int u_height;
+                uniform int u_blocks_wide;
+                uniform int u_blocks_tall;
+                uniform float u_block_size;
+
                 uniform float u_black_level;
                 uniform float u_scale;
                 uniform float u_r_gain;
@@ -135,10 +145,10 @@ bool DebayerStage::process(FrameContext& ctx) {
                     uint outRGB[];
                 };
 
-                float getRaw(int x, int y) {
-                    int cx = clamp(x, 0, u_width - 1);
-                    int cy = clamp(y, 0, u_height - 1);
-                    uint val = texelFetch(u_raw_texture, ivec2(cx, cy), 0).r;
+                float getRawCorrected(ivec2 p, int frameIdx) {
+                    int cx = clamp(p.x, 0, u_width - 1);
+                    int cy = clamp(p.y, 0, u_height - 1);
+                    uint val = texelFetch(u_raw_frames, ivec3(cx, cy, frameIdx), 0).r;
                     float cleanVal = max(0.0, (float(val) - u_black_level) * u_scale);
 
                     bool isEvenRow = (cy % 2 == 0);
@@ -152,76 +162,198 @@ bool DebayerStage::process(FrameContext& ctx) {
                     }
                 }
 
+                int getPixelColor(ivec2 p) {
+                    bool isEvenRow = (p.y % 2 == 0);
+                    bool isEvenCol = (p.x % 2 == 0);
+                    if (isEvenRow && isEvenCol) return 2; // Blue
+                    if (!isEvenRow && !isEvenCol) return 0; // Red
+                    return 1; // Green
+                }
+
                 void main() {
                     ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
                     if (pos.x >= u_width || pos.y >= u_height) return;
 
-                    int r = pos.y;
-                    int c = pos.x;
+                    float sumR = 0.0, weightR = 0.0;
+                    float sumG = 0.0, weightG = 0.0;
+                    float sumB = 0.0, weightB = 0.0;
 
-                    float R = 0.0;
-                    float G = 0.0;
-                    float B = 0.0;
+                    // 1. Reference frame (Frame 0, pre-fused) local neighborhood contribution
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        for (int dx = -1; dx <= 1; ++dx) {
+                            ivec2 samplePos = pos + ivec2(dx, dy);
+                            if (samplePos.x >= 0 && samplePos.x < u_width && samplePos.y >= 0 && samplePos.y < u_height) {
+                                float val = getRawCorrected(samplePos, 0);
+                                int color = getPixelColor(samplePos);
+                                
+                                float dist2 = float(dx * dx + dy * dy);
+                                float spatialW = exp(-dist2 * 1.5);
 
-                    bool isEvenRow = (r % 2 == 0);
-                    bool isEvenCol = (c % 2 == 0);
-
-                    if (isEvenRow && isEvenCol) {
-                        // Blue pixel (BGGR)
-                        B = getRaw(c, r);
-                        G = (getRaw(c-1, r) + getRaw(c+1, r) + getRaw(c, r-1) + getRaw(c, r+1)) * 0.25 + 
-                            (4.0 * getRaw(c, r) - getRaw(c-2, r) - getRaw(c+2, r) - getRaw(c, r-2) - getRaw(c, r+2)) * 0.125;
-                        R = (getRaw(c-1, r-1) + getRaw(c+1, r-1) + getRaw(c-1, r+1) + getRaw(c+1, r+1)) * 0.25 + 
-                            (6.0 * getRaw(c, r) - 1.5 * (getRaw(c-2, r) + getRaw(c+2, r) + getRaw(c, r-2) + getRaw(c, r+2))) * 0.0625;
-                    } else if (!isEvenRow && !isEvenCol) {
-                        // Red pixel
-                        R = getRaw(c, r);
-                        G = (getRaw(c-1, r) + getRaw(c+1, r) + getRaw(c, r-1) + getRaw(c, r+1)) * 0.25 + 
-                            (4.0 * getRaw(c, r) - getRaw(c-2, r) - getRaw(c+2, r) - getRaw(c, r-2) - getRaw(c, r+2)) * 0.125;
-                        B = (getRaw(c-1, r-1) + getRaw(c+1, r-1) + getRaw(c-1, r+1) + getRaw(c+1, r+1)) * 0.25 + 
-                            (6.0 * getRaw(c, r) - 1.5 * (getRaw(c-2, r) + getRaw(c+2, r) + getRaw(c, r-2) + getRaw(c, r+2))) * 0.0625;
-                    } else if (isEvenRow && !isEvenCol) {
-                        // Green pixel on Blue row
-                        G = getRaw(c, r);
-                        B = (getRaw(c-1, r) + getRaw(c+1, r)) * 0.5 + 
-                            (2.0 * getRaw(c, r) - getRaw(c-2, r) - getRaw(c+2, r)) * 0.125;
-                        R = (getRaw(c, r-1) + getRaw(c, r+1)) * 0.5 + 
-                            (2.0 * getRaw(c, r) - getRaw(c, r-2) - getRaw(c, r+2)) * 0.125;
-                    } else {
-                        // Green pixel on Red row
-                        G = getRaw(c, r);
-                        R = (getRaw(c-1, r) + getRaw(c+1, r)) * 0.5 + 
-                            (2.0 * getRaw(c, r) - getRaw(c-2, r) - getRaw(c+2, r)) * 0.125;
-                        B = (getRaw(c, r-1) + getRaw(c, r+1)) * 0.5 + 
-                            (2.0 * getRaw(c, r) - getRaw(c, r-2) - getRaw(c, r+2)) * 0.125;
+                                if (color == 0) {
+                                    sumR += val * spatialW;
+                                    weightR += spatialW;
+                                } else if (color == 1) {
+                                    sumG += val * spatialW;
+                                    weightG += spatialW;
+                                } else {
+                                    sumB += val * spatialW;
+                                    weightB += spatialW;
+                                }
+                            }
+                        }
                     }
 
-                    uint uR = uint(clamp(R, 0.0, 255.0));
-                    uint uG = uint(clamp(G, 0.0, 255.0));
-                    uint uB = uint(clamp(B, 0.0, 255.0));
+                    // 2. Subpixel multi-frame accumulation
+                    for (int f = 1; f < u_num_frames; ++f) {
+                        float bx = (float(pos.x) - u_block_size * 0.5) / u_block_size;
+                        float by = (float(pos.y) - u_block_size * 0.5) / u_block_size;
+                        vec2 mv_uv = vec2((bx + 0.5) / float(u_blocks_wide), (by + 0.5) / float(u_blocks_tall));
+
+                        vec2 mv = texture(u_motion_fields, vec3(mv_uv, float(f - 1))).rg;
+                        vec2 targetPos = vec2(pos) + mv;
+                        ivec2 centerIdx = ivec2(round(targetPos.x), round(targetPos.y));
+
+                        for (int dy = -1; dy <= 1; ++dy) {
+                            for (int dx = -1; dx <= 1; ++dx) {
+                                ivec2 samplePos = centerIdx + ivec2(dx, dy);
+                                if (samplePos.x >= 0 && samplePos.x < u_width && samplePos.y >= 0 && samplePos.y < u_height) {
+                                    float val = getRawCorrected(samplePos, f);
+                                    int color = getPixelColor(samplePos);
+
+                                    vec2 delta = vec2(samplePos) - targetPos;
+                                    float dist2 = dot(delta, delta);
+                                    float spatialW = exp(-dist2 * 1.0);
+
+                                    if (color == 0) {
+                                        sumR += val * spatialW;
+                                        weightR += spatialW;
+                                    } else if (color == 1) {
+                                        sumG += val * spatialW;
+                                        weightG += spatialW;
+                                    } else {
+                                        sumB += val * spatialW;
+                                        weightB += spatialW;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    float finalR = (weightR > 0.01) ? (sumR / weightR) : 0.0;
+                    float finalG = (weightG > 0.01) ? (sumG / weightG) : 0.0;
+                    float finalB = (weightB > 0.01) ? (sumB / weightB) : 0.0;
+
+                    // Fallback to high-quality local demosaicing if any channel lacks enough samples
+                    bool needR = (weightR <= 0.2);
+                    bool needG = (weightG <= 0.2);
+                    bool needB = (weightB <= 0.2);
+
+                    if (needR || needG || needB) {
+                        int r = pos.y;
+                        int c = pos.x;
+                        bool isEvenRow = (r % 2 == 0);
+                        bool isEvenCol = (c % 2 == 0);
+
+                        float fallbackR = 0.0;
+                        float fallbackG = 0.0;
+                        float fallbackB = 0.0;
+
+                        if (isEvenRow && isEvenCol) {
+                            fallbackB = getRawCorrected(pos, 0);
+                            fallbackG = (getRawCorrected(ivec2(c-1, r), 0) + getRawCorrected(ivec2(c+1, r), 0) + getRawCorrected(ivec2(c, r-1), 0) + getRawCorrected(ivec2(c, r+1), 0)) * 0.25 + 
+                                        (4.0 * fallbackB - getRawCorrected(ivec2(c-2, r), 0) - getRawCorrected(ivec2(c+2, r), 0) - getRawCorrected(ivec2(c, r-2), 0) - getRawCorrected(ivec2(c, r+2), 0)) * 0.125;
+                            fallbackR = (getRawCorrected(ivec2(c-1, r-1), 0) + getRawCorrected(ivec2(c+1, r-1), 0) + getRawCorrected(ivec2(c-1, r+1), 0) + getRawCorrected(ivec2(c+1, r+1), 0)) * 0.25 + 
+                                        (6.0 * fallbackB - 1.5 * (getRawCorrected(ivec2(c-2, r), 0) + getRawCorrected(ivec2(c+2, r), 0) + getRawCorrected(ivec2(c, r-2), 0) + getRawCorrected(ivec2(c, r+2), 0))) * 0.0625;
+                        } else if (!isEvenRow && !isEvenCol) {
+                            fallbackR = getRawCorrected(pos, 0);
+                            fallbackG = (getRawCorrected(ivec2(c-1, r), 0) + getRawCorrected(ivec2(c+1, r), 0) + getRawCorrected(ivec2(c, r-1), 0) + getRawCorrected(ivec2(c, r+1), 0)) * 0.25 + 
+                                        (4.0 * fallbackR - getRawCorrected(ivec2(c-2, r), 0) - getRawCorrected(ivec2(c+2, r), 0) - getRawCorrected(ivec2(c, r-2), 0) - getRawCorrected(ivec2(c, r+2), 0)) * 0.125;
+                            fallbackB = (getRawCorrected(ivec2(c-1, r-1), 0) + getRawCorrected(ivec2(c+1, r-1), 0) + getRawCorrected(ivec2(c-1, r+1), 0) + getRawCorrected(ivec2(c+1, r+1), 0)) * 0.25 + 
+                                        (6.0 * fallbackR - 1.5 * (getRawCorrected(ivec2(c-2, r), 0) + getRawCorrected(ivec2(c+2, r), 0) + getRawCorrected(ivec2(c, r-2), 0) + getRawCorrected(ivec2(c, r+2), 0))) * 0.0625;
+                        } else if (isEvenRow && !isEvenCol) {
+                            fallbackG = getRawCorrected(pos, 0);
+                            fallbackB = (getRawCorrected(ivec2(c-1, r), 0) + getRawCorrected(ivec2(c+1, r), 0)) * 0.5 + 
+                                        (2.0 * fallbackG - getRawCorrected(ivec2(c-2, r), 0) - getRawCorrected(ivec2(c+2, r), 0)) * 0.125;
+                            fallbackR = (getRawCorrected(ivec2(c, r-1), 0) + getRawCorrected(ivec2(c, r+1), 0)) * 0.5 + 
+                                        (2.0 * fallbackG - getRawCorrected(ivec2(c, r-2), 0) - getRawCorrected(ivec2(c, r+2), 0)) * 0.125;
+                        } else {
+                            fallbackG = getRawCorrected(pos, 0);
+                            fallbackR = (getRawCorrected(ivec2(c-1, r), 0) + getRawCorrected(ivec2(c+1, r), 0)) * 0.5 + 
+                                        (2.0 * fallbackG - getRawCorrected(ivec2(c-2, r), 0) - getRawCorrected(ivec2(c+2, r), 0)) * 0.125;
+                            fallbackB = (getRawCorrected(ivec2(c, r-1), 0) + getRawCorrected(ivec2(c, r+1), 0)) * 0.5 + 
+                                        (2.0 * fallbackG - getRawCorrected(ivec2(c, r-2), 0) - getRawCorrected(ivec2(c, r+2), 0)) * 0.125;
+                        }
+
+                        if (needR) finalR = fallbackR;
+                        if (needG) finalG = fallbackG;
+                        if (needB) finalB = fallbackB;
+                    }
+
+                    uint uR = uint(clamp(finalR, 0.0, 255.0));
+                    uint uG = uint(clamp(finalG, 0.0, 255.0));
+                    uint uB = uint(clamp(finalB, 0.0, 255.0));
 
                     uint packedVal = uR | (uG << 8) | (uB << 16) | (255u << 24);
-                    outRGB[r * u_width + c] = packedVal;
+                    outRGB[pos.y * u_width + pos.x] = packedVal;
                 }
             )glsl";
 
-            GLuint program = createComputeProgram(COMPUTE_DEMOSAIC_SRC, errorLog);
+            GLuint program = createComputeProgram(COMPUTE_SABRE_SRC, errorLog);
             if (program != 0) {
                 glUseProgram(program);
 
-                // Upload 16-bit RAW buffer as R16UI Texture
-                GLuint rawTexture;
-                glGenTextures(1, &rawTexture);
+                // 1. Upload all RAW burst frames to a 2D Texture Array (Frame 0 = fusedRaw)
+                GLuint rawTextureArray;
+                glGenTextures(1, &rawTextureArray);
                 glActiveTexture(GL_TEXTURE0);
-                glBindTexture(GL_TEXTURE_2D, rawTexture);
-                glTexStorage2D(GL_TEXTURE_2D, 1, GL_R16UI, w, h);
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RED_INTEGER, GL_UNSIGNED_SHORT, fusedRaw.data());
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                glBindTexture(GL_TEXTURE_2D_ARRAY, rawTextureArray);
+                glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_R16UI, w, h, numFrames);
+                for (int f = 0; f < numFrames; ++f) {
+                    const uint16_t* frameRaw = (f == 0) ? fusedRaw.data() : reinterpret_cast<const uint16_t*>(ctx.inputFrames[f].yPlane);
+                    glPixelStorei(GL_UNPACK_ROW_LENGTH, ctx.inputFrames[f].yRowStride / 2);
+                    glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, f, w, h, 1, GL_RED_INTEGER, GL_UNSIGNED_SHORT, frameRaw);
+                }
+                glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+                glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
-                glUniform1i(glGetUniformLocation(program, "u_raw_texture"), 0);
+                // 2. Upload motion fields
+                int blocksWide = ctx.motionFields[0].blocksWide;
+                int blocksTall = ctx.motionFields[0].blocksTall;
+                int blockSize = ctx.motionFields[0].blockSize;
+                int numFields = ctx.motionFields.size();
+
+                std::vector<float> contiguousMVs(2 * blocksWide * blocksTall * numFields);
+                for (int f = 0; f < numFields; ++f) {
+                    const auto& mf = ctx.motionFields[f];
+                    for (int y = 0; y < blocksTall; ++y) {
+                        for (int x = 0; x < blocksWide; ++x) {
+                            auto mv = mf.vectors[y * blocksWide + x];
+                            contiguousMVs[0 + x * 2 + y * blocksWide * 2 + f * blocksWide * blocksTall * 2] = mv.dx;
+                            contiguousMVs[1 + x * 2 + y * blocksWide * 2 + f * blocksWide * blocksTall * 2] = mv.dy;
+                        }
+                    }
+                }
+
+                GLuint motionFieldsTex;
+                glGenTextures(1, &motionFieldsTex);
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_2D_ARRAY, motionFieldsTex);
+                glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_RG32F, blocksWide, blocksTall, numFields);
+                glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, blocksWide, blocksTall, numFields, GL_RG, GL_FLOAT, contiguousMVs.data());
+                glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+                // 3. Set Uniforms
+                glUniform1i(glGetUniformLocation(program, "u_raw_frames"), 0);
+                glUniform1i(glGetUniformLocation(program, "u_motion_fields"), 1);
+                glUniform1i(glGetUniformLocation(program, "u_num_frames"), numFrames);
                 glUniform1i(glGetUniformLocation(program, "u_width"), w);
                 glUniform1i(glGetUniformLocation(program, "u_height"), h);
+                glUniform1i(glGetUniformLocation(program, "u_blocks_wide"), blocksWide);
+                glUniform1i(glGetUniformLocation(program, "u_blocks_tall"), blocksTall);
+                glUniform1f(glGetUniformLocation(program, "u_block_size"), static_cast<float>(blockSize));
+
                 glUniform1f(glGetUniformLocation(program, "u_black_level"), blackLevel);
                 glUniform1f(glGetUniformLocation(program, "u_scale"), scale);
                 glUniform1f(glGetUniformLocation(program, "u_r_gain"), rGain);
@@ -258,7 +390,8 @@ bool DebayerStage::process(FrameContext& ctx) {
                 }
 
                 glDeleteBuffers(1, &outBuffer);
-                glDeleteTextures(1, &rawTexture);
+                glDeleteTextures(1, &rawTextureArray);
+                glDeleteTextures(1, &motionFieldsTex);
                 glDeleteProgram(program);
             }
         }
