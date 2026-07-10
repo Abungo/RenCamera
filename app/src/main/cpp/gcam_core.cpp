@@ -447,6 +447,14 @@ Java_com_renskylab_camera_NativeEngine_processCopiedBurst(
         } else {
             ctx.metadata["debug_images_enabled"] = true;
         }
+        
+        float digitalGain = 1.0f;
+        if (env->GetArrayLength(configParams) > 15) {
+            digitalGain = params[15];
+        }
+        ctx.metadata["digital_gain"] = digitalGain;
+        LOGI("Extracted digital gain from JNI: %.3fx", digitalGain);
+
         env->ReleaseFloatArrayElements(configParams, params, JNI_ABORT);
     }
     

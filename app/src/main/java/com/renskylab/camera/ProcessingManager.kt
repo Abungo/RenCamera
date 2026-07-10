@@ -21,7 +21,8 @@ data class ProcessingJob(
     val onError: (String) -> Unit,
     val awbGains: FloatArray? = null,
     val blackLevel: Float = 1024f,
-    val whiteLevel: Float = 4095f
+    val whiteLevel: Float = 4095f,
+    val digitalGain: Float = 1.0f
 )
 
 object ProcessingManager {

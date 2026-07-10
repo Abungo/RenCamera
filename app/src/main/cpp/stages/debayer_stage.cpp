@@ -101,8 +101,14 @@ bool DebayerStage::process(FrameContext& ctx) {
             whiteLevel = static_cast<float>(maxVal);
         }
 
-        // Adjust scaling factor based on calculated dynamic range
-        float scale = 255.f / std::max(1.f, whiteLevel - blackLevel);
+        float digitalGain = 1.0f;
+        if (ctx.metadata.count("digital_gain")) {
+            try { digitalGain = std::any_cast<float>(ctx.metadata.at("digital_gain")); } catch (...) {}
+        }
+        LOGI("DebayerStage: applying digital gain = %.3fx", digitalGain);
+
+        // Adjust scaling factor based on calculated dynamic range and digital exposure matching gain
+        float scale = (255.f / std::max(1.f, whiteLevel - blackLevel)) * digitalGain;
 
         // Sony sensor color channel gain defaults to neutralize green tint
         float rGain = 2.1f;

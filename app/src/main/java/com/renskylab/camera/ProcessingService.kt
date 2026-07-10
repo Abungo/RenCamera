@@ -175,6 +175,7 @@ class ProcessingService : Service() {
                         job.config,
                         job.iso,
                         job.frameIsos,
+                        job.digitalGain,
                         if (job.config.debugImagesEnabled) rawDir.absolutePath else "", // master debug toggle
                         object : NativeEngine.ProgressListener {
                             override fun onProgress(step: String, percentage: Int) {
@@ -200,18 +201,20 @@ class ProcessingService : Service() {
                             Use RAW: ${job.config.useRawCapture}
                             JPEG Quality: ${job.config.jpegQuality}
                             Target ISO: ${job.iso}
-                            Frame ISOs: ${job.frameIsos.joinToString(", ")}
-                            Frame Exposure Times (ms): ${job.frameExposures?.map { String.format("%.2f", it / 1_000_000.0) }?.joinToString(", ")}
+                            Frame ISOs: ${job.frameIsos.joinToString()}
+                            Frame Exposure Times (ms): ${job.frameExposures?.map { String.format("%.2f", it / 1_000_000.0) }?.joinToString() ?: ""}
                             Average Exposure Time: ${String.format("%.2f", averageExposureMs)} ms
+                            Digital Gain: ${String.format("%.2f", job.digitalGain)}x
                             
                         """.trimIndent()
                         logFile.appendText(details)
                     } catch (e: Exception) {
-                        Log.e(TAG, "Failed to write capture parameters to pipeline log", e)
+                        Log.e(TAG, "Failed to write details to log file", e)
                     }
                 }
                 res
             }
+            
             if (jpegBytes != null) {
                 val uri = PhotoSaver.save(this, jpegBytes, filename)
                 if (uri != null) {
@@ -230,6 +233,13 @@ class ProcessingService : Service() {
                 withContext(Dispatchers.Main) {
                     job.onError("Native pipeline failed to process frames")
                 }
+            }
+            ProcessingManager.removeJob(jobId)
+            
+            // If no more jobs are in queue, stop the service
+            if (!ProcessingManager.hasJobs()) {
+                Log.i(TAG, "All jobs complete. Stopping service.")
+                stopSelf()
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error processing job $jobId", e)
@@ -258,9 +268,14 @@ class ProcessingService : Service() {
         config: PipelineConfig,
         iso: Int,
         frameIsos: IntArray,
+        digitalGain: Float,
         debugDir: String,
         progressListener: NativeEngine.ProgressListener
     ): ByteArray? {
+        val mergedParams = config.toFloatArray().toMutableList().apply {
+            add(digitalGain) // Index 15
+        }.toFloatArray()
+
         return NativeEngine.processCopiedBurst(
             handle      = nativeBurstHandle,
             jpegQuality = config.jpegQuality,
@@ -268,7 +283,7 @@ class ProcessingService : Service() {
             nightMode   = config.nightMode,
             iso         = iso,
             frameIsos   = frameIsos,
-            configParams = config.toFloatArray(),
+            configParams = mergedParams,
             debugDir    = debugDir,
             listener    = progressListener
         )

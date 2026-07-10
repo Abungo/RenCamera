@@ -418,6 +418,7 @@ class CameraController(
             runCatching { session?.stopRepeating() }
 
             var captureIso = currentIso
+            var calculatedDigitalGain = 1.0f
             val isNight = config.nightMode
             val forceBurst = !isNight && currentIso > 400
             val burst = if (isNight || forceBurst) {
@@ -443,7 +444,8 @@ class CameraController(
                     targetExposureTime = currentExposureTime.coerceAtMost(16_666_667L)
                 }
                 captureIso = targetIso
-                Log.i(TAG, "Still capture burst: isNight=$isNight, forceBurst=$forceBurst -> targetIso=$targetIso, targetExp=${targetExposureTime / 1_000_000}ms")
+                calculatedDigitalGain = ((currentIso.toDouble() * currentExposureTime.toDouble()) / (targetIso.toDouble() * targetExposureTime.toDouble())).toFloat()
+                Log.i(TAG, "Still capture burst: isNight=$isNight, forceBurst=$forceBurst -> targetIso=$targetIso, targetExp=${targetExposureTime / 1_000_000}ms, digitalGain=$calculatedDigitalGain")
 
                 // Create a manual still capture burst to collect clean frames
                 val requests = List(numFrames) {
@@ -633,7 +635,8 @@ class CameraController(
                 nativeBurstHandle = nativeHandle,
                 config = config.copy(useRawCapture = isRaw),
                 onSaved = onSaved,
-                onError = onError
+                onError = onError,
+                digitalGain = calculatedDigitalGain
             )
             
             ProcessingManager.addJob(job)
