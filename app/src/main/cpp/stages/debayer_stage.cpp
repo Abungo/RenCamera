@@ -180,6 +180,15 @@ bool DebayerStage::process(FrameContext& ctx) {
                     ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
                     if (pos.x >= u_width || pos.y >= u_height) return;
 
+                    // Edge-adaptive kernel: compute horizontal and vertical green gradients on reference frame
+                    float gLeft = getRawCorrected(pos + ivec2(-1, 0), 0);
+                    float gRight = getRawCorrected(pos + ivec2(1, 0), 0);
+                    float gUp = getRawCorrected(pos + ivec2(0, -1), 0);
+                    float gDown = getRawCorrected(pos + ivec2(0, 1), 0);
+                    float edgeStrength = abs(gLeft - gRight) + abs(gUp - gDown);
+                    // Ramps from 2.0 (flat regions, strong denoising) to 8.0 (sharp edges, detail preservation)
+                    float kExponent = mix(2.0, 8.0, clamp(edgeStrength / 15.0, 0.0, 1.0));
+
                     float sumR = 0.0, weightR = 0.0;
                     float sumG = 0.0, weightG = 0.0;
                     float sumB = 0.0, weightB = 0.0;
@@ -193,7 +202,7 @@ bool DebayerStage::process(FrameContext& ctx) {
                                 int color = getPixelColor(samplePos);
                                 
                                 float dist2 = float(dx * dx + dy * dy);
-                                float spatialW = exp(-dist2 * 8.0);
+                                float spatialW = exp(-dist2 * kExponent);
 
                                 if (color == 0) {
                                     sumR += val * spatialW;
@@ -228,7 +237,7 @@ bool DebayerStage::process(FrameContext& ctx) {
 
                                     vec2 delta = vec2(samplePos) - targetPos;
                                     float dist2 = dot(delta, delta);
-                                    float spatialW = exp(-dist2 * 8.0);
+                                    float spatialW = exp(-dist2 * kExponent);
 
                                     if (color == 0) {
                                         sumR += val * spatialW;
