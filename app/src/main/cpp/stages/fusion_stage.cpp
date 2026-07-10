@@ -956,20 +956,48 @@ bool FusionStage::process(FrameContext& ctx) {
                         out.write(reinterpret_cast<const char*>(fusedRaw.data()), fusedRaw.size() * sizeof(uint16_t));
                         out.close();
                     }
-                    // Save 8-bit grayscale preview JPEG of fused RAW plane
-                    std::vector<uint8_t> previewY(w * h);
-                    for (size_t i = 0; i < previewY.size(); ++i) {
-                        previewY[i] = static_cast<uint8_t>(std::clamp(fusedRaw[i] / 16.f, 0.f, 255.f));
-                    }
-                    std::vector<uint8_t> uvGray(w * h / 2, 128);
-                    saveYuvAsJpeg(previewY.data(), uvGray.data(), uvGray.data(), w, h, debugDir + "/stage_1_fusion/fused.jpg");
-
-                    // Extract and save exposure-boosted center crops for RAW detail comparison
                     float digitalGain = 1.0f;
                     if (ctx.metadata.count("digital_gain")) {
                         try { digitalGain = std::any_cast<float>(ctx.metadata.at("digital_gain")); } catch (...) {}
                     }
                     float previewScale = (255.f / 3071.f) * digitalGain; // normalized to 12-bit range after black-level subtraction
+
+                    // Save 8-bit exposure-boosted grayscale preview JPEG of fused RAW plane
+                    std::vector<uint8_t> previewY(w * h);
+                    for (size_t i = 0; i < previewY.size(); ++i) {
+                        float cleanVal = std::max(0.f, static_cast<float>(fusedRaw[i]) - 1024.f);
+                        previewY[i] = static_cast<uint8_t>(std::clamp(cleanVal * previewScale, 0.f, 255.f));
+                    }
+                    std::vector<uint8_t> uvGray(w * h / 2, 128);
+                    saveYuvAsJpeg(previewY.data(), uvGray.data(), uvGray.data(), w, h, debugDir + "/stage_1_fusion/fused.jpg");
+
+                    // Save full reference RAW frame preview
+                    const uint16_t* refRaw = reinterpret_cast<const uint16_t*>(ctx.inputFrames[0].yPlane);
+                    int refStride = ctx.inputFrames[0].yRowStride / 2;
+                    std::vector<uint8_t> refPreviewY(w * h);
+                    for (int r = 0; r < h; ++r) {
+                        for (int c = 0; c < w; ++c) {
+                            uint16_t val = refRaw[r * refStride + c];
+                            float cleanVal = std::max(0.f, static_cast<float>(val) - 1024.f);
+                            refPreviewY[r * w + c] = static_cast<uint8_t>(std::clamp(cleanVal * previewScale, 0.f, 255.f));
+                        }
+                    }
+                    saveYuvAsJpeg(refPreviewY.data(), uvGray.data(), uvGray.data(), w, h, debugDir + "/stage_1_fusion/ref_frame.jpg");
+
+                    // Save full source RAW frame 1 preview (if present)
+                    if (ctx.inputFrames.size() > 1) {
+                        const uint16_t* srcRaw = reinterpret_cast<const uint16_t*>(ctx.inputFrames[1].yPlane);
+                        int srcStride = ctx.inputFrames[1].yRowStride / 2;
+                        std::vector<uint8_t> srcPreviewY(w * h);
+                        for (int r = 0; r < h; ++r) {
+                            for (int c = 0; c < w; ++c) {
+                                uint16_t val = srcRaw[r * srcStride + c];
+                                float cleanVal = std::max(0.f, static_cast<float>(val) - 1024.f);
+                                srcPreviewY[r * w + c] = static_cast<uint8_t>(std::clamp(cleanVal * previewScale, 0.f, 255.f));
+                            }
+                        }
+                        saveYuvAsJpeg(srcPreviewY.data(), uvGray.data(), uvGray.data(), w, h, debugDir + "/stage_1_fusion/src_frame_1.jpg");
+                    }
 
                     int cy = h / 2;
                     int cx = w / 2;
@@ -979,8 +1007,6 @@ bool FusionStage::process(FrameContext& ctx) {
 
                     // Reference noisy RAW crop (Grayscale representation)
                     std::vector<uint8_t> cropRefY(cropSize * cropSize);
-                    const uint16_t* refRaw = reinterpret_cast<const uint16_t*>(ctx.inputFrames[0].yPlane);
-                    int refStride = ctx.inputFrames[0].yRowStride / 2;
                     for (int r = 0; r < cropSize; ++r) {
                         for (int c = 0; c < cropSize; ++c) {
                             uint16_t val = refRaw[(startY + r) * refStride + (startX + c)];
