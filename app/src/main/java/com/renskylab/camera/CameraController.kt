@@ -447,10 +447,11 @@ class CameraController(
                 calculatedDigitalGain = ((currentIso.toDouble() * currentExposureTime.toDouble()) / (targetIso.toDouble() * targetExposureTime.toDouble())).toFloat()
                 Log.i(TAG, "Still capture burst: isNight=$isNight, forceBurst=$forceBurst -> targetIso=$targetIso, targetExp=${targetExposureTime / 1_000_000}ms, digitalGain=$calculatedDigitalGain")
 
-                // Create a manual still capture burst to collect clean frames
+                // Create a manual still capture burst using TEMPLATE_MANUAL to guarantee hardware register gains are applied
                 val requests = List(numFrames) {
-                    cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                    cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_MANUAL).apply {
                         addTarget(imageReader!!.surface)
+                        set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
                         set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
                         set(CaptureRequest.SENSOR_EXPOSURE_TIME, targetExposureTime)
                         set(CaptureRequest.SENSOR_SENSITIVITY, targetIso)
