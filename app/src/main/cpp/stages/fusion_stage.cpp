@@ -980,10 +980,10 @@ bool FusionStage::process(FrameContext& ctx) {
                     // Reference noisy RAW crop (Grayscale representation)
                     std::vector<uint8_t> cropRefY(cropSize * cropSize);
                     const uint16_t* refRaw = reinterpret_cast<const uint16_t*>(ctx.inputFrames[0].yPlane);
-                    int strideElements = ctx.inputFrames[0].yRowStride / 2;
+                    int refStride = ctx.inputFrames[0].yRowStride / 2;
                     for (int r = 0; r < cropSize; ++r) {
                         for (int c = 0; c < cropSize; ++c) {
-                            uint16_t val = refRaw[(startY + r) * strideElements + (startX + c)];
+                            uint16_t val = refRaw[(startY + r) * refStride + (startX + c)];
                             float cleanVal = std::max(0.f, static_cast<float>(val) - 1024.f);
                             cropRefY[r * cropSize + c] = static_cast<uint8_t>(std::clamp(cleanVal * previewScale, 0.f, 255.f));
                         }
@@ -1001,6 +1001,45 @@ bool FusionStage::process(FrameContext& ctx) {
                         }
                     }
                     saveYuvAsJpeg(cropFusedY.data(), cropUvGray.data(), cropUvGray.data(), cropSize, cropSize, debugDir + "/stage_1_fusion/denoised_crop.jpg");
+
+                    // Compute alignment difference maps for RAW mode (subsampled 4x)
+                    if (ctx.inputFrames.size() > 1) {
+                        int dw = w / 4;
+                        int dh = h / 4;
+                        const uint16_t* srcRaw = reinterpret_cast<const uint16_t*>(ctx.inputFrames[1].yPlane);
+                        int srcStride = ctx.inputFrames[1].yRowStride / 2;
+
+                        // Difference Before Alignment
+                        std::vector<uint8_t> diffBefore(dw * dh);
+                        for (int r = 0; r < dh; ++r) {
+                            for (int c = 0; c < dw; ++c) {
+                                uint16_t refVal = refRaw[(r * 4) * refStride + (c * 4)];
+                                uint16_t srcVal = srcRaw[(r * 4) * srcStride + (c * 4)];
+                                float diff = std::abs(static_cast<float>(refVal) - static_cast<float>(srcVal));
+                                diffBefore[r * dw + c] = static_cast<uint8_t>(std::clamp(diff * previewScale * 10.f, 0.f, 255.f));
+                            }
+                        }
+                        std::vector<uint8_t> uvGrayDiff(dw * dh / 2, 128);
+                        saveYuvAsJpeg(diffBefore.data(), uvGrayDiff.data(), uvGrayDiff.data(), dw, dh, debugDir + "/stage_1_fusion/diff_before_alignment.jpg");
+
+                        // Difference After Alignment (Bayer-phase aligned)
+                        std::vector<uint8_t> diffAfter(dw * dh);
+                        for (int r = 0; r < dh; ++r) {
+                            for (int c = 0; c < dw; ++c) {
+                                MotionVec mv = interpolateMotion(ctx.motionFields[0], r * 4, c * 4);
+                                int cdx = int(round(mv.dx * 0.5f)) * 2;
+                                int cdy = int(round(mv.dy * 0.5f)) * 2;
+                                int sc = std::clamp(c * 4 + cdx, 0, w - 1);
+                                int sr = std::clamp(r * 4 + cdy, 0, h - 1);
+
+                                uint16_t refVal = refRaw[(r * 4) * refStride + (c * 4)];
+                                uint16_t warpedVal = srcRaw[sr * srcStride + sc];
+                                float diff = std::abs(static_cast<float>(refVal) - static_cast<float>(warpedVal));
+                                diffAfter[r * dw + c] = static_cast<uint8_t>(std::clamp(diff * previewScale * 10.f, 0.f, 255.f));
+                            }
+                        }
+                        saveYuvAsJpeg(diffAfter.data(), uvGrayDiff.data(), uvGrayDiff.data(), dw, dh, debugDir + "/stage_1_fusion/diff_after_alignment.jpg");
+                    }
                 }
             } else {
                 // Save Reference Frame
