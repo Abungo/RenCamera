@@ -193,7 +193,7 @@ bool DebayerStage::process(FrameContext& ctx) {
                                 int color = getPixelColor(samplePos);
                                 
                                 float dist2 = float(dx * dx + dy * dy);
-                                float spatialW = exp(-dist2 * 1.5);
+                                float spatialW = exp(-dist2 * 8.0);
 
                                 if (color == 0) {
                                     sumR += val * spatialW;
@@ -228,7 +228,7 @@ bool DebayerStage::process(FrameContext& ctx) {
 
                                     vec2 delta = vec2(samplePos) - targetPos;
                                     float dist2 = dot(delta, delta);
-                                    float spatialW = exp(-dist2 * 1.0);
+                                    float spatialW = exp(-dist2 * 8.0);
 
                                     if (color == 0) {
                                         sumR += val * spatialW;
