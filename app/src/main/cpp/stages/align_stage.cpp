@@ -23,7 +23,7 @@ static constexpr int REFINE_RANGE  =  4;  // ±pixels at finer levels
 
 /// Copy a Camera2 YUV/RAW frame to a packed FloatImage downsampled by 4x
 /// using a 4x4 average box filter. This speeds up alignment by 16x.
-static FloatImage yPlaneToFloatDownsampled4x(const YuvFrame& f, bool useRaw) {
+static FloatImage yPlaneToFloatDownsampled4x(const YuvFrame& f, bool useRaw, float digitalGain) {
     FloatImage out;
     int dw = f.width / 4;
     int dh = f.height / 4;
@@ -32,6 +32,8 @@ static FloatImage yPlaneToFloatDownsampled4x(const YuvFrame& f, bool useRaw) {
     if (useRaw) {
         int strideElements = f.yRowStride / 2;
         const uint16_t* rawBase = reinterpret_cast<const uint16_t*>(f.yPlane);
+        // Normalize 12-bit RAW range after subtracting black level of 1024, and apply digital exposure gain
+        float scale = (255.f / 3071.f) * digitalGain;
         for (int row = 0; row < dh; ++row) {
             float*         dst = out.ptr(row);
             for (int col = 0; col < dw; ++col) {
@@ -41,7 +43,9 @@ static FloatImage yPlaneToFloatDownsampled4x(const YuvFrame& f, bool useRaw) {
                     sum += static_cast<float>(srcRow[4 * col + 0]) + static_cast<float>(srcRow[4 * col + 1]) +
                            static_cast<float>(srcRow[4 * col + 2]) + static_cast<float>(srcRow[4 * col + 3]);
                 }
-                dst[col] = sum * (1.0f / 16.0f) / 16.0f;
+                float avgRaw = sum * (1.0f / 16.0f);
+                float cleanVal = std::max(0.f, avgRaw - 1024.f);
+                dst[col] = cleanVal * scale;
             }
         }
     } else {
@@ -372,9 +376,14 @@ bool AlignStage::process(FrameContext& ctx) {
         } catch (...) {}
     }
 
+    float digitalGain = 1.0f;
+    if (ctx.metadata.count("digital_gain")) {
+        try { digitalGain = std::any_cast<float>(ctx.metadata.at("digital_gain")); } catch (...) {}
+    }
+
     // Frame 0 is the reference (last captured = most recent, sharpest focus)
     const YuvFrame& refFrame = ctx.inputFrames[0];
-    Pyramid refPyr = buildPyramid(yPlaneToFloatDownsampled4x(refFrame, useRaw));
+    Pyramid refPyr = buildPyramid(yPlaneToFloatDownsampled4x(refFrame, useRaw, digitalGain));
 
     size_t numSrcFrames = ctx.inputFrames.size() - 1;
     ctx.motionFields.clear();
@@ -392,8 +401,8 @@ bool AlignStage::process(FrameContext& ctx) {
 
     for (size_t i = 0; i < numSrcFrames; ++i) {
         size_t srcIndex = i + 1;
-        futures.push_back(std::async(std::launch::async, [&ctx, &refPyr, srcIndex, i, regFactor, useRaw]() {
-            Pyramid srcPyr = buildPyramid(yPlaneToFloatDownsampled4x(ctx.inputFrames[srcIndex], useRaw));
+        futures.push_back(std::async(std::launch::async, [&ctx, &refPyr, srcIndex, i, regFactor, useRaw, digitalGain]() {
+            Pyramid srcPyr = buildPyramid(yPlaneToFloatDownsampled4x(ctx.inputFrames[srcIndex], useRaw, digitalGain));
             MotionField mf = alignFrame(refPyr, srcPyr, regFactor);
             
             // Scale up the motion vectors and block size by 4x
