@@ -54,6 +54,7 @@ object NativeEngine {
         nightMode: Boolean,
         iso: Int,
         frameIsos: IntArray,
+        frameNoiseProfiles: FloatArray,
         configParams: FloatArray,
         debugDir: String,
         listener: ProgressListener?

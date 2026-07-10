@@ -8,7 +8,8 @@ import android.media.Image
 data class CapturedFrame(
     val image: Image,
     val iso: Int,
-    val exposureTimeNs: Long
+    val exposureTimeNs: Long,
+    val noiseProfile: FloatArray? = null // size 8 (4 pairs of S and O noise coefficients)
 )
 
 /**

@@ -15,6 +15,7 @@ data class ProcessingJob(
     val iso: Int,
     val frameIsos: IntArray,
     val frameExposures: LongArray? = null,
+    val frameNoiseProfiles: FloatArray? = null, // N * 8 float values (S, O coefficients per channel)
     val nativeBurstHandle: Long,
     val config: PipelineConfig,
     val onSaved: (Uri) -> Unit,

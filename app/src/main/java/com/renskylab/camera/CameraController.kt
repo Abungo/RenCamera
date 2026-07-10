@@ -543,6 +543,7 @@ class CameraController(
             val height = burst[0].image.height
             val frameIsos = IntArray(count)
             val frameExposures = LongArray(count)
+            val frameNoiseProfiles = FloatArray(count * 8)
 
             burst.forEachIndexed { idx, frame ->
                 val planes = frame.image.planes
@@ -589,6 +590,14 @@ class CameraController(
                 }
                 frameIsos[idx] = frame.iso
                 frameExposures[idx] = frame.exposureTimeNs
+                val profile = frame.noiseProfile
+                if (profile != null && profile.size == 8) {
+                    System.arraycopy(profile, 0, frameNoiseProfiles, idx * 8, 8)
+                } else {
+                    for (i in 0 until 8) {
+                        frameNoiseProfiles[idx * 8 + i] = 0f
+                    }
+                }
             }
 
             var nativeHandle: Long = 0
@@ -633,6 +642,7 @@ class CameraController(
                 iso = captureIso,
                 frameIsos = frameIsos,
                 frameExposures = frameExposures,
+                frameNoiseProfiles = frameNoiseProfiles,
                 nativeBurstHandle = nativeHandle,
                 config = config.copy(useRawCapture = isRaw),
                 onSaved = onSaved,

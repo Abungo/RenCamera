@@ -363,6 +363,7 @@ Java_com_renskylab_camera_NativeEngine_processCopiedBurst(
     jboolean nightMode,
     jint iso,
     jintArray frameIsos,
+    jfloatArray frameNoiseProfiles,
     jfloatArray configParams,
     jstring debugDirStr,
     jobject listener)
@@ -389,6 +390,18 @@ Java_com_renskylab_camera_NativeEngine_processCopiedBurst(
         env->ReleaseIntArrayElements(frameIsos, isos, JNI_ABORT);
     }
     ctx.metadata["frame_isos"] = cFrameIsos;
+
+    std::vector<float> noiseProfiles;
+    if (frameNoiseProfiles) {
+        jfloat* profiles = env->GetFloatArrayElements(frameNoiseProfiles, nullptr);
+        jsize len = env->GetArrayLength(frameNoiseProfiles);
+        noiseProfiles.resize(len);
+        for (int i = 0; i < len; ++i) {
+            noiseProfiles[i] = profiles[i];
+        }
+        env->ReleaseFloatArrayElements(frameNoiseProfiles, profiles, JNI_ABORT);
+    }
+    ctx.metadata["noise_profiles"] = noiseProfiles;
 
     for (size_t i = 0; i < count; ++i) {
         const CopiedFrame& f = burst->frames[i];

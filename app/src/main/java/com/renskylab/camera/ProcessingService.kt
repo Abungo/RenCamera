@@ -175,6 +175,7 @@ class ProcessingService : Service() {
                         job.config,
                         job.iso,
                         job.frameIsos,
+                        job.frameNoiseProfiles ?: FloatArray(0),
                         job.digitalGain,
                         if (job.config.debugImagesEnabled) rawDir.absolutePath else "", // master debug toggle
                         object : NativeEngine.ProgressListener {
@@ -268,6 +269,7 @@ class ProcessingService : Service() {
         config: PipelineConfig,
         iso: Int,
         frameIsos: IntArray,
+        frameNoiseProfiles: FloatArray,
         digitalGain: Float,
         debugDir: String,
         progressListener: NativeEngine.ProgressListener
@@ -283,6 +285,7 @@ class ProcessingService : Service() {
             nightMode   = config.nightMode,
             iso         = iso,
             frameIsos   = frameIsos,
+            frameNoiseProfiles = frameNoiseProfiles,
             configParams = mergedParams,
             debugDir    = debugDir,
             listener    = progressListener

@@ -864,23 +864,49 @@ bool FusionStage::process(FrameContext& ctx) {
         } catch (...) {}
     }
 
+    // Extract dynamically calibrated sensor noise parameters if available
+    std::vector<float> noiseProfiles;
+    if (ctx.metadata.count("noise_profiles")) {
+        try {
+            noiseProfiles = std::any_cast<std::vector<float>>(ctx.metadata.at("noise_profiles"));
+        } catch (...) {}
+    }
+
     // ── Build Noise-Aware Fusion LUT per Frame ────────────────────────────────
     std::vector<std::vector<float>> inv_2sigma2_luts(ctx.inputFrames.size(), std::vector<float>(256));
     for (size_t fi = 0; fi < ctx.inputFrames.size(); ++fi) {
         int fIso = frameIsos[fi];
-        for (int i = 0; i < 256; ++i) {
-            float normVal = i / 255.f;
+        
+        double S = 0.0;
+        double O = 0.0;
+        bool hasDynamicNoise = (noiseProfiles.size() >= (fi + 1) * 8);
+        if (hasDynamicNoise) {
+            float sumS = 0.0f;
+            float sumO = 0.0f;
+            for (int ch = 0; ch < 4; ++ch) {
+                sumS += noiseProfiles[fi * 8 + ch * 2];
+                sumO += noiseProfiles[fi * 8 + ch * 2 + 1];
+            }
+            S = sumS / 4.0;
+            O = sumO / 4.0;
+        }
 
-            // IMX882 Noise Model parameters
+        if (!hasDynamicNoise || (S <= 0.0 && O <= 0.0)) {
+            // Fallback to IMX882 noise model parameters
             double A = 1.210813e-06;
             double B = 9.711493e-06;
             double C = 1.376002e-12;
             double D = 1.901007e-07;
 
-            double S = A * fIso + B;
+            S = A * fIso + B;
             double digital_gain = (fIso / 3200.0) < 1.0 ? 1.0 : (fIso / 3200.0);
-            double O = C * fIso * fIso + D * digital_gain * digital_gain;
+            O = C * fIso * fIso + D * digital_gain * digital_gain;
+        }
 
+        LOGI("FusionStage: Frame %zu (ISO %d) Noise Model -> S = %.4e, O = %.4e", fi, fIso, S, O);
+
+        for (int i = 0; i < 256; ++i) {
+            float normVal = i / 255.f;
             double variance = S * normVal + O;
             float noise_sigma = std::sqrt(variance < 0.0 ? 0.0 : variance) * 255.f;
 
