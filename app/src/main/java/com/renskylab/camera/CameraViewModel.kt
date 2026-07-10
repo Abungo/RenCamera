@@ -79,8 +79,9 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
      */
     val pipelineConfig: StateFlow<PipelineConfig> = _pipelineConfig.asStateFlow()
 
+        
     init {
-        // Load config from SharedPreferences
+        // Load config and sheet preferences from SharedPreferences
         val prefs = application.getSharedPreferences("RenCameraPrefs", android.content.Context.MODE_PRIVATE)
         val savedXml = prefs.getString("pipeline_config", null)
         if (savedXml != null) {
@@ -89,6 +90,56 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 _pipelineConfig.value = loaded
                 controller.setRawCaptureEnabled(loaded.useRawCapture)
                 controller.setExposureBias(loaded.exposureBias)
+            }
+        }
+        
+        // Restore ui settings state
+        try {
+            val flashMode = FlashMode.valueOf(prefs.getString("pref_flash_mode", FlashMode.AUTO.name) ?: FlashMode.AUTO.name)
+            val hdrMode = HdrMode.valueOf(prefs.getString("pref_hdr_mode", HdrMode.HDR_ON.name) ?: HdrMode.HDR_ON.name)
+            val timerMode = TimerMode.valueOf(prefs.getString("pref_timer_mode", TimerMode.OFF.name) ?: TimerMode.OFF.name)
+            val captureMode = CaptureMode.valueOf(prefs.getString("pref_capture_mode", CaptureMode.PHOTO.name) ?: CaptureMode.PHOTO.name)
+            
+            _uiState.value = _uiState.value.copy(
+                flashMode = flashMode,
+                hdrMode = hdrMode,
+                timerMode = timerMode,
+                captureMode = captureMode
+            )
+            controller.setNightModeEnabled(captureMode == CaptureMode.NIGHT)
+        } catch (e: Exception) {
+            android.util.Log.e("RenCamera/ViewModel", "Failed to restore sheet states", e)
+        }
+        
+        // Load latest photo from MediaStore to populate gallery button on start
+        loadLastPhotoUri()
+    }
+
+    private fun loadLastPhotoUri() {
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val projection = arrayOf(
+                android.provider.MediaStore.Images.Media._ID,
+                android.provider.MediaStore.Images.Media.DATE_ADDED
+            )
+            val sortOrder = "${android.provider.MediaStore.Images.Media.DATE_ADDED} DESC"
+            val queryUri = android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+            
+            getApplication<Application>().contentResolver.query(
+                queryUri,
+                projection,
+                null,
+                null,
+                sortOrder
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idColumn = cursor.getColumnIndexOrThrow(android.provider.MediaStore.Images.Media._ID)
+                    val id = cursor.getLong(idColumn)
+                    val uri = android.content.ContentUris.withAppendedId(
+                        android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                        id
+                    )
+                    _uiState.value = _uiState.value.copy(lastCapturedUri = uri)
+                }
             }
         }
     }
@@ -214,6 +265,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
      */
     fun setFlashMode(mode: FlashMode) {
         _uiState.value = _uiState.value.copy(flashMode = mode)
+        val prefs = getApplication<Application>().getSharedPreferences("RenCameraPrefs", android.content.Context.MODE_PRIVATE)
+        prefs.edit().putString("pref_flash_mode", mode.name).apply()
     }
 
     /**
@@ -223,6 +276,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
      */
     fun setHdrMode(mode: HdrMode) {
         _uiState.value = _uiState.value.copy(hdrMode = mode)
+        val prefs = getApplication<Application>().getSharedPreferences("RenCameraPrefs", android.content.Context.MODE_PRIVATE)
+        prefs.edit().putString("pref_hdr_mode", mode.name).apply()
     }
 
     /**
@@ -232,6 +287,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
      */
     fun setTimerMode(mode: TimerMode) {
         _uiState.value = _uiState.value.copy(timerMode = mode)
+        val prefs = getApplication<Application>().getSharedPreferences("RenCameraPrefs", android.content.Context.MODE_PRIVATE)
+        prefs.edit().putString("pref_timer_mode", mode.name).apply()
     }
 
     /**
@@ -242,6 +299,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     fun setCaptureMode(mode: CaptureMode) {
         _uiState.value = _uiState.value.copy(captureMode = mode)
         controller.setNightModeEnabled(mode == CaptureMode.NIGHT)
+        val prefs = getApplication<Application>().getSharedPreferences("RenCameraPrefs", android.content.Context.MODE_PRIVATE)
+        prefs.edit().putString("pref_capture_mode", mode.name).apply()
     }
 
     /**

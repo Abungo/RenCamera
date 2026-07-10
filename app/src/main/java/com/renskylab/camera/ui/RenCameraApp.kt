@@ -35,6 +35,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import android.content.Intent
+import android.net.Uri
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.layout.ContentScale
+import coil.compose.AsyncImage
 import com.renskylab.camera.CaptureMode
 import com.renskylab.camera.CameraViewModel
 import com.renskylab.camera.FlashMode
@@ -598,13 +603,38 @@ private fun BottomControlsRow(
     ) {
         // Gallery thumbnail placeholder with progress spinner
         val isBackgroundProcessing by ProcessingManager.isProcessing.collectAsState()
+        val context = LocalContext.current
 
         Box(
             modifier = Modifier
                 .size(52.dp)
-                .clip(RoundedCornerShape(8.dp))
+                .clip(CircleShape)
                 .background(SurfaceGlass)
-                .border(1.dp, White60.copy(alpha = 0.3f), RoundedCornerShape(8.dp)),
+                .border(1.dp, White60.copy(alpha = 0.3f), CircleShape)
+                .clickable(enabled = !isBackgroundProcessing) {
+                    val intent = Intent(Intent.ACTION_VIEW).apply {
+                        if (lastCapturedUri != null) {
+                            setDataAndType(lastCapturedUri, "image/*")
+                        } else {
+                            setDataAndType(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, "image/*")
+                        }
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+
+                    // Attempt Google Photos directly first
+                    val photosIntent = Intent(intent).setPackage("com.google.android.apps.photos")
+                    val started = runCatching {
+                        context.startActivity(photosIntent)
+                        true
+                    }.getOrDefault(false)
+
+                    if (!started) {
+                        // Fall back to default system handler (respects always preferences)
+                        runCatching {
+                            context.startActivity(intent)
+                        }
+                    }
+                },
             contentAlignment = Alignment.Center,
         ) {
             if (isBackgroundProcessing) {
@@ -623,6 +653,13 @@ private fun BottomControlsRow(
                         modifier = Modifier.size(24.dp)
                     )
                 }
+            } else if (lastCapturedUri != null) {
+                AsyncImage(
+                    model = lastCapturedUri,
+                    contentDescription = "Last Photo",
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Crop
+                )
             } else {
                 Icon(
                     imageVector        = Icons.Default.PhotoLibrary,

@@ -823,7 +823,7 @@ bool FusionStage::process(FrameContext& ctx) {
         LOGE("FusionStage: no input frames");
         return false;
     }
-    if (ctx.motionFields.size() != ctx.inputFrames.size() - 1) {
+    if (ctx.inputFrames.size() > 1 && ctx.motionFields.size() != ctx.inputFrames.size() - 1) {
         LOGE("FusionStage: motion field count mismatch (%zu fields, %zu frames)",
              ctx.motionFields.size(), ctx.inputFrames.size());
         return false;
@@ -937,17 +937,46 @@ bool FusionStage::process(FrameContext& ctx) {
             sensorMax = static_cast<float>(maxVal);
         }
         
-        fuseRawBayer(ctx.inputFrames, ctx.motionFields, fusedRaw, w, h, inv_2sigma2_luts, sensorMax);
+        if (ctx.inputFrames.size() == 1) {
+            LOGI("FusionStage: single frame, copying RAW Bayer reference directly");
+            const uint16_t* rawData = reinterpret_cast<const uint16_t*>(ctx.inputFrames[0].yPlane);
+            int strideElements = ctx.inputFrames[0].yRowStride / 2;
+            fusedRaw.resize(static_cast<size_t>(w) * h);
+            for (int r = 0; r < h; ++r) {
+                std::copy(rawData + r * strideElements, rawData + r * strideElements + w, fusedRaw.data() + r * w);
+            }
+        } else {
+            fuseRawBayer(ctx.inputFrames, ctx.motionFields, fusedRaw, w, h, inv_2sigma2_luts, sensorMax);
+        }
         ctx.metadata["fused_raw"] = fusedRaw;
     } else {
         std::string debugDir = "";
         if (ctx.metadata.count("debug_dir")) {
             try { debugDir = std::any_cast<std::string>(ctx.metadata.at("debug_dir")); } catch (...) {}
         }
-        std::vector<float> lumaWeights;
-        fuseYPlane(ctx.inputFrames, ctx.motionFields, ctx.fusedY, lumaWeights, w, h, inv_2sigma2_luts, debugDir);
-        fuseChromaPlane(ctx.inputFrames, ctx.motionFields, /*isU=*/true,  ctx.fusedU, uvW, uvH, inv_2sigma2_luts, lumaWeights, w, h);
-        fuseChromaPlane(ctx.inputFrames, ctx.motionFields, /*isU=*/false, ctx.fusedV, uvW, uvH, inv_2sigma2_luts, lumaWeights, w, h);
+        if (ctx.inputFrames.size() == 1) {
+            LOGI("FusionStage: single frame, copying YUV reference directly");
+            const YuvFrame& ref = ctx.inputFrames[0];
+            ctx.fusedY.resize(static_cast<size_t>(w) * h);
+            for (int r = 0; r < h; ++r) {
+                std::copy(ref.yPlane + r * ref.yRowStride, ref.yPlane + r * ref.yRowStride + w, ctx.fusedY.data() + r * w);
+            }
+            ctx.fusedU.resize(static_cast<size_t>(uvW) * uvH);
+            ctx.fusedV.resize(static_cast<size_t>(uvW) * uvH);
+            for (int r = 0; r < uvH; ++r) {
+                const uint8_t* uRow = ref.uPlane + r * ref.uvRowStride;
+                const uint8_t* vRow = ref.vPlane + r * ref.uvRowStride;
+                for (int c = 0; c < uvW; ++c) {
+                    ctx.fusedU[r * uvW + c] = uRow[c * ref.uvPixelStride];
+                    ctx.fusedV[r * uvW + c] = vRow[c * ref.uvPixelStride];
+                }
+            }
+        } else {
+            std::vector<float> lumaWeights;
+            fuseYPlane(ctx.inputFrames, ctx.motionFields, ctx.fusedY, lumaWeights, w, h, inv_2sigma2_luts, debugDir);
+            fuseChromaPlane(ctx.inputFrames, ctx.motionFields, /*isU=*/true,  ctx.fusedU, uvW, uvH, inv_2sigma2_luts, lumaWeights, w, h);
+            fuseChromaPlane(ctx.inputFrames, ctx.motionFields, /*isU=*/false, ctx.fusedV, uvW, uvH, inv_2sigma2_luts, lumaWeights, w, h);
+        }
 
         bool chromaDenoise = true;
         if (ctx.metadata.count("chroma_denoise_enabled")) {

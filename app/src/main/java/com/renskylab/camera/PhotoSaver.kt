@@ -5,8 +5,10 @@ import android.content.Context
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
+import androidx.exifinterface.media.ExifInterface
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.io.IOException
 
 /**
@@ -22,9 +24,10 @@ object PhotoSaver {
      * @param context The application or activity context.
      * @param jpegBytes The compressed JPEG image data to be saved.
      * @param filename The target display name for the saved image file.
+     * @param orientationDegrees The orientation degrees to write as EXIF metadata (e.g. 90, 180, 270).
      * @return The [Uri] pointing to the saved image in the MediaStore, or null if the operation fails.
      */
-    suspend fun save(context: Context, jpegBytes: ByteArray, filename: String): Uri? =
+    suspend fun save(context: Context, jpegBytes: ByteArray, filename: String, orientationDegrees: Int = 90): Uri? =
         withContext(Dispatchers.IO) {
 
             val contentValues = ContentValues().apply {
@@ -44,6 +47,23 @@ object PhotoSaver {
                 resolver.openOutputStream(uri)?.use { stream ->
                     stream.write(jpegBytes)
                 } ?: throw IOException("Failed to open output stream for $uri")
+
+                // Write EXIF orientation tag using ExifInterface
+                try {
+                    resolver.openFileDescriptor(uri, "rw")?.use { pfd ->
+                        val exifInterface = ExifInterface(pfd.fileDescriptor)
+                        val exifOrientation = when (orientationDegrees) {
+                            90 -> ExifInterface.ORIENTATION_ROTATE_90
+                            180 -> ExifInterface.ORIENTATION_ROTATE_180
+                            270 -> ExifInterface.ORIENTATION_ROTATE_270
+                            else -> ExifInterface.ORIENTATION_NORMAL
+                        }
+                        exifInterface.setAttribute(ExifInterface.TAG_ORIENTATION, exifOrientation.toString())
+                        exifInterface.saveAttributes()
+                    }
+                } catch (exifEx: Exception) {
+                    android.util.Log.e("RenCamera/PhotoSaver", "Failed to write EXIF orientation", exifEx)
+                }
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     contentValues.clear()

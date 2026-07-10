@@ -77,6 +77,7 @@ dependencies {
     // AndroidX core
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
+    implementation("androidx.exifinterface:exifinterface:1.3.7")
 
     // Lifecycle + ViewModel + Activity
     implementation(libs.lifecycle.runtime.ktx)
@@ -90,4 +91,7 @@ dependencies {
 
     // Debug — Compose tooling
     debugImplementation(libs.compose.ui.tooling)
+
+    // Image loading — Coil
+    implementation("io.coil-kt:coil-compose:2.6.0")
 }

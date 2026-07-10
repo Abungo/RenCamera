@@ -444,6 +444,13 @@ class CameraController(
                 set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
                 set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
 
+                // Enable Optical Image Stabilization (OIS) if supported
+                val oisModes = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+                if (oisModes != null && oisModes.contains(CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)) {
+                    set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
+                    Log.i(TAG, "OIS enabled for preview")
+                }
+
                 // Select target FPS range with lowest minimum to support longer exposure times, preferring 30fps max to avoid capping exposure at 16.6ms
                 val fpsRanges = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
                 val bestRange = fpsRanges?.filter { it.upper == 30 }
@@ -516,8 +523,8 @@ class CameraController(
             var calculatedDigitalGain = 1.0f
             val isNight = config.nightMode
             val isHdrEnhanced = hdrMode == HdrMode.HDR_ENHANCED
-            val forceBurst = !isNight && !isHdrEnhanced && currentIso > 400
-            val burst = if (isNight || forceBurst || isHdrEnhanced) {
+            val forceBurst = !isNight && !isHdrEnhanced && hdrMode != HdrMode.OFF && currentIso > 400
+            val burst = if ((isNight || forceBurst || isHdrEnhanced) && hdrMode != HdrMode.OFF) {
                 isCapturingPsl = true
                 _captureProgress.value = 0f
                 ringBuffer.flush() // Clear preview frames
@@ -566,6 +573,14 @@ class CameraController(
                         set(CaptureRequest.SENSOR_EXPOSURE_TIME, frameExp)
                         set(CaptureRequest.SENSOR_SENSITIVITY, targetIso)
                         set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                        
+                        // Enable Optical Image Stabilization (OIS) if supported
+                        val chars = manager.getCameraCharacteristics(pickBackCamera() ?: "")
+                        val oisModes = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+                        if (oisModes != null && oisModes.contains(CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)) {
+                            set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
+                        }
+
                         setTag("BURST")
                     }.build()
                 }
@@ -750,6 +765,9 @@ class CameraController(
             val timestamp = System.currentTimeMillis()
             val jobId = "job_$timestamp"
             
+            val characteristics = manager.getCameraCharacteristics(pickBackCamera() ?: "")
+            val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+
             val job = ProcessingJob(
                 id = jobId,
                 timestamp = timestamp,
@@ -761,7 +779,8 @@ class CameraController(
                 config = config.copy(useRawCapture = isRaw),
                 onSaved = onSaved,
                 onError = onError,
-                digitalGain = calculatedDigitalGain
+                digitalGain = calculatedDigitalGain,
+                sensorOrientation = sensorOrientation
             )
             
             ProcessingManager.addJob(job)

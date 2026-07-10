@@ -43,7 +43,8 @@ data class ProcessingJob(
     val awbGains: FloatArray? = null,
     val blackLevel: Float = 1024f,
     val whiteLevel: Float = 4095f,
-    val digitalGain: Float = 1.0f
+    val digitalGain: Float = 1.0f,
+    val sensorOrientation: Int = 90
 )
 
 /**

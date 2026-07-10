@@ -121,8 +121,11 @@ bool DebayerStage::process(FrameContext& ctx) {
         
         int numFrames = ctx.inputFrames.size();
 
-        EglHeadlessSetup egl;
-        if (egl.init(errorLog)) {
+        if (numFrames == 1) {
+            LOGI("DebayerStage: single frame detected, bypassing Sabre GPU compute. Using CPU Bilinear demosaicing fallback.");
+        } else {
+            EglHeadlessSetup egl;
+            if (egl.init(errorLog)) {
             const char* COMPUTE_SABRE_SRC = R"glsl(
                 #version 310 es
                 layout(local_size_x = 16, local_size_y = 16) in;
@@ -418,11 +421,11 @@ bool DebayerStage::process(FrameContext& ctx) {
                 glDeleteBuffers(1, &outBuffer);
                 glDeleteTextures(1, &rawTextureArray);
                 glDeleteTextures(1, &motionFieldsTex);
-                glDeleteProgram(program);
             }
         }
+    }
 
-        if (!success) {
+    if (!success) {
             LOGE("GL Demosaicing failed, falling back to CPU multi-threaded Bilinear demosaicing. GL Errors:\n%s", errorLog.c_str());
             // Bilinear Demosaicing (BGGR layout) - Multi-threaded CPU Fallback
             int numThreads = 8;

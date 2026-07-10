@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.exifinterface.media.ExifInterface
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import java.nio.ByteBuffer
@@ -229,6 +230,37 @@ class ProcessingService : Service() {
                 saveDeferred?.await()
                 val res = pipelineDeferred.await()
                 
+                // Write EXIF orientation tags to intermediate debug preview files if enabled
+                if (job.config.debugImagesEnabled) {
+                    try {
+                        val exifOrientation = when (job.sensorOrientation) {
+                            90 -> ExifInterface.ORIENTATION_ROTATE_90
+                            180 -> ExifInterface.ORIENTATION_ROTATE_180
+                            270 -> ExifInterface.ORIENTATION_ROTATE_270
+                            else -> ExifInterface.ORIENTATION_NORMAL
+                        }
+                        val debugPaths = listOf("stage_1_fusion", "stage_2_debayer", "stage_3_tonemap")
+                        for (dirName in debugPaths) {
+                            val dir = java.io.File(rawDir, dirName)
+                            if (dir.exists()) {
+                                dir.listFiles()?.forEach { file ->
+                                    if (file.name.endsWith(".jpg") || file.name.endsWith(".jpeg")) {
+                                        try {
+                                            val ex = ExifInterface(file.absolutePath)
+                                            ex.setAttribute(ExifInterface.TAG_ORIENTATION, exifOrientation.toString())
+                                            ex.saveAttributes()
+                                        } catch (e: Exception) {
+                                            Log.w(TAG, "Failed writing EXIF to debug file ${file.name}", e)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error writing debug image EXIF orientations", e)
+                    }
+                }
+
                 // Append exact capture parameters to pipeline timing log
                 if (job.config.debugImagesEnabled && res != null) {
                     try {
@@ -257,7 +289,7 @@ class ProcessingService : Service() {
             }
             
             if (jpegBytes != null) {
-                val uri = PhotoSaver.save(this, jpegBytes, filename)
+                val uri = PhotoSaver.save(this, jpegBytes, filename, job.sensorOrientation)
                 if (uri != null) {
                     Log.i(TAG, "Job $jobId completed. Saved URI: $uri")
                     withContext(Dispatchers.Main) {
