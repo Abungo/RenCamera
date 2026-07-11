@@ -217,6 +217,7 @@ class ProcessingService : Service() {
                         job.frameExposures ?: LongArray(job.frameIsos.size),
                         job.frameNoiseProfiles ?: FloatArray(0),
                         job.digitalGain,
+                        job.appliedEvCompensation,
                         if (job.config.debugImagesEnabled) rawDir.absolutePath else "", // master debug toggle
                         object : NativeEngine.ProgressListener {
                             override fun onProgress(step: String, percentage: Int) {
@@ -349,11 +350,13 @@ class ProcessingService : Service() {
         frameExposures: LongArray,
         frameNoiseProfiles: FloatArray,
         digitalGain: Float,
+        appliedEvCompensation: Float,
         debugDir: String,
         progressListener: NativeEngine.ProgressListener
     ): ByteArray? {
         val mergedParams = config.toFloatArray().toMutableList().apply {
             add(digitalGain) // Index 15
+            add(appliedEvCompensation) // Index 16
         }.toFloatArray()
 
         return NativeEngine.processCopiedBurst(

@@ -480,6 +480,13 @@ Java_com_renskylab_camera_NativeEngine_processCopiedBurst(
         ctx.metadata["digital_gain"] = digitalGain;
         LOGI("Extracted digital gain from JNI: %.3fx", digitalGain);
 
+        float appliedEv = 0.0f;
+        if (env->GetArrayLength(configParams) > 16) {
+            appliedEv = params[16];
+        }
+        ctx.metadata["applied_ev_compensation"] = appliedEv;
+        LOGI("Extracted applied EV compensation from JNI: %.3f EV", appliedEv);
+
         env->ReleaseFloatArrayElements(configParams, params, JNI_ABORT);
     }
     

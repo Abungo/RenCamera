@@ -52,7 +52,7 @@ data class PipelineConfig(
     // Tone mapping parameters
     val detailAlpha: Float = 1.15f,
     val saturationBoost: Float = 1.15f,
-    val blackPointClamp: Float = 0.08f,
+    val blackPointClamp: Float = 0.03f, // Reduced default from 0.08f to 0.03f so dark parts are naturally brighter
 
     // ISO override for noise model (0 = use actual capture ISO from EXIF/metadata)
     val isoOverride: Int = 0,
@@ -109,7 +109,7 @@ data class PipelineConfig(
             var awbSoftnessNight = 0.85f
             var detailAlpha = 1.15f
             var saturationBoost = 1.15f
-            var blackPointClamp = 0.08f
+            var blackPointClamp = 0.03f
             var isoOverride = 0
             var useRawCapture = true
             var debugRawDumps = false
@@ -135,7 +135,7 @@ data class PipelineConfig(
                     "awbSoftnessNight" -> awbSoftnessNight = value.toFloatOrNull() ?: 0.85f
                     "detailAlpha" -> detailAlpha = value.toFloatOrNull() ?: 1.15f
                     "saturationBoost" -> saturationBoost = value.toFloatOrNull() ?: 1.15f
-                    "blackPointClamp" -> blackPointClamp = value.toFloatOrNull() ?: 0.08f
+                    "blackPointClamp" -> blackPointClamp = value.toFloatOrNull() ?: 0.03f
                     "isoOverride" -> isoOverride = value.toIntOrNull() ?: 0
                     "useRawCapture" -> useRawCapture = value.toBooleanStrictOrNull() ?: true
                     "debugRawDumps" -> debugRawDumps = value.toBooleanStrictOrNull() ?: false

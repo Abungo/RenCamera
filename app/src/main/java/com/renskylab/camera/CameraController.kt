@@ -91,6 +91,23 @@ class CameraController(
             } else {
                 val iso = meta.get(CaptureResult.SENSOR_SENSITIVITY) ?: 400
                 val expTime = meta.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 30_000_000L
+                
+                // Run preview frame histogram analysis periodically (every 10th frame) to dynamically adapt AE EV
+                if (!isCapturingPsl && analysisFrameCount++ % 10 == 0) {
+                    scope.launch(Dispatchers.Default) {
+                        val result = LumaHistogramAnalyzer.analyze(img)
+                        activeDynamicEv = result.targetEv
+                        Log.i(TAG, "Luma Analyzer: shadow=${result.shadowLuma}, highlight=${result.highlightLuma}, DR stops=${result.drStops}, targetEv=${result.targetEv}")
+                        
+                        // Dynamically update the repeating preview request exposure bias if needed
+                        val session = captureSession
+                        val surface = lastPreviewSurface
+                        if (session != null && surface != null) {
+                            runCatching { startRepeatingRequest(session, surface) }
+                        }
+                    }
+                }
+
                 val rawProfile: Array<out android.util.Pair<Double, Double>>? = meta.get(CaptureResult.SENSOR_NOISE_PROFILE)
                 val noiseProfile = if (rawProfile != null && rawProfile.size >= 4) {
                     floatArrayOf(
@@ -131,6 +148,8 @@ class CameraController(
     @Volatile private var currentExposureTime: Long = 33_333_333L
     @Volatile private var isCapturingPsl = false
     @Volatile private var staticNoiseProfile: FloatArray? = null
+    @Volatile @JvmField var activeDynamicEv: Float = 0.0f
+    private var analysisFrameCount = 0
     private val rawBufferPool = ArrayList<ByteBuffer>()
 
     // ── Semaphore to guard cameraDevice opening (Camera2 requirement) ──────────
@@ -432,7 +451,7 @@ class CameraController(
         val aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
         val aeStep  = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)
         val stepSize = aeStep?.toFloat() ?: (1f / 3f)
-        val bias = if (isNightMode) 1.5f else activeExposureBias
+        val bias = if (isNightMode) 1.5f else activeDynamicEv
         val evSteps = (bias / stepSize).toInt()
             .coerceIn(aeRange?.lower ?: -6, aeRange?.upper ?: 0)
 
@@ -780,7 +799,8 @@ class CameraController(
                 onSaved = onSaved,
                 onError = onError,
                 digitalGain = calculatedDigitalGain,
-                sensorOrientation = sensorOrientation
+                sensorOrientation = sensorOrientation,
+                appliedEvCompensation = activeDynamicEv
             )
             
             ProcessingManager.addJob(job)

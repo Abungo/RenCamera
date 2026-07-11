@@ -309,6 +309,13 @@ bool ToneMapStage::process(FrameContext& ctx) {
         } catch (...) {}
     }
 
+    float appliedEvCompensation = 0.0f;
+    if (ctx.metadata.count("applied_ev_compensation")) {
+        try {
+            appliedEvCompensation = std::any_cast<float>(ctx.metadata.at("applied_ev_compensation"));
+        } catch (...) {}
+    }
+
     // Save intermediate debug frames (Before White Balance / Debayered RGB)
     if (ctx.metadata.count("debug_dir")) {
         try {
@@ -355,6 +362,7 @@ bool ToneMapStage::process(FrameContext& ctx) {
             uniform float u_black_point_clamp;
             uniform float u_detail_alpha;
             uniform float u_saturation_boost;
+            uniform float u_ev_compensation;
 
             layout(std430, binding = 0) writeonly buffer OutputBuffer {
                 uint outRGB[];
@@ -377,7 +385,9 @@ bool ToneMapStage::process(FrameContext& ctx) {
                 ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
                 if (pos.x >= u_width || pos.y >= u_height) return;
 
-                vec3 rgbVal = texelFetch(u_input_texture, pos, 0).rgb * 255.0;
+                // Dynamically compensate exposure bias (scale = 2^(-EV))
+                float evScale = pow(2.0, -u_ev_compensation);
+                vec3 rgbVal = texelFetch(u_input_texture, pos, 0).rgb * 255.0 * evScale;
                 float L = luma(rgbVal);
 
                 // Single-pass bilateral filter on the GPU to extract local low-frequency base layer
@@ -523,6 +533,7 @@ bool ToneMapStage::process(FrameContext& ctx) {
             glUniform1f(glGetUniformLocation(program, "u_black_point_clamp"), blackPointClamp);
             glUniform1f(glGetUniformLocation(program, "u_detail_alpha"), detailAlpha);
             glUniform1f(glGetUniformLocation(program, "u_saturation_boost"), saturationBoost);
+            glUniform1f(glGetUniformLocation(program, "u_ev_compensation"), appliedEvCompensation);
 
             // Create output SSBO for packed RGB
             GLuint outBuffer;
@@ -690,15 +701,16 @@ bool ToneMapStage::process(FrameContext& ctx) {
             int rStart = t * rowsPerThread;
             int rEnd = (t == numThreads - 1) ? h : (t + 1) * rowsPerThread;
 
-            futures.push_back(std::async(std::launch::async, [&ctx, &grid, rStart, rEnd, w, h, adaptiveGamma, isNight, blackPointClamp, detailAlpha, saturationBoost]() {
+            futures.push_back(std::async(std::launch::async, [&ctx, &grid, rStart, rEnd, w, h, adaptiveGamma, isNight, blackPointClamp, detailAlpha, saturationBoost, appliedEvCompensation]() {
+                float evScale = std::powf(2.0f, -appliedEvCompensation);
                 for (int r = rStart; r < rEnd; ++r) {
                     const uint8_t* src = ctx.colorImage.rowPtr(r);
                     uint8_t*       dst = ctx.processedImage.rowPtr(r);
 
                     for (int c = 0; c < w; ++c) {
-                        float R = src[c*3];
-                        float G = src[c*3+1];
-                        float B = src[c*3+2];
+                        float R = src[c*3] * evScale;
+                        float G = src[c*3+1] * evScale;
+                        float B = src[c*3+2] * evScale;
                         
                         float L = luma(R, G, B);
                         float logL = std::log2f(L + 1.f);

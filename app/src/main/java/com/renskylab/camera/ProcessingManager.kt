@@ -44,7 +44,8 @@ data class ProcessingJob(
     val blackLevel: Float = 1024f,
     val whiteLevel: Float = 4095f,
     val digitalGain: Float = 1.0f,
-    val sensorOrientation: Int = 90
+    val sensorOrientation: Int = 90,
+    val appliedEvCompensation: Float = 0.0f
 )
 
 /**

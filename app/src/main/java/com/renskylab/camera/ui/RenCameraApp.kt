@@ -100,6 +100,33 @@ fun RenCameraApp(viewModel: CameraViewModel) {
             .fillMaxSize()
             .background(Black)
     ) {
+        // Bind CameraController to Activity Lifecycle events
+        val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+        val context = LocalContext.current
+        var currentTexture by remember { mutableStateOf<SurfaceTexture?>(null) }
+
+        DisposableEffect(lifecycleOwner) {
+            val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+                when (event) {
+                    androidx.lifecycle.Lifecycle.Event.ON_RESUME -> {
+                        val texture = currentTexture
+                        if (texture != null) {
+                            viewModel.controller.startCamera(texture)
+                        }
+                    }
+                    androidx.lifecycle.Lifecycle.Event.ON_PAUSE -> {
+                        viewModel.controller.stopCamera()
+                    }
+                    else -> {}
+                }
+            }
+            lifecycleOwner.lifecycle.addObserver(observer)
+            onDispose {
+                lifecycleOwner.lifecycle.removeObserver(observer)
+                viewModel.controller.stopCamera()
+            }
+        }
+
         // ── Camera preview ─────────────────────────────────────────────────────
         CameraPreview(
             modifier = Modifier
@@ -116,6 +143,7 @@ fun RenCameraApp(viewModel: CameraViewModel) {
                     }
                 },
             onTextureReady = { st ->
+                currentTexture = st
                 viewModel.controller.startCamera(st)
             }
         )
