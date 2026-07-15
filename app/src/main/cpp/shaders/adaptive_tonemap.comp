@@ -1,0 +1,214 @@
+#version 310 es
+layout(local_size_x = 16, local_size_y = 16) in;
+
+precision highp float;
+precision highp sampler2D;
+
+uniform sampler2D u_input_texture;
+uniform int u_width;
+uniform int u_height;
+uniform float u_adaptive_gamma;
+uniform float u_black_point_clamp;
+uniform float u_detail_alpha;
+uniform float u_saturation_boost;
+uniform float u_ev_compensation;
+uniform float u_final_gamma;
+uniform float u_chroma_range_sigma;
+uniform float u_effective_iso;
+uniform float u_exposure_boost;
+uniform mat3 u_ccm;
+
+layout(std430, binding = 0) writeonly buffer OutputBuffer {
+    uint outRGB[];
+};
+
+float luma(vec3 rgb) {
+    return 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
+}
+
+float acesFilm(float x) {
+    float a = 2.51;
+    float b = 0.03;
+    float c = 2.43;
+    float d = 0.59;
+    float e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    if (pos.x >= u_width || pos.y >= u_height) return;
+
+    // Dynamically compensate exposure bias (scale = 2^(-EV))
+    // Scaled up by user-configurable u_exposure_boost
+    float evScale = pow(2.0, -u_ev_compensation) * u_exposure_boost;
+    vec3 rgbVal = texelFetch(u_input_texture, pos, 0).rgb * 255.0 * evScale;
+    float L = luma(rgbVal);
+
+    // Single-pass bilateral filter on the GPU to extract local low-frequency base layer
+    float sumVal = 0.0;
+    float sumW = 0.0;
+    
+    float spatial_sigma2 = 2.0 * 16.0 * 16.0;
+    float range_sigma2 = 2.0 * 15.0 * 15.0;
+
+    int radius = 12;
+    for (int dy = -radius; dy <= radius; dy += 2) {
+        for (int dx = -radius; dx <= radius; dx += 2) {
+            ivec2 nPos = clamp(pos + ivec2(dx, dy), ivec2(0), ivec2(u_width - 1, u_height - 1));
+            vec3 nRgb = texelFetch(u_input_texture, nPos, 0).rgb * 255.0 * evScale;
+            float nL = luma(nRgb);
+
+            float dS2 = float(dx * dx + dy * dy);
+            float dR = nL - L;
+            float dR2 = dR * dR;
+
+            float w = exp(-dS2 / spatial_sigma2) * exp(-dR2 / range_sigma2);
+            sumVal += w * nL;
+            sumW += w;
+        }
+    }
+    float baseL = max(1.0, sumVal / sumW);
+    
+    float logL = log2(L + 1.0);
+    float logBase = log2(baseL + 1.0);
+    logBase = clamp(logBase, 0.0, 10.0);
+    
+    float normBase = (pow(2.0, logBase) - 1.0) / 255.0;
+    float boostedBase = pow(normBase, u_adaptive_gamma);
+    if (boostedBase < u_black_point_clamp) {
+        boostedBase = (boostedBase * boostedBase) / u_black_point_clamp;
+    }
+    float compBase = acesFilm(boostedBase) * 255.0;
+
+    float currentDetailAlpha = u_detail_alpha;
+    if (baseL < 80.0) {
+        float shadowFactor = baseL / 80.0;
+        float minDetail = 1.0;
+        if (u_effective_iso >= 1600.0) {
+            minDetail = 0.3;
+        } else if (u_effective_iso >= 800.0) {
+            minDetail = 0.5;
+        } else if (u_effective_iso >= 400.0) {
+            minDetail = 0.7;
+        }
+        currentDetailAlpha = minDetail + shadowFactor * (u_detail_alpha - minDetail);
+    }
+
+    float logDetail = logL - logBase;
+    
+    // Sobel-guided texture boost curve: amplify low-amplitude high-frequency details
+    // while compressing large-amplitude transitions to prevent haloing.
+    float signDetail = sign(logDetail);
+    float absDetail = abs(logDetail);
+    
+    // Micro-contrast exponent curve (exponents < 1.0 lift low-contrast details)
+    float detailExponent = 0.85;
+    float boostedDetail = signDetail * pow(absDetail, detailExponent) * currentDetailAlpha;
+    
+    float compLogL = log2(compBase + 1.0) + boostedDetail;
+    float compL = clamp(pow(2.0, compLogL) - 1.0, 0.0, 255.0);
+
+    float scale = (L > 0.1) ? compL / L : 1.0;
+    scale = min(scale, 10.0);
+
+    // Apply CCM to the scaled center RGB to do YUV conversion in sRGB space
+    vec3 srgbVal = u_ccm * (rgbVal * scale);
+    float newL = luma(srgbVal);
+    float centerLumaUnscaled = luma(u_ccm * (texelFetch(u_input_texture, pos, 0).rgb * 255.0));
+
+    // Convert to YUV (YPbPr) space in sRGB
+    float uVal = -0.1687 * srgbVal.r - 0.3313 * srgbVal.g + 0.5 * srgbVal.b;
+    float vVal = 0.5 * srgbVal.r - 0.4187 * srgbVal.g - 0.0813 * srgbVal.b;
+
+    // Wide-radius chroma denoiser: Bilateral blur on U & V channels
+    // range_sigma FIXED at 15 (tight) — independent of post-tonemap u_chroma_range_sigma.
+    // At a text edge (luma diff 50): exp(-2500/450) = 0.004 → no bleed.
+    float sumU = 0.0;
+    float sumV = 0.0;
+    float sumChromaW = 0.0;
+
+    // Local gradient magnitude: high on text edges, low on smooth areas
+    float gradX = luma(u_ccm * (texelFetch(u_input_texture, clamp(pos + ivec2(1,0), ivec2(0), ivec2(u_width-1,u_height-1)), 0).rgb * 255.0))
+                - luma(u_ccm * (texelFetch(u_input_texture, clamp(pos - ivec2(1,0), ivec2(0), ivec2(u_width-1,u_height-1)), 0).rgb * 255.0));
+    float gradY = luma(u_ccm * (texelFetch(u_input_texture, clamp(pos + ivec2(0,1), ivec2(0), ivec2(u_width-1,u_height-1)), 0).rgb * 255.0))
+                - luma(u_ccm * (texelFetch(u_input_texture, clamp(pos - ivec2(0,1), ivec2(0), ivec2(u_width-1,u_height-1)), 0).rgb * 255.0));
+    float gradMag = sqrt(gradX * gradX + gradY * gradY);
+    // edgeGate → 1.0 on flat areas (blur freely), → 0.0 on text/edges (no blur)
+    float edgeGate = exp(-gradMag / 20.0);
+    // In edge areas: collapse spatial sigma to ~1px. On flat areas: keep 3px sigma (div=18)
+    float effectiveSpatialDiv = mix(2.0, 18.0, edgeGate);
+    float inTonemapRangeSigma2 = 2.0 * 15.0 * 15.0; // tight — always 15, never elevated
+
+    int chromaRadius = 6; // Large window for flat areas
+
+    for (int dy = -chromaRadius; dy <= chromaRadius; ++dy) {
+        for (int dx = -chromaRadius; dx <= chromaRadius; ++dx) {
+            ivec2 nPos = clamp(pos + ivec2(dx, dy), ivec2(0), ivec2(u_width - 1, u_height - 1));
+
+            // Sample neighboring RGB, map to sRGB, and compute its unscaled luma
+            vec3 nRgbUnscaled = texelFetch(u_input_texture, nPos, 0).rgb * 255.0;
+            vec3 nSrgbUnscaled = u_ccm * nRgbUnscaled;
+            float nLUnscaled = luma(nSrgbUnscaled);
+
+            // Range weight: tight sigma preserves text edge colour boundaries
+            float diffL = nLUnscaled - centerLumaUnscaled;
+            float wChroma = exp(-float(dx*dx + dy*dy) / effectiveSpatialDiv)
+                          * exp(-diffL * diffL / inTonemapRangeSigma2);
+
+            vec3 nSrgb = nSrgbUnscaled * evScale;
+            float nU = -0.1687 * nSrgb.r - 0.3313 * nSrgb.g + 0.5 * nSrgb.b;
+            float nV = 0.5 * nSrgb.r - 0.4187 * nSrgb.g - 0.0813 * nSrgb.b;
+
+            sumU += wChroma * nU;
+            sumV += wChroma * nV;
+            sumChromaW += wChroma;
+        }
+    }
+    
+    if (sumChromaW > 1e-4) {
+        uVal = (sumU / sumChromaW) * scale;
+        vVal = (sumV / sumChromaW) * scale;
+    }
+
+    // Shadow desaturation to suppress chroma noise in dark regions
+    if (newL < 30.0) {
+        float desatFactor = clamp(newL / 30.0, 0.0, 1.0);
+        uVal *= desatFactor;
+        vVal *= desatFactor;
+    }
+
+    // Convert back from YUV to RGB space using denoised U & V (which are already in sRGB)
+    vec3 finalRgb;
+    finalRgb.r = newL + 1.402 * vVal;
+    finalRgb.g = newL - 0.34414 * uVal - 0.71414 * vVal;
+    finalRgb.b = newL + 1.772 * uVal;
+
+    if (newL > 0.1) {
+        float factor = u_saturation_boost;
+        if (newL > 200.0) {
+            float t = (newL - 200.0) / (255.0 - 200.0);
+            factor = factor * (1.0 - clamp(t, 0.0, 1.0));
+        }
+        finalRgb = newL + factor * (finalRgb - newL);
+    }
+
+    float maxChan = max(finalRgb.r, max(finalRgb.g, finalRgb.b));
+    if (maxChan > 255.0) {
+        float blendL = luma(finalRgb);
+        if (maxChan - blendL > 1e-4) {
+            float blend = clamp((255.0 - blendL) / (maxChan - blendL), 0.0, 1.0);
+            finalRgb = blendL + blend * (finalRgb - blendL);
+        }
+    }
+
+    // Apply an ISO-adaptive custom gamma correction to balance brightness
+    vec3 gammaRgb = pow(clamp(finalRgb / 255.0, 0.0, 1.0), vec3(1.0 / u_final_gamma)) * 255.0;
+
+    uint uR = uint(clamp(gammaRgb.r, 0.0, 255.0));
+    uint uG = uint(clamp(gammaRgb.g, 0.0, 255.0));
+    uint uB = uint(clamp(gammaRgb.b, 0.0, 255.0));
+
+    uint packedVal = uR | (uG << 8) | (uB << 16) | (255u << 24);
+    outRGB[pos.y * u_width + pos.x] = packedVal;
+}

@@ -94,4 +94,10 @@ dependencies {
 
     // Image loading — Coil
     implementation("io.coil-kt:coil-compose:2.6.0")
+
+    // ML Kit Selfie Segmentation
+    implementation("com.google.mlkit:segmentation-selfie:16.0.0-beta6")
+
+    // MediaPipe Tasks Vision (Multiclass Selfie Segmentation)
+    implementation("com.google.mediapipe:tasks-vision:0.10.14")
 }

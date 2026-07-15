@@ -1,0 +1,169 @@
+#version 310 es
+layout(local_size_x = 16, local_size_y = 16) in;
+
+precision highp float;
+
+layout(std430, binding = 0) readonly buffer InputBuffer {
+    uint inRGB[];
+};
+
+layout(std430, binding = 1) writeonly buffer OutputBuffer {
+    uint outRGB[];
+};
+
+uniform int u_width;
+uniform int u_height;
+uniform float u_spatial_sigma;
+uniform float u_range_sigma;
+uniform int u_denoise_radius;
+uniform float u_luma_h2;
+
+vec3 unpackRGB(uint val) {
+    float r = float(val & 0xFFu);
+    float g = float((val >> 8) & 0xFFu);
+    float b = float((val >> 16) & 0xFFu);
+    return vec3(r, g, b);
+}
+
+float luma(vec3 rgb) {
+    return 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
+}
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    if (pos.x >= u_width || pos.y >= u_height) return;
+
+    uint centerVal = inRGB[pos.y * u_width + pos.x];
+    vec3 centerRgb = unpackRGB(centerVal);
+    float centerL = luma(centerRgb);
+
+    float sumWL = 0.0;
+    float sumL = 0.0;
+    float sumU = 0.0;
+    float sumV = 0.0;
+    float sumWC = 0.0;
+
+    // ── Brightness Gate (Only denoise darker regions) ───────────────────
+    // Denoise normally below 100 luma. Fade to 0 denoising by 150 luma.
+    float brightnessGate = clamp(1.0 - (centerL - 100.0) / 50.0, 0.0, 1.0);
+
+    if (brightnessGate <= 0.0) {
+        // Completely skip denoising for brighter areas (like text on white background)
+        outRGB[pos.y * u_width + pos.x] = centerVal;
+        return;
+    }
+
+    float spatial_sigma2 = 2.0 * u_spatial_sigma * u_spatial_sigma;
+    float range_sigma2 = 2.0 * u_range_sigma * u_range_sigma;
+    // Parabolic boost: stronger at shadows, moderate in midtones
+    float centerLNorm = centerL / 255.0;
+    float boost = 2.0 - 2.5 * centerLNorm * (1.0 - centerLNorm);
+    // Scale denoising parameter h2 by brightnessGate
+    float h2 = u_luma_h2 * boost * brightnessGate;
+    int search_r = 2; // 5x5 luma NLM window
+    int patch_r = 1;  // 3x3 patch
+
+    // ── Texture & Sobel Gradient Gate (Protects low-contrast text) ────────
+    // Measure local variance and calculate Sobel gradient magnitudes
+    float sumLp = 0.0, sumLp2 = 0.0;
+    float gx = 0.0, gy = 0.0;
+    
+    // Sobel kernels:
+    // H: [-1, 0, 1; -2, 0, 2; -1, 0, 1]
+    // V: [-1, -2, -1;  0, 0, 0;  1, 2, 1]
+    float pL_00 = luma(unpackRGB(inRGB[clamp(pos + ivec2(-1, -1), ivec2(0), ivec2(u_width - 1, u_height - 1)).y * u_width + clamp(pos + ivec2(-1, -1), ivec2(0), ivec2(u_width - 1, u_height - 1)).x]));
+    float pL_01 = luma(unpackRGB(inRGB[clamp(pos + ivec2( 0, -1), ivec2(0), ivec2(u_width - 1, u_height - 1)).y * u_width + clamp(pos + ivec2( 0, -1), ivec2(0), ivec2(u_width - 1, u_height - 1)).x]));
+    float pL_02 = luma(unpackRGB(inRGB[clamp(pos + ivec2( 1, -1), ivec2(0), ivec2(u_width - 1, u_height - 1)).y * u_width + clamp(pos + ivec2( 1, -1), ivec2(0), ivec2(u_width - 1, u_height - 1)).x]));
+    
+    float pL_10 = luma(unpackRGB(inRGB[clamp(pos + ivec2(-1,  0), ivec2(0), ivec2(u_width - 1, u_height - 1)).y * u_width + clamp(pos + ivec2(-1,  0), ivec2(0), ivec2(u_width - 1, u_height - 1)).x]));
+    float pL_11 = luma(unpackRGB(inRGB[pos.y * u_width + pos.x]));
+    float pL_12 = luma(unpackRGB(inRGB[clamp(pos + ivec2( 1,  0), ivec2(0), ivec2(u_width - 1, u_height - 1)).y * u_width + clamp(pos + ivec2( 1,  0), ivec2(0), ivec2(u_width - 1, u_height - 1)).x]));
+    
+    float pL_20 = luma(unpackRGB(inRGB[clamp(pos + ivec2(-1,  1), ivec2(0), ivec2(u_width - 1, u_height - 1)).y * u_width + clamp(pos + ivec2(-1,  1), ivec2(0), ivec2(u_width - 1, u_height - 1)).x]));
+    float pL_21 = luma(unpackRGB(inRGB[clamp(pos + ivec2( 0,  1), ivec2(0), ivec2(u_width - 1, u_height - 1)).y * u_width + clamp(pos + ivec2( 0,  1), ivec2(0), ivec2(u_width - 1, u_height - 1)).x]));
+    float pL_22 = luma(unpackRGB(inRGB[clamp(pos + ivec2( 1,  1), ivec2(0), ivec2(u_width - 1, u_height - 1)).y * u_width + clamp(pos + ivec2( 1,  1), ivec2(0), ivec2(u_width - 1, u_height - 1)).x]));
+
+    gx = (pL_02 + 2.0 * pL_12 + pL_22) - (pL_00 + 2.0 * pL_10 + pL_20);
+    gy = (pL_20 + 2.0 * pL_21 + pL_22) - (pL_00 + 2.0 * pL_01 + pL_02);
+    float edgeMagnitude = sqrt(gx * gx + gy * gy);
+
+    // Compute 3x3 variance
+    sumLp = pL_00 + pL_01 + pL_02 + pL_10 + pL_11 + pL_12 + pL_20 + pL_21 + pL_22;
+    sumLp2 = pL_00*pL_00 + pL_01*pL_01 + pL_02*pL_02 + pL_10*pL_10 + pL_11*pL_11 + pL_12*pL_12 + pL_20*pL_20 + pL_21*pL_21 + pL_22*pL_22;
+    float localMean = sumLp / 9.0;
+    float localVar  = max(0.0, sumLp2 / 9.0 - localMean * localMean);
+
+    // textureGate based on variance
+    float textureGate = exp(-localVar / (h2 * 2.0));
+    
+    // edgeGate scales down denoising on structured low-contrast Sobel edges
+    float edgeGate = clamp(1.0 - (edgeMagnitude / 5.0), 0.0, 1.0); 
+
+    // Combine texture variance gating and structured edge gating
+    float effectiveH2 = h2 * textureGate * edgeGate; 
+
+    if (effectiveH2 < 1e-5) {
+        // If no luma denoising is needed, keep the original center luma
+        sumL = centerL;
+        sumWL = 1.0;
+    } else {
+        // ── Luma NLM pass (5x5 search) ────────────────────────────────────────
+        for (int dy = -search_r; dy <= search_r; ++dy) {
+            for (int dx = -search_r; dx <= search_r; ++dx) {
+                ivec2 nPos = clamp(pos + ivec2(dx, dy), ivec2(0), ivec2(u_width - 1, u_height - 1));
+                vec3 nRgb = unpackRGB(inRGB[nPos.y * u_width + nPos.x]);
+                float nL = luma(nRgb);
+
+                // NLM patch SSD for luma
+                float ssd = 0.0;
+                for (int py = -patch_r; py <= patch_r; ++py) {
+                    for (int px = -patch_r; px <= patch_r; ++px) {
+                        ivec2 p1 = clamp(pos + ivec2(px, py), ivec2(0), ivec2(u_width - 1, u_height - 1));
+                        ivec2 p2 = clamp(nPos + ivec2(px, py), ivec2(0), ivec2(u_width - 1, u_height - 1));
+                        float l1 = luma(unpackRGB(inRGB[p1.y * u_width + p1.x]));
+                        float l2 = luma(unpackRGB(inRGB[p2.y * u_width + p2.x]));
+                        float diff = l1 - l2;
+                        ssd += diff * diff;
+                    }
+                }
+                float wL = exp(-(ssd / 9.0) / effectiveH2) * exp(-float(dx*dx + dy*dy) / 12.5);
+                sumL += wL * nL;
+                sumWL += wL;
+            }
+        }
+    }
+
+    // Pure Gaussian chroma blur — radius narrowed by textureGate in detail areas
+    // to prevent colour bleeding across text/edge boundaries
+    int chroma_r = 10; // 21x21 window max
+    // In flat noisy areas: full 5px sigma. In textured areas: narrow to ~1px sigma.
+    float effectiveChromaSigma2 = mix(2.0, 50.0, textureGate);
+    for (int dy = -chroma_r; dy <= chroma_r; ++dy) {
+        for (int dx = -chroma_r; dx <= chroma_r; ++dx) {
+            ivec2 nPos = clamp(pos + ivec2(dx, dy), ivec2(0), ivec2(u_width - 1, u_height - 1));
+            vec3 nRgb = unpackRGB(inRGB[nPos.y * u_width + nPos.x]);
+
+            float dS2 = float(dx * dx + dy * dy);
+            float wC = exp(-dS2 / effectiveChromaSigma2);
+            float nU = -0.1687 * nRgb.r - 0.3313 * nRgb.g + 0.5 * nRgb.b;
+            float nV = 0.5 * nRgb.r - 0.4187 * nRgb.g - 0.0813 * nRgb.b;
+            sumU += wC * nU;
+            sumV += wC * nV;
+            sumWC += wC;
+        }
+    }
+
+    float filteredL = sumL / sumWL;
+    float filteredU = sumU / sumWC;
+    float filteredV = sumV / sumWC;
+
+    float rVal = filteredL + 1.402 * filteredV;
+    float gVal = filteredL - 0.34414 * filteredU - 0.71414 * filteredV;
+    float bVal = filteredL + 1.772 * filteredU;
+
+    uint uR = uint(clamp(rVal, 0.0, 255.0));
+    uint uG = uint(clamp(gVal, 0.0, 255.0));
+    uint uB = uint(clamp(bVal, 0.0, 255.0));
+
+    outRGB[pos.y * u_width + pos.x] = uR | (uG << 8) | (uB << 16) | (255u << 24);
+}

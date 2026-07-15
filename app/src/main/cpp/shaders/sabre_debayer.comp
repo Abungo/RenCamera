@@ -1,0 +1,238 @@
+#version 310 es
+layout(local_size_x = 16, local_size_y = 16) in;
+
+precision highp float;
+precision highp usampler2DArray;
+precision highp sampler2DArray;
+
+uniform usampler2DArray u_raw_frames;
+uniform sampler2DArray u_motion_fields;
+
+uniform int u_num_frames;
+uniform int u_width;
+uniform int u_height;
+uniform int u_blocks_wide;
+uniform int u_blocks_tall;
+uniform float u_block_size;
+
+uniform float u_black_level;
+uniform float u_scale;
+uniform float u_raw_range_sigma;
+uniform float u_r_gain;
+uniform float u_g_gain;
+uniform float u_b_gain;
+uniform int u_cfa_pattern;
+
+layout(std430, binding = 0) writeonly buffer OutputBuffer {
+    uint outRGB[];
+};
+
+int getPixelColor(ivec2 p) {
+    int r = p.y % 2;
+    int c = p.x % 2;
+    if (u_cfa_pattern == 0) { // RGGB
+        if (r == 0 && c == 0) return 0;
+        if (r == 1 && c == 1) return 2;
+        return 1;
+    } else if (u_cfa_pattern == 1) { // GRBG
+        if (r == 0 && c == 1) return 0;
+        if (r == 1 && c == 0) return 2;
+        return 1;
+    } else if (u_cfa_pattern == 2) { // GBRG
+        if (r == 1 && c == 0) return 0;
+        if (r == 0 && c == 1) return 2;
+        return 1;
+    } else { // BGGR (3)
+        if (r == 1 && c == 1) return 0;
+        if (r == 0 && c == 0) return 2;
+        return 1;
+    }
+}
+
+float getRawCorrected(ivec2 p, int frameIdx) {
+    int cx = clamp(p.x, 0, u_width - 1);
+    int cy = clamp(p.y, 0, u_height - 1);
+    uint val = texelFetch(u_raw_frames, ivec3(cx, cy, frameIdx), 0).r;
+    float centerCleanVal = max(0.0, (float(val) - u_black_level) * u_scale);
+
+    // Bayer spatial bilateral filter on same-color pixels
+    float sumVal = 0.0;
+    float sumW = 0.0;
+    
+    float rSigma2 = 2.0 * u_raw_range_sigma * u_raw_range_sigma;
+    float sSigma2 = 2.0 * 1.5 * 1.5;
+
+    for (int dy = -2; dy <= 2; dy += 2) {
+        for (int dx = -2; dx <= 2; dx += 2) {
+            ivec2 np = clamp(p + ivec2(dx, dy), ivec2(0), ivec2(u_width - 1, u_height - 1));
+            uint nRawVal = texelFetch(u_raw_frames, ivec3(np.x, np.y, frameIdx), 0).r;
+            float nCleanVal = max(0.0, (float(nRawVal) - u_black_level) * u_scale);
+
+            float diff = nCleanVal - centerCleanVal;
+            float dS2 = float((dx/2)*(dx/2) + (dy/2)*(dy/2));
+            float w = exp(-dS2 / sSigma2) * exp(-diff*diff / rSigma2);
+
+            sumVal += w * nCleanVal;
+            sumW += w;
+        }
+    }
+    float cleanVal = (sumW > 1e-4) ? (sumVal / sumW) : centerCleanVal;
+
+    int color = getPixelColor(p);
+    if (color == 0) {
+        return cleanVal * u_r_gain;
+    } else if (color == 2) {
+        return cleanVal * u_b_gain;
+    } else {
+        return cleanVal * u_g_gain;
+    }
+}
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    if (pos.x >= u_width || pos.y >= u_height) return;
+
+    // Edge-adaptive kernel: compute horizontal and vertical green gradients on reference frame
+    float gLeft = getRawCorrected(pos + ivec2(-1, 0), 0);
+    float gRight = getRawCorrected(pos + ivec2(1, 0), 0);
+    float gUp = getRawCorrected(pos + ivec2(0, -1), 0);
+    float gDown = getRawCorrected(pos + ivec2(0, 1), 0);
+    float edgeStrength = abs(gLeft - gRight) + abs(gUp - gDown);
+    // Ramps from 3.5 (flat regions, strong denoising) to 8.0 (sharp edges, detail preservation)
+    float kExponent = mix(3.5, 8.0, clamp(edgeStrength / 15.0, 0.0, 1.0));
+
+    float sumR = 0.0, weightR = 0.0;
+    float sumG = 0.0, weightG = 0.0;
+    float sumB = 0.0, weightB = 0.0;
+
+    // 1. Reference frame (Frame 0, pre-fused) local neighborhood contribution
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            ivec2 samplePos = pos + ivec2(dx, dy);
+            if (samplePos.x >= 0 && samplePos.x < u_width && samplePos.y >= 0 && samplePos.y < u_height) {
+                float val = getRawCorrected(samplePos, 0);
+                int color = getPixelColor(samplePos);
+                
+                float dist2 = float(dx * dx + dy * dy);
+                float spatialW = exp(-dist2 * kExponent);
+
+                if (color == 0) {
+                    sumR += val * spatialW;
+                    weightR += spatialW;
+                } else if (color == 1) {
+                    sumG += val * spatialW;
+                    weightG += spatialW;
+                } else {
+                    sumB += val * spatialW;
+                    weightB += spatialW;
+                }
+            }
+        }
+    }
+
+    // 2. Subpixel multi-frame accumulation (with noise weight filtering)
+    float noiseTolerance = 12.f / u_scale; // scaled to RAW pixel domain (12.f out of 255.f)
+    for (int f = 1; f < u_num_frames; ++f) {
+        float bx = (float(pos.x) - u_block_size * 0.5) / u_block_size;
+        float by = (float(pos.y) - u_block_size * 0.5) / u_block_size;
+        vec2 mv_uv = vec2((bx + 0.5) / float(u_blocks_wide), (by + 0.5) / float(u_blocks_tall));
+
+        vec2 mv = texture(u_motion_fields, vec3(mv_uv, float(f - 1))).rg;
+        vec2 targetPos = vec2(pos) + mv;
+        ivec2 centerIdx = ivec2(round(targetPos.x), round(targetPos.y));
+
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                ivec2 samplePos = centerIdx + ivec2(dx, dy);
+                if (samplePos.x >= 0 && samplePos.x < u_width && samplePos.y >= 0 && samplePos.y < u_height) {
+                    float val = getRawCorrected(samplePos, f);
+                    
+                    // Compare against reference pixel to reject noise and motion mismatches
+                    ivec2 refSamplePos = pos + ivec2(dx, dy);
+                    float refVal = getRawCorrected(clamp(refSamplePos, ivec2(0), ivec2(u_width - 1, u_height - 1)), 0);
+                    float diff = abs(val - refVal);
+                    
+                    // Smoothly reject unaligned/noisy pixels
+                    float weightFactor = exp(-diff * diff / (2.f * noiseTolerance * noiseTolerance));
+                    if (weightFactor < 0.2) continue; // Tightened threshold from 0.1 to 0.2
+
+                    int color = getPixelColor(samplePos);
+
+                    vec2 delta = vec2(samplePos) - targetPos;
+                    float dist2 = dot(delta, delta);
+                    float spatialW = exp(-dist2 * kExponent) * weightFactor;
+
+                    if (color == 0) {
+                        sumR += val * spatialW;
+                        weightR += spatialW;
+                    } else if (color == 1) {
+                        sumG += val * spatialW;
+                        weightG += spatialW;
+                    } else {
+                        sumB += val * spatialW;
+                        weightB += spatialW;
+                    }
+                }
+            }
+        }
+    }
+
+    float finalR = (weightR > 0.01) ? (sumR / weightR) : 0.0;
+    float finalG = (weightG > 0.01) ? (sumG / weightG) : 0.0;
+    float finalB = (weightB > 0.01) ? (sumB / weightB) : 0.0;
+
+    // Fallback to high-quality local demosaicing if any channel lacks enough samples
+    bool needR = (weightR <= 0.2);
+    bool needG = (weightG <= 0.2);
+    bool needB = (weightB <= 0.2);
+
+    if (needR || needG || needB) {
+        int r = pos.y;
+        int c = pos.x;
+        bool isEvenRow = (r % 2 == 0);
+        bool isEvenCol = (c % 2 == 0);
+
+        float fallbackR = 0.0;
+        float fallbackG = 0.0;
+        float fallbackB = 0.0;
+
+        if (isEvenRow && isEvenCol) {
+            fallbackB = getRawCorrected(pos, 0);
+            fallbackG = (getRawCorrected(ivec2(c-1, r), 0) + getRawCorrected(ivec2(c+1, r), 0) + getRawCorrected(ivec2(c, r-1), 0) + getRawCorrected(ivec2(c, r+1), 0)) * 0.25 + 
+                        (4.0 * fallbackB - getRawCorrected(ivec2(c-2, r), 0) - getRawCorrected(ivec2(c+2, r), 0) - getRawCorrected(ivec2(c, r-2), 0) - getRawCorrected(ivec2(c, r+2), 0)) * 0.125;
+            fallbackR = (getRawCorrected(ivec2(c-1, r-1), 0) + getRawCorrected(ivec2(c+1, r-1), 0) + getRawCorrected(ivec2(c-1, r+1), 0) + getRawCorrected(ivec2(c+1, r+1), 0)) * 0.25 + 
+                        (6.0 * fallbackB - 1.5 * (getRawCorrected(ivec2(c-2, r), 0) + getRawCorrected(ivec2(c+2, r), 0) + getRawCorrected(ivec2(c, r-2), 0) + getRawCorrected(ivec2(c, r+2), 0))) * 0.0625;
+        } else if (!isEvenRow && !isEvenCol) {
+            fallbackR = getRawCorrected(pos, 0);
+            fallbackG = (getRawCorrected(ivec2(c-1, r), 0) + getRawCorrected(ivec2(c+1, r), 0) + getRawCorrected(ivec2(c, r-1), 0) + getRawCorrected(ivec2(c, r+1), 0)) * 0.25 + 
+                        (4.0 * fallbackR - getRawCorrected(ivec2(c-2, r), 0) - getRawCorrected(ivec2(c+2, r), 0) - getRawCorrected(ivec2(c, r-2), 0) - getRawCorrected(ivec2(c, r+2), 0)) * 0.125;
+            fallbackB = (getRawCorrected(ivec2(c-1, r-1), 0) + getRawCorrected(ivec2(c+1, r-1), 0) + getRawCorrected(ivec2(c-1, r+1), 0) + getRawCorrected(ivec2(c+1, r+1), 0)) * 0.25 + 
+                        (6.0 * fallbackR - 1.5 * (getRawCorrected(ivec2(c-2, r), 0) + getRawCorrected(ivec2(c+2, r), 0) + getRawCorrected(ivec2(c, r-2), 0) + getRawCorrected(ivec2(c, r+2), 0))) * 0.0625;
+        } else if (isEvenRow && !isEvenCol) {
+            fallbackG = getRawCorrected(pos, 0);
+            fallbackB = (getRawCorrected(ivec2(c-1, r), 0) + getRawCorrected(ivec2(c+1, r), 0)) * 0.5 + 
+                        (2.0 * fallbackG - getRawCorrected(ivec2(c-2, r), 0) - getRawCorrected(ivec2(c+2, r), 0)) * 0.125;
+            fallbackR = (getRawCorrected(ivec2(c, r-1), 0) + getRawCorrected(ivec2(c, r+1), 0)) * 0.5 + 
+                        (2.0 * fallbackG - getRawCorrected(ivec2(c, r-2), 0) - getRawCorrected(ivec2(c, r+2), 0)) * 0.125;
+        } else {
+            fallbackG = getRawCorrected(pos, 0);
+            fallbackR = (getRawCorrected(ivec2(c-1, r), 0) + getRawCorrected(ivec2(c+1, r), 0)) * 0.5 + 
+                        (2.0 * fallbackG - getRawCorrected(ivec2(c-2, r), 0) - getRawCorrected(ivec2(c+2, r), 0)) * 0.125;
+            fallbackB = (getRawCorrected(ivec2(c, r-1), 0) + getRawCorrected(ivec2(c, r+1), 0)) * 0.5 + 
+                        (2.0 * fallbackG - getRawCorrected(ivec2(c, r-2), 0) - getRawCorrected(ivec2(c, r+2), 0)) * 0.125;
+        }
+
+        if (needR) finalR = fallbackR;
+        if (needG) finalG = fallbackG;
+        if (needB) finalB = fallbackB;
+    }
+
+    vec3 sensorRgb = vec3(finalR, finalG, finalB);
+
+    uint uR = uint(clamp(sensorRgb.r, 0.0, 255.0));
+    uint uG = uint(clamp(sensorRgb.g, 0.0, 255.0));
+    uint uB = uint(clamp(sensorRgb.b, 0.0, 255.0));
+
+    uint packedVal = uR | (uG << 8) | (uB << 16) | (255u << 24);
+    outRGB[pos.y * u_width + pos.x] = packedVal;
+}

@@ -4,7 +4,11 @@ import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.Canvas
+import android.graphics.Paint
 import android.media.Image
 import android.os.Build
 import android.os.IBinder
@@ -13,6 +17,7 @@ import androidx.core.app.NotificationCompat
 import androidx.exifinterface.media.ExifInterface
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import java.io.FileOutputStream
 import java.nio.ByteBuffer
 
 /**
@@ -279,6 +284,197 @@ class ProcessingService : Service() {
                         Log.e(TAG, "Failed to write details to log file", e)
                     }
                 }
+                // Run portrait selfie segmentation immediately after native pipeline completes
+                if (job.config.debugImagesEnabled && res != null) {
+                    try {
+                        val options = BitmapFactory.Options().apply {
+                            inSampleSize = 4 // Decode at 1/4 size to execute quickly and fit heap limits
+                        }
+                        val bmp = BitmapFactory.decodeByteArray(res, 0, res.size, options)
+                        if (bmp != null) {
+                            Log.i(TAG, "Running Selfie Segmentation on fully fused output (${bmp.width}x${bmp.height})")
+                            val segmenter = ImageSegmenterHelper(this@ProcessingService)
+                            val segResult = segmenter.segmentImage(bmp)
+                            if (segResult != null) {
+                                // ==========================================
+                                // LEVEL 1: Main Subject Segmentation (Foreground vs Background)
+                                // ==========================================
+                                val subjectMaskBmp = Bitmap.createBitmap(segResult.width, segResult.height, Bitmap.Config.ARGB_8888)
+                                val subjectMaskPixels = IntArray(segResult.width * segResult.height)
+                                for (i in subjectMaskPixels.indices) {
+                                    val classVal = segResult.bytes[i].toInt() and 0xFF
+                                    // Main Subject includes: Hair (1), Body (2), Face (3), Clothes (4), Others (5)
+                                    val isSubject = (classVal in 1..5)
+                                    val grayVal = if (isSubject) 255 else 0
+                                    subjectMaskPixels[i] = Color.rgb(grayVal, grayVal, grayVal)
+                                }
+                                subjectMaskBmp.setPixels(subjectMaskPixels, 0, segResult.width, 0, 0, segResult.width, segResult.height)
+                                
+                                val subjectMaskFile = java.io.File(rawDir, "segmentation_subject_mask.jpg")
+                                FileOutputStream(subjectMaskFile).use { out ->
+                                    subjectMaskBmp.compress(Bitmap.CompressFormat.JPEG, 90, out)
+                                }
+                                subjectMaskBmp.recycle()
+
+                                // Fused visualization for Level 1 (Green overlay for entire subject)
+                                val subjectFusedBmp = bmp.copy(Bitmap.Config.ARGB_8888, true)
+                                val subjectCanvas = Canvas(subjectFusedBmp)
+                                val subjectPaint = Paint().apply {
+                                    color = Color.argb(120, 0, 255, 0) // Semi-transparent green
+                                    style = Paint.Style.FILL
+                                }
+                                for (y in 0 until segResult.height) {
+                                    for (x in 0 until segResult.width) {
+                                        val classVal = segResult.bytes[y * segResult.width + x].toInt() and 0xFF
+                                        if (classVal in 1..5) {
+                                            subjectCanvas.drawPoint(x.toFloat(), y.toFloat(), subjectPaint)
+                                        }
+                                    }
+                                }
+                                
+                                // Label for Subject Fused Mask
+                                val subjectLabelPaint = Paint().apply {
+                                    color = Color.GREEN
+                                    textSize = (segResult.height / 32f).coerceAtLeast(16f)
+                                    isAntiAlias = true
+                                    style = Paint.Style.FILL
+                                    typeface = android.graphics.Typeface.DEFAULT_BOLD
+                                }
+                                val subjectText = "SUBJECT (Foreground)"
+                                val subjectTextBounds = android.graphics.Rect()
+                                subjectLabelPaint.getTextBounds(subjectText, 0, subjectText.length, subjectTextBounds)
+                                val subjectPadding = 12f
+                                val subjectStartX = 24f
+                                val subjectStartY = 24f + subjectTextBounds.height()
+                                val subjectBgPaint = Paint().apply {
+                                    color = Color.BLACK
+                                    alpha = 180
+                                    style = Paint.Style.FILL
+                                }
+                                subjectCanvas.drawRect(
+                                    subjectStartX - subjectPadding,
+                                    subjectStartY - subjectTextBounds.height() - subjectPadding,
+                                    subjectStartX + subjectTextBounds.width() + subjectPadding,
+                                    subjectStartY + subjectPadding,
+                                    subjectBgPaint
+                                )
+                                subjectCanvas.drawText(subjectText, subjectStartX, subjectStartY, subjectLabelPaint)
+
+                                val subjectFusedFile = java.io.File(rawDir, "segmentation_subject_fused.jpg")
+                                FileOutputStream(subjectFusedFile).use { out ->
+                                    subjectFusedBmp.compress(Bitmap.CompressFormat.JPEG, 90, out)
+                                }
+                                subjectFusedBmp.recycle()
+
+                                // ==========================================
+                                // LEVEL 2: Finer Multiclass Segmentation
+                                // ==========================================
+                                // Save Category Mask as an Image representation where each class gets a custom pixel value for diagnostics
+                                val maskBmp = Bitmap.createBitmap(segResult.width, segResult.height, Bitmap.Config.ARGB_8888)
+                                val maskPixels = IntArray(segResult.width * segResult.height)
+                                for (i in maskPixels.indices) {
+                                    val classVal = segResult.bytes[i].toInt() and 0xFF
+                                    // Map categories to high-contrast grayscale steps
+                                    val grayVal = when (classVal) {
+                                        1 -> 50   // Hair
+                                        2 -> 100  // Body
+                                        3 -> 150  // Face
+                                        4 -> 200  // Clothes
+                                        5 -> 255  // Others
+                                        else -> 0 // Background
+                                    }
+                                    maskPixels[i] = Color.rgb(grayVal, grayVal, grayVal)
+                                }
+                                maskBmp.setPixels(maskPixels, 0, segResult.width, 0, 0, segResult.width, segResult.height)
+                                
+                                val maskFile = java.io.File(rawDir, "segmentation_mask.jpg")
+                                FileOutputStream(maskFile).use { out ->
+                                    maskBmp.compress(Bitmap.CompressFormat.JPEG, 90, out)
+                                }
+                                maskBmp.recycle()
+
+                                // Create fused mask visualization (overlay mask directly onto the color image with distinct translucent colors)
+                                val fusedBmp = bmp.copy(Bitmap.Config.ARGB_8888, true)
+                                val canvas = Canvas(fusedBmp)
+
+                                val hairPaint = Paint().apply { color = Color.argb(100, 255, 0, 0); style = Paint.Style.FILL }       // Red for Hair
+                                val bodyPaint = Paint().apply { color = Color.argb(100, 0, 0, 255); style = Paint.Style.FILL }       // Blue for Body
+                                val facePaint = Paint().apply { color = Color.argb(100, 0, 255, 255); style = Paint.Style.FILL }     // Cyan for Face
+                                val clothesPaint = Paint().apply { color = Color.argb(100, 255, 255, 0); style = Paint.Style.FILL }  // Yellow for Clothes
+                                val othersPaint = Paint().apply { color = Color.argb(100, 255, 0, 255); style = Paint.Style.FILL }   // Magenta for Accessories
+
+                                // Overlay category mask pixels
+                                for (y in 0 until segResult.height) {
+                                    for (x in 0 until segResult.width) {
+                                        val classVal = segResult.bytes[y * segResult.width + x].toInt() and 0xFF
+                                        when (classVal) {
+                                            1 -> canvas.drawPoint(x.toFloat(), y.toFloat(), hairPaint)
+                                            2 -> canvas.drawPoint(x.toFloat(), y.toFloat(), bodyPaint)
+                                            3 -> canvas.drawPoint(x.toFloat(), y.toFloat(), facePaint)
+                                            4 -> canvas.drawPoint(x.toFloat(), y.toFloat(), clothesPaint)
+                                            5 -> canvas.drawPoint(x.toFloat(), y.toFloat(), othersPaint)
+                                        }
+                                    }
+                                }
+
+                                // Draw labels at the top left corner in a legend layout
+                                val labelSize = (segResult.height / 38f).coerceAtLeast(14f)
+                                val legendItems = listOf(
+                                    Pair("HAIR (Red)", Color.RED),
+                                    Pair("FACE (Cyan)", Color.CYAN),
+                                    Pair("BODY (Blue)", Color.BLUE),
+                                    Pair("CLOTHES (Yellow)", Color.YELLOW),
+                                    Pair("OTHERS (Magenta)", Color.MAGENTA)
+                                )
+
+                                var currentY = 24f
+                                for (item in legendItems) {
+                                    val labelPaint = Paint().apply {
+                                        color = item.second
+                                        textSize = labelSize
+                                        isAntiAlias = true
+                                        style = Paint.Style.FILL
+                                        typeface = android.graphics.Typeface.DEFAULT_BOLD
+                                    }
+                                    val text = item.first
+                                    val textBounds = android.graphics.Rect()
+                                    labelPaint.getTextBounds(text, 0, text.length, textBounds)
+
+                                    val padding = 6f
+                                    val startX = 24f
+                                    currentY += textBounds.height() + padding * 2
+
+                                    val bgPaint = Paint().apply {
+                                        color = Color.BLACK
+                                        alpha = 180
+                                        style = Paint.Style.FILL
+                                    }
+                                    canvas.drawRect(
+                                        startX - padding,
+                                        currentY - textBounds.height() - padding,
+                                        startX + textBounds.width() + padding,
+                                        currentY + padding,
+                                        bgPaint
+                                    )
+                                    canvas.drawText(text, startX, currentY, labelPaint)
+                                    currentY += padding
+                                }
+
+                                val fusedFile = java.io.File(rawDir, "segmentation_fused_mask.jpg")
+                                FileOutputStream(fusedFile).use { out ->
+                                    fusedBmp.compress(Bitmap.CompressFormat.JPEG, 90, out)
+                                }
+                                fusedBmp.recycle()
+                                segmenter.close()
+                                Log.i(TAG, "Dumping multi-class segmentation mask debug images completed.")
+                            }
+                            bmp.recycle()
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed running image portrait segmenter callback", e)
+                    }
+                }
+
                 res
             }
             

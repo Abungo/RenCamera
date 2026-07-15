@@ -1,0 +1,86 @@
+#version 310 es
+layout(local_size_x = 16, local_size_y = 16) in;
+
+precision highp float;
+precision highp sampler2D;
+
+uniform sampler2D u_input_texture;
+uniform int u_width;
+uniform int u_height;
+uniform float u_S;
+uniform float u_O;
+uniform float u_strength_multiplier;
+
+layout(rgba8, binding = 0) writeonly uniform image2D u_output_image;
+
+float luma(vec3 rgb) {
+    return 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
+}
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    if (pos.x >= u_width || pos.y >= u_height) return;
+
+    float sumW = 0.0;
+    vec3 sumRGB = vec3(0.0);
+
+    int search_r = 2; // 5x5 search window
+    int patch_r = 1;  // 3x3 patch
+
+    vec3 centerColor = texelFetch(u_input_texture, pos, 0).rgb;
+    float centerL = luma(centerColor);
+
+    // Parabolic boost curve to strengthen NLM in both shadows and highlights
+    float boost = 1.5 - 2.0 * centerL * (1.0 - centerL);
+    float h2 = (u_S * centerL + u_O) * u_strength_multiplier * boost;
+    if (h2 < 1e-6) h2 = 1e-6;
+
+    // ── Texture-Aware Variance Gate ───────────────────────────────────────
+    // Compute local 3x3 variance. Text/detail has high variance >> noise level.
+    // Only denoise where localVar ≈ noise variance (flat noisy region).
+    float sumLp = 0.0, sumLp2 = 0.0;
+    for (int py = -1; py <= 1; ++py) {
+        for (int px = -1; px <= 1; ++px) {
+            ivec2 pp = clamp(pos + ivec2(px, py), ivec2(0), ivec2(u_width - 1, u_height - 1));
+            float pL = luma(texelFetch(u_input_texture, pp, 0).rgb);
+            sumLp  += pL;
+            sumLp2 += pL * pL;
+        }
+    }
+    float localMean = sumLp / 9.0;
+    float localVar  = max(0.0, sumLp2 / 9.0 - localMean * localMean);
+
+    // textureGate → 1.0 in flat noisy areas, → 0.0 in textured/detail areas
+    float textureGate = exp(-localVar / (h2 * 0.5));
+    float effectiveH2 = h2 * max(0.05, textureGate);
+
+    for (int dy = -search_r; dy <= search_r; ++dy) {
+        for (int dx = -search_r; dx <= search_r; ++dx) {
+            ivec2 nPos = pos + ivec2(dx, dy);
+            nPos = clamp(nPos, ivec2(0), ivec2(u_width - 1, u_height - 1));
+
+            float ssd = 0.0;
+            for (int py = -patch_r; py <= patch_r; ++py) {
+                for (int px = -patch_r; px <= patch_r; ++px) {
+                    ivec2 p1 = clamp(pos + ivec2(px, py), ivec2(0), ivec2(u_width - 1, u_height - 1));
+                    ivec2 p2 = clamp(nPos + ivec2(px, py), ivec2(0), ivec2(u_width - 1, u_height - 1));
+
+                    float l1 = luma(texelFetch(u_input_texture, p1, 0).rgb);
+                    float l2 = luma(texelFetch(u_input_texture, p2, 0).rgb);
+
+                    float diff = l1 - l2;
+                    ssd += diff * diff;
+                }
+            }
+
+            // Spatial-bilateral NLM using texture-gated effectiveH2
+            float w = exp(-(ssd / 9.0) / effectiveH2) * exp(-float(dx*dx + dy*dy) / 12.5);
+            vec3 nColor = texelFetch(u_input_texture, nPos, 0).rgb;
+
+            sumRGB += w * nColor;
+            sumW += w;
+        }
+    }
+
+    imageStore(u_output_image, pos, vec4(sumRGB / sumW, 1.0));
+}
