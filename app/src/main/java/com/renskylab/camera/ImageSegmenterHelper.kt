@@ -41,7 +41,7 @@ class ImageSegmenterHelper(private val context: Context) {
                 .setBaseOptions(baseOptions)
                 .setRunningMode(com.google.mediapipe.tasks.vision.core.RunningMode.IMAGE)
                 .setOutputCategoryMask(true)
-                .setOutputConfidenceMasks(false)
+                .setOutputConfidenceMasks(true) // Enable confidence masks output for alpha calculations
                 .build()
 
             segmenter = ImageSegmenter.createFromOptions(context, options)

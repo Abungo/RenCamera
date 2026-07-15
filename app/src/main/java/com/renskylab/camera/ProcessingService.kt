@@ -455,26 +455,32 @@ class ProcessingService : Service() {
                                         val options = ImageSegmenter.ImageSegmenterOptions.builder()
                                             .setBaseOptions(selfieOptions)
                                             .setRunningMode(com.google.mediapipe.tasks.vision.core.RunningMode.IMAGE)
-                                            .setOutputCategoryMask(true)
-                                            .setOutputConfidenceMasks(false)
+                                            .setOutputCategoryMask(false)
+                                            .setOutputConfidenceMasks(true)
                                             .build()
                                         val selfieSegmenter = ImageSegmenter.createFromOptions(this@ProcessingService, options)
                                         val selfieResult = selfieSegmenter.segment(com.google.mediapipe.framework.image.BitmapImageBuilder(bmp).build())
-                                        val categoryMask = selfieResult.categoryMask().orElse(null) as? MPImage
-                                        if (categoryMask != null) {
-                                            val sW = categoryMask.width
-                                            val sH = categoryMask.height
-                                            val byteBuffer = com.google.mediapipe.framework.image.ByteBufferExtractor.extract(categoryMask)
-                                            val selfieBytes = ByteArray(sW * sH)
-                                            byteBuffer.rewind()
-                                            byteBuffer.get(selfieBytes, 0, selfieBytes.size)
+                                        val confidenceMasks = selfieResult.confidenceMasks().orElse(null)
+                                        if (confidenceMasks != null && confidenceMasks.size >= 6) {
+                                            // Retrieve dimensions of confidence mask 0 (always matches all channels)
+                                            val firstMask = confidenceMasks[0]
+                                            val sW = firstMask.width
+                                            val sH = firstMask.height
 
-                                            // Setup paints for selfie regions
-                                            val sHairPaint = Paint().apply { color = Color.argb(130, 255, 50, 50); style = Paint.Style.FILL }     // Bright Red
-                                            val sFacePaint = Paint().apply { color = Color.argb(130, 50, 255, 255); style = Paint.Style.FILL }    // Bright Cyan
-                                            val sBodyPaint = Paint().apply { color = Color.argb(130, 50, 50, 255); style = Paint.Style.FILL }     // Bright Blue
-                                            val sClothesPaint = Paint().apply { color = Color.argb(130, 255, 255, 50); style = Paint.Style.FILL }  // Bright Yellow
-                                            val sOthersPaint = Paint().apply { color = Color.argb(130, 255, 50, 255); style = Paint.Style.FILL }   // Bright Magenta
+                                            // Extract byte buffers for each target class
+                                            // 1: Hair, 2: Body, 3: Face, 4: Clothes, 5: Others
+                                            val buffers = Array(6) { idx ->
+                                                val byteBuf = com.google.mediapipe.framework.image.ByteBufferExtractor.extract(confidenceMasks[idx])
+                                                byteBuf.rewind()
+                                                byteBuf.asFloatBuffer()
+                                            }
+
+                                            // Setup base paints for selfie regions
+                                            val baseHairPaint = Paint().apply { style = Paint.Style.FILL }
+                                            val baseFacePaint = Paint().apply { style = Paint.Style.FILL }
+                                            val baseBodyPaint = Paint().apply { style = Paint.Style.FILL }
+                                            val baseClothesPaint = Paint().apply { style = Paint.Style.FILL }
+                                            val baseOthersPaint = Paint().apply { style = Paint.Style.FILL }
 
                                             // Map coordinate scaling between DeepLab mask resolution and Selfie mask resolution if they differ
                                             for (y in 0 until sH) {
@@ -485,13 +491,48 @@ class ProcessingService : Service() {
                                                     val dlClassVal = segResult.bytes[dlY * segResult.width + dlX].toInt() and 0xFF
 
                                                     if (dlClassVal == 15) { // Only refine inside DeepLab's Person region
-                                                        val selfieVal = selfieBytes[y * sW + x].toInt() and 0xFF
-                                                        when (selfieVal) {
-                                                            1 -> canvas.drawPoint(dlX.toFloat(), dlY.toFloat(), sHairPaint)
-                                                            2 -> canvas.drawPoint(dlX.toFloat(), dlY.toFloat(), sBodyPaint)
-                                                            3 -> canvas.drawPoint(dlX.toFloat(), dlY.toFloat(), sFacePaint)
-                                                            4 -> canvas.drawPoint(dlX.toFloat(), dlY.toFloat(), sClothesPaint)
-                                                            5 -> canvas.drawPoint(dlX.toFloat(), dlY.toFloat(), sOthersPaint)
+                                                        val pixelIndex = y * sW + x
+                                                        
+                                                        // Access confidence levels for each class
+                                                        val confHair = buffers[1].get(pixelIndex).coerceIn(0.0f, 1.0f)
+                                                        val confBody = buffers[2].get(pixelIndex).coerceIn(0.0f, 1.0f)
+                                                        val confFace = buffers[3].get(pixelIndex).coerceIn(0.0f, 1.0f)
+                                                        val confClothes = buffers[4].get(pixelIndex).coerceIn(0.0f, 1.0f)
+                                                        val confOthers = buffers[5].get(pixelIndex).coerceIn(0.0f, 1.0f)
+
+                                                        // Find the winning class for this pixel
+                                                        var maxConf = 0.2f // confidence threshold
+                                                        var winningClass = 0
+                                                        if (confHair > maxConf) { maxConf = confHair; winningClass = 1 }
+                                                        if (confBody > maxConf) { maxConf = confBody; winningClass = 2 }
+                                                        if (confFace > maxConf) { maxConf = confFace; winningClass = 3 }
+                                                        if (confClothes > maxConf) { maxConf = confClothes; winningClass = 4 }
+                                                        if (confOthers > maxConf) { maxConf = confOthers; winningClass = 5 }
+
+                                                        if (winningClass > 0) {
+                                                            val alphaVal = (maxConf * 130).toInt()
+                                                            when (winningClass) {
+                                                                1 -> {
+                                                                    baseHairPaint.color = Color.argb(alphaVal, 255, 50, 50)
+                                                                    canvas.drawPoint(dlX.toFloat(), dlY.toFloat(), baseHairPaint)
+                                                                }
+                                                                2 -> {
+                                                                    baseBodyPaint.color = Color.argb(alphaVal, 50, 50, 255)
+                                                                    canvas.drawPoint(dlX.toFloat(), dlY.toFloat(), baseBodyPaint)
+                                                                }
+                                                                3 -> {
+                                                                    baseFacePaint.color = Color.argb(alphaVal, 50, 255, 255)
+                                                                    canvas.drawPoint(dlX.toFloat(), dlY.toFloat(), baseFacePaint)
+                                                                }
+                                                                4 -> {
+                                                                    baseClothesPaint.color = Color.argb(alphaVal, 255, 255, 50)
+                                                                    canvas.drawPoint(dlX.toFloat(), dlY.toFloat(), baseClothesPaint)
+                                                                }
+                                                                5 -> {
+                                                                    baseOthersPaint.color = Color.argb(alphaVal, 255, 50, 255)
+                                                                    canvas.drawPoint(dlX.toFloat(), dlY.toFloat(), baseOthersPaint)
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                 }
