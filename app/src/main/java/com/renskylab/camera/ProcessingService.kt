@@ -433,6 +433,7 @@ class ProcessingService : Service() {
 
                                 // Overlay category mask pixels
                                 var containsPerson = false
+                                val detectedClasses = mutableSetOf<Int>()
                                 for (y in 0 until segResult.height) {
                                     for (x in 0 until segResult.width) {
                                         val classVal = segResult.bytes[y * segResult.width + x].toInt() and 0xFF
@@ -440,7 +441,10 @@ class ProcessingService : Service() {
                                             containsPerson = true
                                         }
                                         if (classVal in 1..20) {
-                                            canvas.drawPoint(x.toFloat(), y.toFloat(), paints[classVal])
+                                            detectedClasses.add(classVal)
+                                            if (classVal != 15) { // Skip drawing general "Person" mask to avoid overlaying DeepLab's color under selfie details
+                                                canvas.drawPoint(x.toFloat(), y.toFloat(), paints[classVal])
+                                            }
                                         }
                                     }
                                 }
@@ -546,21 +550,33 @@ class ProcessingService : Service() {
 
                                 // Draw labels at the top left corner in a legend layout
                                 val labelSize = (segResult.height / 38f).coerceAtLeast(14f)
-                                // We list key labels of interest on the overlay
-                                val legendItems = mutableListOf(
-                                    Pair("CAT (Blue)", Color.BLUE),
-                                    Pair("DOG (Cyan)", Color.CYAN),
-                                    Pair("BOTTLE (Yellow)", Color.YELLOW),
-                                    Pair("CHAIR (Magenta)", Color.MAGENTA),
-                                    Pair("TV (Orange)", Color.rgb(255, 128, 0))
-                                )
+                                
+                                // Build dynamic legend items list based on actually detected classes
+                                val legendItems = mutableListOf<Pair<String, Int>>()
+                                
                                 if (containsPerson) {
-                                    legendItems.add(0, Pair("PERSON HAIR (Red)", Color.RED))
-                                    legendItems.add(1, Pair("PERSON FACE (Cyan)", Color.CYAN))
-                                    legendItems.add(2, Pair("PERSON BODY (Blue)", Color.BLUE))
-                                    legendItems.add(3, Pair("PERSON CLOTHES (Yellow)", Color.YELLOW))
-                                } else {
-                                    legendItems.add(0, Pair("PERSON (Red)", Color.RED))
+                                    legendItems.add(Pair("PERSON HAIR (Red)", Color.RED))
+                                    legendItems.add(Pair("PERSON FACE (Cyan)", Color.CYAN))
+                                    legendItems.add(Pair("PERSON BODY (Blue)", Color.BLUE))
+                                    legendItems.add(Pair("PERSON CLOTHES (Yellow)", Color.YELLOW))
+                                } else if (detectedClasses.contains(15)) {
+                                    legendItems.add(Pair("PERSON (Red)", Color.RED))
+                                }
+
+                                if (detectedClasses.contains(8)) {
+                                    legendItems.add(Pair("CAT (Blue)", Color.BLUE))
+                                }
+                                if (detectedClasses.contains(12)) {
+                                    legendItems.add(Pair("DOG (Cyan)", Color.CYAN))
+                                }
+                                if (detectedClasses.contains(5)) {
+                                    legendItems.add(Pair("BOTTLE (Yellow)", Color.YELLOW))
+                                }
+                                if (detectedClasses.contains(9)) {
+                                    legendItems.add(Pair("CHAIR (Magenta)", Color.MAGENTA))
+                                }
+                                if (detectedClasses.contains(20)) {
+                                    legendItems.add(Pair("TV (Orange)", Color.rgb(255, 128, 0)))
                                 }
 
                                 var currentY = 24f
