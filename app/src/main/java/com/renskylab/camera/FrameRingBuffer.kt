@@ -2,6 +2,8 @@ package com.renskylab.camera
 
 import android.media.Image
 
+import android.hardware.camera2.TotalCaptureResult
+
 /**
  * Wraps a Camera2 [Image] along with its capture metadata (ISO, exposure time).
  * 
@@ -9,12 +11,14 @@ import android.media.Image
  * @property iso The ISO speed value calculated for this specific captured frame.
  * @property exposureTimeNs The sensor exposure integration duration in nanoseconds.
  * @property noiseProfile Float array containing sensor calibration coefficients used for noise reduction.
+ * @property captureResult Optional metadata containing AWB, gains, CCM, and other characteristics.
  */
 data class CapturedFrame(
     val image: Image,
     val iso: Int,
     val exposureTimeNs: Long,
-    val noiseProfile: FloatArray? = null // size 8 (4 pairs of S and O noise coefficients)
+    val noiseProfile: FloatArray? = null, // size 8 (4 pairs of S and O noise coefficients)
+    val captureResult: TotalCaptureResult? = null
 )
 
 /**

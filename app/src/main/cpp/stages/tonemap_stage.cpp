@@ -247,17 +247,18 @@ bool ToneMapStage::process(FrameContext& ctx) {
     int w = ctx.colorImage.width;
     int h = ctx.colorImage.height;
 
-    // Calculate scene key (average luminance)
-    double lumaSum = 0;
+    // Calculate scene key (logarithmic mean luminance to be robust against small bright highlights)
+    double logLumaSum = 0;
     uint64_t lumaCount = 0;
     for (int r = 0; r < h; r += 8) {
         const uint8_t* row = ctx.colorImage.rowPtr(r);
         for (int c = 0; c < w; c += 8) {
-            lumaSum += luma(row[c*3], row[c*3+1], row[c*3+2]);
+            float l = luma(row[c*3], row[c*3+1], row[c*3+2]);
+            logLumaSum += std::logf(l + 1.f);
             lumaCount++;
         }
     }
-    float meanL = (lumaCount > 0) ? static_cast<float>(lumaSum / lumaCount) : 10.f;
+    float meanL = (lumaCount > 0) ? (std::expf(static_cast<float>(logLumaSum / lumaCount)) - 1.f) : 10.f;
 
     bool isNight = false;
     if (ctx.metadata.count("night_mode")) {
@@ -268,8 +269,8 @@ bool ToneMapStage::process(FrameContext& ctx) {
 
     // Adapt gamma based on actual scene brightness
     // Darker scenes get a stronger shadow boost, brighter scenes stay natural.
-    float gammaMin = isNight ? 0.55f : 0.65f;
-    float gammaMax = isNight ? 0.80f : 0.95f;
+    float gammaMin = isNight ? 0.45f : 0.50f;
+    float gammaMax = isNight ? 0.65f : 0.70f;
 
     float t_mean = std::clamp((meanL - 10.f) / (80.f - 10.f), 0.f, 1.f);
     float adaptiveGamma = gammaMin + t_mean * (gammaMax - gammaMin);
@@ -309,33 +310,129 @@ bool ToneMapStage::process(FrameContext& ctx) {
         } catch (...) {}
     }
 
+    std::vector<float> ccm = {
+        1.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 1.0f
+    };
+    if (ctx.metadata.count("color_correction_matrix")) {
+        try {
+            ccm = std::any_cast<std::vector<float>>(ctx.metadata.at("color_correction_matrix"));
+        } catch (...) {}
+    }
+
     float appliedEvCompensation = 0.0f;
     if (ctx.metadata.count("applied_ev_compensation")) {
         try {
             appliedEvCompensation = std::any_cast<float>(ctx.metadata.at("applied_ev_compensation"));
         } catch (...) {}
     }
+    int iso = 100;
+    if (ctx.metadata.count("iso")) {
+        try {
+            iso = std::any_cast<int>(ctx.metadata.at("iso"));
+        } catch (...) {}
+    }
+
+    float digitalGain = 1.0f;
+    if (ctx.metadata.count("digital_gain")) {
+        try { digitalGain = std::any_cast<float>(ctx.metadata.at("digital_gain")); } catch (...) {}
+    }
+    float effectiveIso = iso * digitalGain;
+
+    // ISO-adaptive luma denoise parameters (bilateral filter) using effectiveIso
+    float spatialSigma = 2.0f + (effectiveIso / 100.0f) * 0.1f;
+    spatialSigma = std::clamp(spatialSigma, 2.0f, 4.0f);
+
+    float rangeSigma = 6.0f + (effectiveIso / 100.0f) * 1.5f;
+    rangeSigma = std::clamp(rangeSigma, 6.0f, 35.0f);
+
+    float chromaRangeSigma = 60.0f + (effectiveIso / 100.0f) * 3.5f;
+    chromaRangeSigma = std::clamp(chromaRangeSigma, 60.0f, 150.0f);
+
+    // ISO-adaptive final gamma correction using effectiveIso
+    float finalGamma = 1.15f + (effectiveIso / 100.0f) * 0.015f;
+    finalGamma = std::clamp(finalGamma, 1.15f, 1.35f);
+
+    double S = 1.0e-5 * (effectiveIso / 100.0);
+    double O = 1.0e-6 * (effectiveIso / 100.0) * (effectiveIso / 100.0);
+    
+    std::vector<float> noiseProfiles;
+    if (ctx.metadata.count("noise_profiles")) {
+        try {
+            noiseProfiles = std::any_cast<std::vector<float>>(ctx.metadata.at("noise_profiles"));
+            if (noiseProfiles.size() >= 8) {
+                float sumS = 0.0f;
+                float sumO = 0.0f;
+                for (int ch = 0; ch < 4; ++ch) {
+                    sumS += noiseProfiles[ch * 2];
+                    sumO += noiseProfiles[ch * 2 + 1];
+                }
+                double avgS = sumS / 4.0;
+                double avgO = sumO / 4.0;
+                if (avgS > 1e-8) {
+                    S = avgS;
+                    O = avgO;
+                } else {
+                    LOGI("ToneMapStage: Bypassing camera hardware noise profile because values are near-zero (S=%.8f). Using fallback model.", avgS);
+                }
+            }
+        } catch (...) {}
+    }
+
+    int spatialDenoiseStrength = 8;
+    if (ctx.metadata.count("spatial_denoise_strength")) {
+        try {
+            spatialDenoiseStrength = std::any_cast<int>(ctx.metadata.at("spatial_denoise_strength"));
+        } catch (...) {}
+    }
+    
+    float nlmStrengthMultiplier = 0.0f;
+    // Pre-tonemap NLM disabled: post-tonemap NLM with texture-aware gate handles all denoising
+    // more effectively in gamma space. Pre-tonemap pass only risks blurring sharp detail.
+    if (false && spatialDenoiseStrength > 0) {
+        nlmStrengthMultiplier = (spatialDenoiseStrength / 8.0f) * 16.0f;
+    }
+
+    LOGI("ToneMapStage: Noise Model parameters -> S = %.8f, O = %.8f, NLM strength multiplier = %.2f (effectiveISO = %.1f)", 
+         S, O, nlmStrengthMultiplier, effectiveIso);
 
     // Save intermediate debug frames (Before White Balance / Debayered RGB)
     if (ctx.metadata.count("debug_dir")) {
         try {
             std::string debugDir = std::any_cast<std::string>(ctx.metadata.at("debug_dir"));
+            // Create a gamma-corrected copy for debug preview visualization
+            std::vector<uint8_t> previewRgb(ctx.colorImage.data.size());
+            for (size_t i = 0; i < previewRgb.size(); ++i) {
+                float norm = ctx.colorImage.data[i] / 255.f;
+                previewRgb[i] = static_cast<uint8_t>(std::clamp(std::sqrt(norm) * 255.f, 0.f, 255.f));
+            }
             saveRgbAsJpeg(
-                ctx.colorImage.data.data(), w, h,
+                previewRgb.data(), w, h,
                 debugDir + "/stage_3_tonemap/before_white_balance.jpg");
         } catch (...) {}
     }
 
     // Apply Auto White Balance to correct color casts before tone mapping
-    float softness = isNight ? awbSoftnessNight : awbSoftnessNormal;
-    applyWhiteBalance(ctx.colorImage, softness);
+    if (!ctx.metadata.count("awb_gains")) {
+        float softness = isNight ? awbSoftnessNight : awbSoftnessNormal;
+        applyWhiteBalance(ctx.colorImage, softness);
+    } else {
+        LOGI("ToneMapStage: Bypassing Grey-World AWB because dynamic sensor AWB gains are active.");
+    }
 
     // Save intermediate debug frames (After White Balance / Neutralized)
     if (ctx.metadata.count("debug_dir")) {
         try {
             std::string debugDir = std::any_cast<std::string>(ctx.metadata.at("debug_dir"));
+            // Create a gamma-corrected copy for debug preview visualization
+            std::vector<uint8_t> previewRgb(ctx.colorImage.data.size());
+            for (size_t i = 0; i < previewRgb.size(); ++i) {
+                float norm = ctx.colorImage.data[i] / 255.f;
+                previewRgb[i] = static_cast<uint8_t>(std::clamp(std::sqrt(norm) * 255.f, 0.f, 255.f));
+            }
             saveRgbAsJpeg(
-                ctx.colorImage.data.data(), w, h,
+                previewRgb.data(), w, h,
                 debugDir + "/stage_3_tonemap/after_white_balance.jpg");
         } catch (...) {}
     }
@@ -348,6 +445,95 @@ bool ToneMapStage::process(FrameContext& ctx) {
 
     EglHeadlessSetup egl;
     if (egl.init(errorLog)) {
+        const char* COMPUTE_NLM_SRC = R"glsl(
+            #version 310 es
+            layout(local_size_x = 16, local_size_y = 16) in;
+
+            precision highp float;
+            precision highp sampler2D;
+
+            uniform sampler2D u_input_texture;
+            uniform int u_width;
+            uniform int u_height;
+            uniform float u_S;
+            uniform float u_O;
+            uniform float u_strength_multiplier;
+
+            layout(rgba8, binding = 0) writeonly uniform image2D u_output_image;
+
+            float luma(vec3 rgb) {
+                return 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
+            }
+
+            void main() {
+                ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+                if (pos.x >= u_width || pos.y >= u_height) return;
+
+                float sumW = 0.0;
+                vec3 sumRGB = vec3(0.0);
+
+                int search_r = 2; // 5x5 search window
+                int patch_r = 1;  // 3x3 patch
+
+                vec3 centerColor = texelFetch(u_input_texture, pos, 0).rgb;
+                float centerL = luma(centerColor);
+
+                // Parabolic boost curve to strengthen NLM in both shadows and highlights
+                float boost = 1.5 - 2.0 * centerL * (1.0 - centerL);
+                float h2 = (u_S * centerL + u_O) * u_strength_multiplier * boost;
+                if (h2 < 1e-6) h2 = 1e-6;
+
+                // ── Texture-Aware Variance Gate ───────────────────────────────────────
+                // Compute local 3x3 variance. Text/detail has high variance >> noise level.
+                // Only denoise where localVar ≈ noise variance (flat noisy region).
+                float sumLp = 0.0, sumLp2 = 0.0;
+                for (int py = -1; py <= 1; ++py) {
+                    for (int px = -1; px <= 1; ++px) {
+                        ivec2 pp = clamp(pos + ivec2(px, py), ivec2(0), ivec2(u_width - 1, u_height - 1));
+                        float pL = luma(texelFetch(u_input_texture, pp, 0).rgb);
+                        sumLp  += pL;
+                        sumLp2 += pL * pL;
+                    }
+                }
+                float localMean = sumLp / 9.0;
+                float localVar  = max(0.0, sumLp2 / 9.0 - localMean * localMean);
+
+                // textureGate → 1.0 in flat noisy areas, → 0.0 in textured/detail areas
+                float textureGate = exp(-localVar / (h2 * 0.5));
+                float effectiveH2 = h2 * max(0.05, textureGate);
+
+                for (int dy = -search_r; dy <= search_r; ++dy) {
+                    for (int dx = -search_r; dx <= search_r; ++dx) {
+                        ivec2 nPos = pos + ivec2(dx, dy);
+                        nPos = clamp(nPos, ivec2(0), ivec2(u_width - 1, u_height - 1));
+
+                        float ssd = 0.0;
+                        for (int py = -patch_r; py <= patch_r; ++py) {
+                            for (int px = -patch_r; px <= patch_r; ++px) {
+                                ivec2 p1 = clamp(pos + ivec2(px, py), ivec2(0), ivec2(u_width - 1, u_height - 1));
+                                ivec2 p2 = clamp(nPos + ivec2(px, py), ivec2(0), ivec2(u_width - 1, u_height - 1));
+
+                                float l1 = luma(texelFetch(u_input_texture, p1, 0).rgb);
+                                float l2 = luma(texelFetch(u_input_texture, p2, 0).rgb);
+
+                                float diff = l1 - l2;
+                                ssd += diff * diff;
+                            }
+                        }
+
+                        // Spatial-bilateral NLM using texture-gated effectiveH2
+                        float w = exp(-(ssd / 9.0) / effectiveH2) * exp(-float(dx*dx + dy*dy) / 12.5);
+                        vec3 nColor = texelFetch(u_input_texture, nPos, 0).rgb;
+
+                        sumRGB += w * nColor;
+                        sumW += w;
+                    }
+                }
+
+                imageStore(u_output_image, pos, vec4(sumRGB / sumW, 1.0));
+            }
+        )glsl";
+
         const char* COMPUTE_TONEMAP_SRC = R"glsl(
             #version 310 es
             layout(local_size_x = 16, local_size_y = 16) in;
@@ -363,6 +549,11 @@ bool ToneMapStage::process(FrameContext& ctx) {
             uniform float u_detail_alpha;
             uniform float u_saturation_boost;
             uniform float u_ev_compensation;
+            uniform float u_final_gamma;
+            uniform float u_chroma_range_sigma;
+            uniform float u_effective_iso;
+            uniform float u_exposure_boost;
+            uniform mat3 u_ccm;
 
             layout(std430, binding = 0) writeonly buffer OutputBuffer {
                 uint outRGB[];
@@ -386,7 +577,8 @@ bool ToneMapStage::process(FrameContext& ctx) {
                 if (pos.x >= u_width || pos.y >= u_height) return;
 
                 // Dynamically compensate exposure bias (scale = 2^(-EV))
-                float evScale = pow(2.0, -u_ev_compensation);
+                // Scaled up by user-configurable u_exposure_boost
+                float evScale = pow(2.0, -u_ev_compensation) * u_exposure_boost;
                 vec3 rgbVal = texelFetch(u_input_texture, pos, 0).rgb * 255.0 * evScale;
                 float L = luma(rgbVal);
 
@@ -395,13 +587,13 @@ bool ToneMapStage::process(FrameContext& ctx) {
                 float sumW = 0.0;
                 
                 float spatial_sigma2 = 2.0 * 16.0 * 16.0;
-                float range_sigma2 = 2.0 * 38.25 * 38.25;
+                float range_sigma2 = 2.0 * 15.0 * 15.0;
 
                 int radius = 12;
                 for (int dy = -radius; dy <= radius; dy += 2) {
                     for (int dx = -radius; dx <= radius; dx += 2) {
                         ivec2 nPos = clamp(pos + ivec2(dx, dy), ivec2(0), ivec2(u_width - 1, u_height - 1));
-                        vec3 nRgb = texelFetch(u_input_texture, nPos, 0).rgb * 255.0;
+                        vec3 nRgb = texelFetch(u_input_texture, nPos, 0).rgb * 255.0 * evScale;
                         float nL = luma(nRgb);
 
                         float dS2 = float(dx * dx + dy * dy);
@@ -417,7 +609,7 @@ bool ToneMapStage::process(FrameContext& ctx) {
                 
                 float logL = log2(L + 1.0);
                 float logBase = log2(baseL + 1.0);
-                logBase = clamp(logBase, 0.0, 8.0);
+                logBase = clamp(logBase, 0.0, 10.0);
                 
                 float normBase = (pow(2.0, logBase) - 1.0) / 255.0;
                 float boostedBase = pow(normBase, u_adaptive_gamma);
@@ -427,48 +619,84 @@ bool ToneMapStage::process(FrameContext& ctx) {
                 float compBase = acesFilm(boostedBase) * 255.0;
 
                 float currentDetailAlpha = u_detail_alpha;
-                if (baseL < 50.0) {
-                    float factor = baseL / 50.0;
-                    currentDetailAlpha = 1.0 + factor * (u_detail_alpha - 1.0);
+                if (baseL < 80.0) {
+                    float shadowFactor = baseL / 80.0;
+                    float minDetail = 1.0;
+                    if (u_effective_iso >= 1600.0) {
+                        minDetail = 0.3;
+                    } else if (u_effective_iso >= 800.0) {
+                        minDetail = 0.5;
+                    } else if (u_effective_iso >= 400.0) {
+                        minDetail = 0.7;
+                    }
+                    currentDetailAlpha = minDetail + shadowFactor * (u_detail_alpha - minDetail);
                 }
 
                 float logDetail = logL - logBase;
-                float compLogL = log2(compBase + 1.0) + logDetail * currentDetailAlpha;
+                
+                // Sobel-guided texture boost curve: amplify low-amplitude high-frequency details
+                // while compressing large-amplitude transitions to prevent haloing.
+                float signDetail = sign(logDetail);
+                float absDetail = abs(logDetail);
+                
+                // Micro-contrast exponent curve (exponents < 1.0 lift low-contrast details)
+                float detailExponent = 0.85;
+                float boostedDetail = signDetail * pow(absDetail, detailExponent) * currentDetailAlpha;
+                
+                float compLogL = log2(compBase + 1.0) + boostedDetail;
                 float compL = clamp(pow(2.0, compLogL) - 1.0, 0.0, 255.0);
 
                 float scale = (L > 0.1) ? compL / L : 1.0;
                 scale = min(scale, 10.0);
 
-                vec3 oRgb = rgbVal * scale;
-                float newL = luma(oRgb);
+                // Apply CCM to the scaled center RGB to do YUV conversion in sRGB space
+                vec3 srgbVal = u_ccm * (rgbVal * scale);
+                float newL = luma(srgbVal);
+                float centerLumaUnscaled = luma(u_ccm * (texelFetch(u_input_texture, pos, 0).rgb * 255.0));
 
-                // Convert to YUV (YPbPr) space to isolate U and V chroma channels
-                float uVal = -0.1687 * oRgb.r - 0.3313 * oRgb.g + 0.5 * oRgb.b;
-                float vVal = 0.5 * oRgb.r - 0.4187 * oRgb.g - 0.0813 * oRgb.b;
+                // Convert to YUV (YPbPr) space in sRGB
+                float uVal = -0.1687 * srgbVal.r - 0.3313 * srgbVal.g + 0.5 * srgbVal.b;
+                float vVal = 0.5 * srgbVal.r - 0.4187 * srgbVal.g - 0.0813 * srgbVal.b;
 
-                // Wide-radius chroma denoiser: Bilateral blur on U & V channels across ALL regions (dark and light)
+                // Wide-radius chroma denoiser: Bilateral blur on U & V channels
+                // range_sigma FIXED at 15 (tight) — independent of post-tonemap u_chroma_range_sigma.
+                // At a text edge (luma diff 50): exp(-2500/450) = 0.004 → no bleed.
                 float sumU = 0.0;
                 float sumV = 0.0;
                 float sumChromaW = 0.0;
-                
-                int chromaRadius = 6; // Large window to wash out splotchy high/low-frequency color noise
-                
+
+                // Local gradient magnitude: high on text edges, low on smooth areas
+                float gradX = luma(u_ccm * (texelFetch(u_input_texture, clamp(pos + ivec2(1,0), ivec2(0), ivec2(u_width-1,u_height-1)), 0).rgb * 255.0))
+                            - luma(u_ccm * (texelFetch(u_input_texture, clamp(pos - ivec2(1,0), ivec2(0), ivec2(u_width-1,u_height-1)), 0).rgb * 255.0));
+                float gradY = luma(u_ccm * (texelFetch(u_input_texture, clamp(pos + ivec2(0,1), ivec2(0), ivec2(u_width-1,u_height-1)), 0).rgb * 255.0))
+                            - luma(u_ccm * (texelFetch(u_input_texture, clamp(pos - ivec2(0,1), ivec2(0), ivec2(u_width-1,u_height-1)), 0).rgb * 255.0));
+                float gradMag = sqrt(gradX * gradX + gradY * gradY);
+                // edgeGate → 1.0 on flat areas (blur freely), → 0.0 on text/edges (no blur)
+                float edgeGate = exp(-gradMag / 20.0);
+                // In edge areas: collapse spatial sigma to ~1px. On flat areas: keep 3px sigma (div=18)
+                float effectiveSpatialDiv = mix(2.0, 18.0, edgeGate);
+                float inTonemapRangeSigma2 = 2.0 * 15.0 * 15.0; // tight — always 15, never elevated
+
+                int chromaRadius = 6; // Large window for flat areas
+
                 for (int dy = -chromaRadius; dy <= chromaRadius; ++dy) {
                     for (int dx = -chromaRadius; dx <= chromaRadius; ++dx) {
                         ivec2 nPos = clamp(pos + ivec2(dx, dy), ivec2(0), ivec2(u_width - 1, u_height - 1));
-                        
-                        // Sample neighboring RGB and compute its luma
-                        vec3 nRgb = texelFetch(u_input_texture, nPos, 0).rgb * 255.0;
-                        float nL = luma(nRgb);
-                        
-                        // Range weight based on luma difference to preserve colors on boundaries
-                        float diffL = nL - L;
-                        float wChroma = exp(-float(dx*dx + dy*dy) / 18.0) * exp(-diffL*diffL / (2.0 * 35.0 * 35.0));
-                        
-                        vec3 nRgbScaled = nRgb * scale;
-                        float nU = -0.1687 * nRgbScaled.r - 0.3313 * nRgbScaled.g + 0.5 * nRgbScaled.b;
-                        float nV = 0.5 * nRgbScaled.r - 0.4187 * nRgbScaled.g - 0.0813 * nRgbScaled.b;
-                        
+
+                        // Sample neighboring RGB, map to sRGB, and compute its unscaled luma
+                        vec3 nRgbUnscaled = texelFetch(u_input_texture, nPos, 0).rgb * 255.0;
+                        vec3 nSrgbUnscaled = u_ccm * nRgbUnscaled;
+                        float nLUnscaled = luma(nSrgbUnscaled);
+
+                        // Range weight: tight sigma preserves text edge colour boundaries
+                        float diffL = nLUnscaled - centerLumaUnscaled;
+                        float wChroma = exp(-float(dx*dx + dy*dy) / effectiveSpatialDiv)
+                                      * exp(-diffL * diffL / inTonemapRangeSigma2);
+
+                        vec3 nSrgb = nSrgbUnscaled * evScale;
+                        float nU = -0.1687 * nSrgb.r - 0.3313 * nSrgb.g + 0.5 * nSrgb.b;
+                        float nV = 0.5 * nSrgb.r - 0.4187 * nSrgb.g - 0.0813 * nSrgb.b;
+
                         sumU += wChroma * nU;
                         sumV += wChroma * nV;
                         sumChromaW += wChroma;
@@ -476,14 +704,22 @@ bool ToneMapStage::process(FrameContext& ctx) {
                 }
                 
                 if (sumChromaW > 1e-4) {
-                    uVal = sumU / sumChromaW;
-                    vVal = sumV / sumChromaW;
+                    uVal = (sumU / sumChromaW) * scale;
+                    vVal = (sumV / sumChromaW) * scale;
                 }
 
-                // Convert back from YUV to RGB space using denoised U & V
-                oRgb.r = newL + 1.402 * vVal;
-                oRgb.g = newL - 0.34414 * uVal - 0.71414 * vVal;
-                oRgb.b = newL + 1.772 * uVal;
+                // Shadow desaturation to suppress chroma noise in dark regions
+                if (newL < 30.0) {
+                    float desatFactor = clamp(newL / 30.0, 0.0, 1.0);
+                    uVal *= desatFactor;
+                    vVal *= desatFactor;
+                }
+
+                // Convert back from YUV to RGB space using denoised U & V (which are already in sRGB)
+                vec3 finalRgb;
+                finalRgb.r = newL + 1.402 * vVal;
+                finalRgb.g = newL - 0.34414 * uVal - 0.71414 * vVal;
+                finalRgb.b = newL + 1.772 * uVal;
 
                 if (newL > 0.1) {
                     float factor = u_saturation_boost;
@@ -491,41 +727,130 @@ bool ToneMapStage::process(FrameContext& ctx) {
                         float t = (newL - 200.0) / (255.0 - 200.0);
                         factor = factor * (1.0 - clamp(t, 0.0, 1.0));
                     }
-                    oRgb = newL + factor * (oRgb - newL);
+                    finalRgb = newL + factor * (finalRgb - newL);
                 }
 
-                float maxChan = max(oRgb.r, max(oRgb.g, oRgb.b));
+                float maxChan = max(finalRgb.r, max(finalRgb.g, finalRgb.b));
                 if (maxChan > 255.0) {
-                    float blendL = luma(oRgb);
+                    float blendL = luma(finalRgb);
                     if (maxChan - blendL > 1e-4) {
                         float blend = clamp((255.0 - blendL) / (maxChan - blendL), 0.0, 1.0);
-                        oRgb = blendL + blend * (oRgb - blendL);
+                        finalRgb = blendL + blend * (finalRgb - blendL);
                     }
                 }
 
-                uint uR = uint(clamp(oRgb.r, 0.0, 255.0));
-                uint uG = uint(clamp(oRgb.g, 0.0, 255.0));
-                uint uB = uint(clamp(oRgb.b, 0.0, 255.0));
+                // Apply an ISO-adaptive custom gamma correction to balance brightness
+                vec3 gammaRgb = pow(clamp(finalRgb / 255.0, 0.0, 1.0), vec3(1.0 / u_final_gamma)) * 255.0;
+
+                uint uR = uint(clamp(gammaRgb.r, 0.0, 255.0));
+                uint uG = uint(clamp(gammaRgb.g, 0.0, 255.0));
+                uint uB = uint(clamp(gammaRgb.b, 0.0, 255.0));
 
                 uint packedVal = uR | (uG << 8) | (uB << 16) | (255u << 24);
                 outRGB[pos.y * u_width + pos.x] = packedVal;
             }
         )glsl";
 
+        GLuint nlmProgram = 0;
+        GLuint denoisedTexture = 0;
+        
+        if (nlmStrengthMultiplier > 0.0f) {
+            nlmProgram = createComputeProgram(COMPUTE_NLM_SRC, errorLog);
+            if (nlmProgram == 0) {
+                LOGE("ToneMapStage: COMPUTE_NLM_SRC compilation failed! Errors:\n%s", errorLog.c_str());
+            }
+        }
+
         GLuint program = createComputeProgram(COMPUTE_TONEMAP_SRC, errorLog);
         if (program != 0) {
-            glUseProgram(program);
+            // Convert RGB to RGBA on CPU to prevent GL_INVALID_OPERATION mismatch on mobile drivers
+            std::vector<uint8_t> rgbaData(static_cast<size_t>(w) * h * 4);
+            const uint8_t* srcData = ctx.colorImage.data.data();
+            for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
+                rgbaData[i * 4 + 0] = srcData[i * 3 + 0];
+                rgbaData[i * 4 + 1] = srcData[i * 3 + 1];
+                rgbaData[i * 4 + 2] = srcData[i * 3 + 2];
+                rgbaData[i * 4 + 3] = 255;
+            }
 
             // Upload input RGB image as Texture
             GLuint rgbTexture;
             glGenTextures(1, &rgbTexture);
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, rgbTexture);
-            glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGB8, w, h);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, ctx.colorImage.data.data());
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, w, h);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgbaData.data());
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
+            // Clear any preceding GL errors before starting NLM
+            while (glGetError() != GL_NO_ERROR);
+
+            GLenum errSetup = GL_NO_ERROR;
+            GLenum errDispatch = GL_NO_ERROR;
+
+            // Execute GPU NLM pass if spatial denoising is requested
+            if (nlmStrengthMultiplier > 0.0f && nlmProgram != 0) {
+                glGenTextures(1, &denoisedTexture);
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_2D, denoisedTexture);
+                glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, w, h);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+                glUseProgram(nlmProgram);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, rgbTexture);
+                glUniform1i(glGetUniformLocation(nlmProgram, "u_input_texture"), 0);
+                glUniform1i(glGetUniformLocation(nlmProgram, "u_width"), w);
+                glUniform1i(glGetUniformLocation(nlmProgram, "u_height"), h);
+                glUniform1f(glGetUniformLocation(nlmProgram, "u_S"), static_cast<float>(S));
+                glUniform1f(glGetUniformLocation(nlmProgram, "u_O"), static_cast<float>(O));
+                glUniform1f(glGetUniformLocation(nlmProgram, "u_strength_multiplier"), nlmStrengthMultiplier);
+
+                errSetup = glGetError();
+
+                glBindImageTexture(0, denoisedTexture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+                glDispatchCompute(static_cast<GLuint>((w + 15) / 16), static_cast<GLuint>((h + 15) / 16), 1);
+                glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+                errDispatch = glGetError();
+
+                // Write NLM diagnostic logs to file
+                if (ctx.metadata.count("debug_dir")) {
+                    try {
+                        std::string debugDir = std::any_cast<std::string>(ctx.metadata.at("debug_dir"));
+                        std::ofstream out(debugDir + "/stage_3_tonemap/nlm_debug.txt");
+                        if (out) {
+                            out << "nlmStrengthMultiplier: " << nlmStrengthMultiplier << "\n";
+                            out << "nlmProgram: " << nlmProgram << "\n";
+                            out << "S: " << S << "\n";
+                            out << "O: " << O << "\n";
+                            out << "GL Setup Error: " << errSetup << "\n";
+                            out << "GL Dispatch Error: " << errDispatch << "\n";
+                            out << "errorLog: " << errorLog << "\n";
+                            out.close();
+                        }
+                    } catch (...) {}
+                }
+
+                // Unbind the image unit
+                glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+
+                // Bind denoised texture as input to tone mapping
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, denoisedTexture);
+            } else {
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, rgbTexture);
+            }
+
+            float tonemapExposureBoost = 1.30f;
+            if (ctx.metadata.count("tonemap_exposure_boost")) {
+                try { tonemapExposureBoost = std::any_cast<float>(ctx.metadata.at("tonemap_exposure_boost")); } catch (...) {}
+            }
+
+            glUseProgram(program);
             glUniform1i(glGetUniformLocation(program, "u_input_texture"), 0);
             glUniform1i(glGetUniformLocation(program, "u_width"), w);
             glUniform1i(glGetUniformLocation(program, "u_height"), h);
@@ -534,6 +859,11 @@ bool ToneMapStage::process(FrameContext& ctx) {
             glUniform1f(glGetUniformLocation(program, "u_detail_alpha"), detailAlpha);
             glUniform1f(glGetUniformLocation(program, "u_saturation_boost"), saturationBoost);
             glUniform1f(glGetUniformLocation(program, "u_ev_compensation"), appliedEvCompensation);
+            glUniform1f(glGetUniformLocation(program, "u_final_gamma"), finalGamma);
+            glUniform1f(glGetUniformLocation(program, "u_chroma_range_sigma"), chromaRangeSigma);
+            glUniform1f(glGetUniformLocation(program, "u_effective_iso"), effectiveIso);
+            glUniform1f(glGetUniformLocation(program, "u_exposure_boost"), tonemapExposureBoost);
+            glUniformMatrix3fv(glGetUniformLocation(program, "u_ccm"), 1, GL_TRUE, ccm.data());
 
             // Create output SSBO for packed RGB
             GLuint outBuffer;
@@ -546,7 +876,28 @@ bool ToneMapStage::process(FrameContext& ctx) {
             glDispatchCompute(static_cast<GLuint>((w + 15) / 16), static_cast<GLuint>((h + 15) / 16), 1);
             glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-            // ── GPU DENOISE COMPUTE SHADER PASS ──────────────────────────────────
+            // Save intermediate pre-denoised tonemapped image
+            if (ctx.metadata.count("debug_dir")) {
+                try {
+                    std::string debugDir = std::any_cast<std::string>(ctx.metadata.at("debug_dir"));
+                    glBindBuffer(GL_SHADER_STORAGE_BUFFER, outBuffer);
+                    void* ptr = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, static_cast<GLsizeiptr>(w) * h * sizeof(uint32_t), GL_MAP_READ_BIT);
+                    if (ptr != nullptr) {
+                        std::vector<uint8_t> tempBuffer(w * h * 3);
+                        const uint32_t* src = static_cast<const uint32_t*>(ptr);
+                        for (int i = 0; i < w * h; ++i) {
+                            uint32_t val = src[i];
+                            tempBuffer[i * 3 + 0] = val & 0xFF;
+                            tempBuffer[i * 3 + 1] = (val >> 8) & 0xFF;
+                            tempBuffer[i * 3 + 2] = (val >> 16) & 0xFF;
+                        }
+                        glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+                        saveRgbAsJpeg(tempBuffer.data(), w, h, debugDir + "/stage_3_tonemap/tonemapped.jpg");
+                    }
+                } catch (...) {}
+            }
+
+            // ── GPU POST-TONEMAP LUMA+CHROMA NLM PASS ──────────────────────────────────
             const char* COMPUTE_DENOISE_SRC = R"glsl(
                 #version 310 es
                 layout(local_size_x = 16, local_size_y = 16) in;
@@ -565,6 +916,8 @@ bool ToneMapStage::process(FrameContext& ctx) {
                 uniform int u_height;
                 uniform float u_spatial_sigma;
                 uniform float u_range_sigma;
+                uniform int u_denoise_radius;
+                uniform float u_luma_h2;
 
                 vec3 unpackRGB(uint val) {
                     float r = float(val & 0xFFu);
@@ -585,66 +938,257 @@ bool ToneMapStage::process(FrameContext& ctx) {
                     vec3 centerRgb = unpackRGB(centerVal);
                     float centerL = luma(centerRgb);
 
-                    float sumR = 0.0;
-                    float sumG = 0.0;
-                    float sumB = 0.0;
-                    float sumW = 0.0;
+                    float sumWL = 0.0;
+                    float sumL = 0.0;
+                    float sumU = 0.0;
+                    float sumV = 0.0;
+                    float sumWC = 0.0;
+
+                    // ── Brightness Gate (Only denoise darker regions) ───────────────────
+                    // Denoise normally below 100 luma. Fade to 0 denoising by 150 luma.
+                    float brightnessGate = clamp(1.0 - (centerL - 100.0) / 50.0, 0.0, 1.0);
+
+                    if (brightnessGate <= 0.0) {
+                        // Completely skip denoising for brighter areas (like text on white background)
+                        outRGB[pos.y * u_width + pos.x] = centerVal;
+                        return;
+                    }
 
                     float spatial_sigma2 = 2.0 * u_spatial_sigma * u_spatial_sigma;
                     float range_sigma2 = 2.0 * u_range_sigma * u_range_sigma;
+                    // Parabolic boost: stronger at shadows, moderate in midtones
+                    float centerLNorm = centerL / 255.0;
+                    float boost = 2.0 - 2.5 * centerLNorm * (1.0 - centerLNorm);
+                    // Scale denoising parameter h2 by brightnessGate
+                    float h2 = u_luma_h2 * boost * brightnessGate;
+                    int search_r = 2; // 5x5 luma NLM window
+                    int patch_r = 1;  // 3x3 patch
 
-                    int radius = 2;
-                    for (int dy = -radius; dy <= radius; ++dy) {
-                        for (int dx = -radius; dx <= radius; ++dx) {
-                            ivec2 nPos = clamp(pos + ivec2(dx, dy), ivec2(0), ivec2(u_width - 1, u_height - 1));
-                            uint nVal = inRGB[nPos.y * u_width + nPos.x];
-                            vec3 nRgb = unpackRGB(nVal);
-                            float nL = luma(nRgb);
+                    // ── Texture & Sobel Gradient Gate (Protects low-contrast text) ────────
+                    // Measure local variance and calculate Sobel gradient magnitudes
+                    float sumLp = 0.0, sumLp2 = 0.0;
+                    float gx = 0.0, gy = 0.0;
+                    
+                    // Sobel kernels:
+                    // H: [-1, 0, 1; -2, 0, 2; -1, 0, 1]
+                    // V: [-1, -2, -1;  0, 0, 0;  1, 2, 1]
+                    float pL_00 = luma(unpackRGB(inRGB[clamp(pos + ivec2(-1, -1), ivec2(0), ivec2(u_width - 1, u_height - 1)).y * u_width + clamp(pos + ivec2(-1, -1), ivec2(0), ivec2(u_width - 1, u_height - 1)).x]));
+                    float pL_01 = luma(unpackRGB(inRGB[clamp(pos + ivec2( 0, -1), ivec2(0), ivec2(u_width - 1, u_height - 1)).y * u_width + clamp(pos + ivec2( 0, -1), ivec2(0), ivec2(u_width - 1, u_height - 1)).x]));
+                    float pL_02 = luma(unpackRGB(inRGB[clamp(pos + ivec2( 1, -1), ivec2(0), ivec2(u_width - 1, u_height - 1)).y * u_width + clamp(pos + ivec2( 1, -1), ivec2(0), ivec2(u_width - 1, u_height - 1)).x]));
+                    
+                    float pL_10 = luma(unpackRGB(inRGB[clamp(pos + ivec2(-1,  0), ivec2(0), ivec2(u_width - 1, u_height - 1)).y * u_width + clamp(pos + ivec2(-1,  0), ivec2(0), ivec2(u_width - 1, u_height - 1)).x]));
+                    float pL_11 = luma(unpackRGB(inRGB[pos.y * u_width + pos.x]));
+                    float pL_12 = luma(unpackRGB(inRGB[clamp(pos + ivec2( 1,  0), ivec2(0), ivec2(u_width - 1, u_height - 1)).y * u_width + clamp(pos + ivec2( 1,  0), ivec2(0), ivec2(u_width - 1, u_height - 1)).x]));
+                    
+                    float pL_20 = luma(unpackRGB(inRGB[clamp(pos + ivec2(-1,  1), ivec2(0), ivec2(u_width - 1, u_height - 1)).y * u_width + clamp(pos + ivec2(-1,  1), ivec2(0), ivec2(u_width - 1, u_height - 1)).x]));
+                    float pL_21 = luma(unpackRGB(inRGB[clamp(pos + ivec2( 0,  1), ivec2(0), ivec2(u_width - 1, u_height - 1)).y * u_width + clamp(pos + ivec2( 0,  1), ivec2(0), ivec2(u_width - 1, u_height - 1)).x]));
+                    float pL_22 = luma(unpackRGB(inRGB[clamp(pos + ivec2( 1,  1), ivec2(0), ivec2(u_width - 1, u_height - 1)).y * u_width + clamp(pos + ivec2( 1,  1), ivec2(0), ivec2(u_width - 1, u_height - 1)).x]));
 
-                            float dS2 = float(dx * dx + dy * dy);
-                            float dR = nL - centerL;
-                            float dR2 = dR * dR;
+                    gx = (pL_02 + 2.0 * pL_12 + pL_22) - (pL_00 + 2.0 * pL_10 + pL_20);
+                    gy = (pL_20 + 2.0 * pL_21 + pL_22) - (pL_00 + 2.0 * pL_01 + pL_02);
+                    float edgeMagnitude = sqrt(gx * gx + gy * gy);
 
-                            float w = exp(-dS2 / spatial_sigma2) * exp(-dR2 / range_sigma2);
-                            sumR += w * nRgb.r;
-                            sumG += w * nRgb.g;
-                            sumB += w * nRgb.b;
-                            sumW += w;
+                    // Compute 3x3 variance
+                    sumLp = pL_00 + pL_01 + pL_02 + pL_10 + pL_11 + pL_12 + pL_20 + pL_21 + pL_22;
+                    sumLp2 = pL_00*pL_00 + pL_01*pL_01 + pL_02*pL_02 + pL_10*pL_10 + pL_11*pL_11 + pL_12*pL_12 + pL_20*pL_20 + pL_21*pL_21 + pL_22*pL_22;
+                    float localMean = sumLp / 9.0;
+                    float localVar  = max(0.0, sumLp2 / 9.0 - localMean * localMean);
+
+                    // textureGate based on variance
+                    float textureGate = exp(-localVar / (h2 * 2.0));
+                    
+                    // edgeGate scales down denoising on structured low-contrast Sobel edges
+                    float edgeGate = clamp(1.0 - (edgeMagnitude / 5.0), 0.0, 1.0); 
+
+                    // Combine texture variance gating and structured edge gating
+                    float effectiveH2 = h2 * textureGate * edgeGate; 
+
+                    if (effectiveH2 < 1e-5) {
+                        // If no luma denoising is needed, keep the original center luma
+                        sumL = centerL;
+                        sumWL = 1.0;
+                    } else {
+                        // ── Luma NLM pass (5x5 search) ────────────────────────────────────────
+                        for (int dy = -search_r; dy <= search_r; ++dy) {
+                            for (int dx = -search_r; dx <= search_r; ++dx) {
+                                ivec2 nPos = clamp(pos + ivec2(dx, dy), ivec2(0), ivec2(u_width - 1, u_height - 1));
+                                vec3 nRgb = unpackRGB(inRGB[nPos.y * u_width + nPos.x]);
+                                float nL = luma(nRgb);
+
+                                // NLM patch SSD for luma
+                                float ssd = 0.0;
+                                for (int py = -patch_r; py <= patch_r; ++py) {
+                                    for (int px = -patch_r; px <= patch_r; ++px) {
+                                        ivec2 p1 = clamp(pos + ivec2(px, py), ivec2(0), ivec2(u_width - 1, u_height - 1));
+                                        ivec2 p2 = clamp(nPos + ivec2(px, py), ivec2(0), ivec2(u_width - 1, u_height - 1));
+                                        float l1 = luma(unpackRGB(inRGB[p1.y * u_width + p1.x]));
+                                        float l2 = luma(unpackRGB(inRGB[p2.y * u_width + p2.x]));
+                                        float diff = l1 - l2;
+                                        ssd += diff * diff;
+                                    }
+                                }
+                                float wL = exp(-(ssd / 9.0) / effectiveH2) * exp(-float(dx*dx + dy*dy) / 12.5);
+                                sumL += wL * nL;
+                                sumWL += wL;
+                            }
                         }
                     }
 
-                    uint uR = uint(clamp(sumR / sumW, 0.0, 255.0));
-                    uint uG = uint(clamp(sumG / sumW, 0.0, 255.0));
-                    uint uB = uint(clamp(sumB / sumW, 0.0, 255.0));
+                    // Pure Gaussian chroma blur — radius narrowed by textureGate in detail areas
+                    // to prevent colour bleeding across text/edge boundaries
+                    int chroma_r = 10; // 21x21 window max
+                    // In flat noisy areas: full 5px sigma. In textured areas: narrow to ~1px sigma.
+                    float effectiveChromaSigma2 = mix(2.0, 50.0, textureGate);
+                    for (int dy = -chroma_r; dy <= chroma_r; ++dy) {
+                        for (int dx = -chroma_r; dx <= chroma_r; ++dx) {
+                            ivec2 nPos = clamp(pos + ivec2(dx, dy), ivec2(0), ivec2(u_width - 1, u_height - 1));
+                            vec3 nRgb = unpackRGB(inRGB[nPos.y * u_width + nPos.x]);
+
+                            float dS2 = float(dx * dx + dy * dy);
+                            float wC = exp(-dS2 / effectiveChromaSigma2);
+                            float nU = -0.1687 * nRgb.r - 0.3313 * nRgb.g + 0.5 * nRgb.b;
+                            float nV = 0.5 * nRgb.r - 0.4187 * nRgb.g - 0.0813 * nRgb.b;
+                            sumU += wC * nU;
+                            sumV += wC * nV;
+                            sumWC += wC;
+                        }
+                    }
+
+                    float filteredL = sumL / sumWL;
+                    float filteredU = sumU / sumWC;
+                    float filteredV = sumV / sumWC;
+
+                    float rVal = filteredL + 1.402 * filteredV;
+                    float gVal = filteredL - 0.34414 * filteredU - 0.71414 * filteredV;
+                    float bVal = filteredL + 1.772 * filteredU;
+
+                    uint uR = uint(clamp(rVal, 0.0, 255.0));
+                    uint uG = uint(clamp(gVal, 0.0, 255.0));
+                    uint uB = uint(clamp(bVal, 0.0, 255.0));
 
                     outRGB[pos.y * u_width + pos.x] = uR | (uG << 8) | (uB << 16) | (255u << 24);
                 }
             )glsl";
 
+            // Extract pass configs from metadata
+            bool pass1Enabled = true;
+            float pass1Strength = 1.0f;
+            bool pass2Enabled = true;
+            float pass2Strength = 0.5f;
+            if (ctx.metadata.count("denoise_pass1_enabled")) {
+                try { pass1Enabled = std::any_cast<bool>(ctx.metadata.at("denoise_pass1_enabled")); } catch (...) {}
+            }
+            if (ctx.metadata.count("denoise_pass1_strength")) {
+                try { pass1Strength = std::any_cast<float>(ctx.metadata.at("denoise_pass1_strength")); } catch (...) {}
+            }
+            if (ctx.metadata.count("denoise_pass2_enabled")) {
+                try { pass2Enabled = std::any_cast<bool>(ctx.metadata.at("denoise_pass2_enabled")); } catch (...) {}
+            }
+            if (ctx.metadata.count("denoise_pass2_strength")) {
+                try { pass2Strength = std::any_cast<float>(ctx.metadata.at("denoise_pass2_strength")); } catch (...) {}
+            }
+
             GLuint denoiseProgram = createComputeProgram(COMPUTE_DENOISE_SRC, errorLog);
             if (denoiseProgram != 0) {
-                glUseProgram(denoiseProgram);
-
-                // Create denoised output SSBO
+                // Create buffer for pass-1 output
                 GLuint denoiseOutBuffer;
                 glGenBuffers(1, &denoiseOutBuffer);
                 glBindBuffer(GL_SHADER_STORAGE_BUFFER, denoiseOutBuffer);
                 glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(w) * h * sizeof(uint32_t), nullptr, GL_DYNAMIC_READ);
 
-                // Bind outBuffer (from tone map) to binding 0, and denoiseOutBuffer to binding 1
-                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outBuffer);
-                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, denoiseOutBuffer);
+                // Run Pass 1 if enabled
+                if (pass1Enabled) {
+                    glUseProgram(denoiseProgram);
+                    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, outBuffer);
+                    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, denoiseOutBuffer);
 
-                glUniform1i(glGetUniformLocation(denoiseProgram, "u_width"), w);
-                glUniform1i(glGetUniformLocation(denoiseProgram, "u_height"), h);
-                glUniform1f(glGetUniformLocation(denoiseProgram, "u_spatial_sigma"), 1.5f);
-                glUniform1f(glGetUniformLocation(denoiseProgram, "u_range_sigma"), 8.0f);
+                    glUniform1i(glGetUniformLocation(denoiseProgram, "u_width"), w);
+                    glUniform1i(glGetUniformLocation(denoiseProgram, "u_height"), h);
+                    glUniform1f(glGetUniformLocation(denoiseProgram, "u_spatial_sigma"), spatialSigma);
+                    glUniform1f(glGetUniformLocation(denoiseProgram, "u_range_sigma"), chromaRangeSigma);
+                    int denoiseRadius = (effectiveIso >= 1600.f) ? 3 : 2;
+                    glUniform1i(glGetUniformLocation(denoiseProgram, "u_denoise_radius"), denoiseRadius);
 
-                // Dispatch denoise compute shader
-                glDispatchCompute(static_cast<GLuint>((w + 15) / 16), static_cast<GLuint>((h + 15) / 16), 1);
-                glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+                    float activeStrength = (spatialDenoiseStrength > 0) ? ((spatialDenoiseStrength / 8.0f) * 16.0f) : 16.0f;
+                    // Apply pass-1 strength multiplier
+                    float postTonemapH2 = static_cast<float>((S * 0.5 + O) * activeStrength * pass1Strength * 65025.0);
+                    if (postTonemapH2 < 1e-5f) postTonemapH2 = 1e-5f;
+                    glUniform1f(glGetUniformLocation(denoiseProgram, "u_luma_h2"), postTonemapH2);
+                    glUniform1f(glGetUniformLocation(denoiseProgram, "u_S"), static_cast<float>(S));
+                    glUniform1f(glGetUniformLocation(denoiseProgram, "u_O"), static_cast<float>(O));
+                    glUniform1f(glGetUniformLocation(denoiseProgram, "u_strength_multiplier"), activeStrength * pass1Strength);
 
-                // Read back final denoised output buffer
+                    glDispatchCompute(static_cast<GLuint>((w + 15) / 16), static_cast<GLuint>((h + 15) / 16), 1);
+                    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+                } else {
+                    // Copy outBuffer straight to denoiseOutBuffer (bypass pass 1)
+                    glBindBuffer(GL_COPY_READ_BUFFER, outBuffer);
+                    glBindBuffer(GL_COPY_WRITE_BUFFER, denoiseOutBuffer);
+                    glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, 0, static_cast<GLsizeiptr>(w) * h * sizeof(uint32_t));
+                    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+                }
+
+                // Save pass-1 output debug image
+                if (ctx.metadata.count("debug_dir")) {
+                    const std::string debugDir = std::any_cast<std::string>(ctx.metadata.at("debug_dir"));
+                    try {
+                        glBindBuffer(GL_SHADER_STORAGE_BUFFER, denoiseOutBuffer);
+                        void* p1 = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, static_cast<GLsizeiptr>(w) * h * sizeof(uint32_t), GL_MAP_READ_BIT);
+                        if (p1 != nullptr) {
+                            std::vector<uint8_t> p1Rgb(w * h * 3);
+                            const uint32_t* ps = static_cast<const uint32_t*>(p1);
+                            for (int i = 0; i < w * h; ++i) {
+                                uint32_t val = ps[i];
+                                p1Rgb[i * 3 + 0] = val & 0xFF;
+                                p1Rgb[i * 3 + 1] = (val >> 8) & 0xFF;
+                                p1Rgb[i * 3 + 2] = (val >> 16) & 0xFF;
+                            }
+                            glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+                            saveRgbAsJpeg(p1Rgb.data(), w, h, debugDir + "/stage_3_tonemap/denoise_pass1.jpg");
+                        }
+                    } catch (...) {}
+                }
+
+                // Create buffer for pass-2 output
+                GLuint denoiseOut2Buffer;
+                glGenBuffers(1, &denoiseOut2Buffer);
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, denoiseOut2Buffer);
+                glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(w) * h * sizeof(uint32_t), nullptr, GL_DYNAMIC_READ);
+
+                // Run Pass 2 if enabled
+                if (pass2Enabled) {
+                    glUseProgram(denoiseProgram);
+                    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, denoiseOutBuffer);  // pass-1 output -> input
+                    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, denoiseOut2Buffer); // pass-2 output
+
+                    glUniform1i(glGetUniformLocation(denoiseProgram, "u_width"), w);
+                    glUniform1i(glGetUniformLocation(denoiseProgram, "u_height"), h);
+                    glUniform1f(glGetUniformLocation(denoiseProgram, "u_spatial_sigma"), spatialSigma);
+                    glUniform1f(glGetUniformLocation(denoiseProgram, "u_range_sigma"), chromaRangeSigma);
+                    int denoiseRadius = (effectiveIso >= 1600.f) ? 3 : 2;
+                    glUniform1i(glGetUniformLocation(denoiseProgram, "u_denoise_radius"), denoiseRadius);
+
+                    float activeStrength = (spatialDenoiseStrength > 0) ? ((spatialDenoiseStrength / 8.0f) * 16.0f) : 16.0f;
+                    // Apply pass-2 strength multiplier
+                    float postTonemapH2_pass2 = static_cast<float>((S * 0.5 + O) * activeStrength * pass2Strength * 65025.0);
+                    if (postTonemapH2_pass2 < 1e-5f) postTonemapH2_pass2 = 1e-5f;
+                    glUniform1f(glGetUniformLocation(denoiseProgram, "u_luma_h2"), postTonemapH2_pass2);
+                    glUniform1f(glGetUniformLocation(denoiseProgram, "u_S"), static_cast<float>(S));
+                    glUniform1f(glGetUniformLocation(denoiseProgram, "u_O"), static_cast<float>(O));
+                    glUniform1f(glGetUniformLocation(denoiseProgram, "u_strength_multiplier"), activeStrength * pass2Strength);
+
+                    glDispatchCompute(static_cast<GLuint>((w + 15) / 16), static_cast<GLuint>((h + 15) / 16), 1);
+                    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+                } else {
+                    // Copy denoiseOutBuffer straight to denoiseOut2Buffer (bypass pass 2)
+                    glBindBuffer(GL_COPY_READ_BUFFER, denoiseOutBuffer);
+                    glBindBuffer(GL_COPY_WRITE_BUFFER, denoiseOut2Buffer);
+                    glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, 0, static_cast<GLsizeiptr>(w) * h * sizeof(uint32_t));
+                    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+                }
+
+                // Read back final output (from denoiseOut2Buffer) and write to processedImage
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, denoiseOut2Buffer);
                 void* ptr = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, static_cast<GLsizeiptr>(w) * h * sizeof(uint32_t), GL_MAP_READ_BIT);
                 if (ptr != nullptr) {
                     uint8_t* dst = ctx.processedImage.data.data();
@@ -657,12 +1201,27 @@ bool ToneMapStage::process(FrameContext& ctx) {
                     }
                     glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
                     success = true;
+                    if (ctx.metadata.count("debug_dir")) {
+                        try {
+                            const std::string debugDir2 = std::any_cast<std::string>(ctx.metadata.at("debug_dir"));
+                            saveRgbAsJpeg(ctx.processedImage.data.data(), w, h,
+                                debugDir2 + "/stage_3_tonemap/denoise_pass2.jpg");
+                        } catch (...) {}
+                    }
                 } else {
-                    errorLog += "GL: failed to map denoise output buffer\n";
+                    errorLog += "GL: failed to map denoise final output buffer\n";
                 }
 
+                glDeleteBuffers(1, &denoiseOut2Buffer);
                 glDeleteBuffers(1, &denoiseOutBuffer);
                 glDeleteProgram(denoiseProgram);
+            }
+
+            if (denoisedTexture != 0) {
+                glDeleteTextures(1, &denoisedTexture);
+            }
+            if (nlmProgram != 0) {
+                glDeleteProgram(nlmProgram);
             }
 
             glDeleteBuffers(1, &outBuffer);
@@ -673,6 +1232,102 @@ bool ToneMapStage::process(FrameContext& ctx) {
 
     if (!success) {
         LOGE("GL Tone Mapping failed, falling back to CPU multi-threaded Bilateral Grid. GL Errors:\n%s", errorLog.c_str());
+        if (ctx.metadata.count("debug_dir")) {
+            try {
+                std::string debugDir = std::any_cast<std::string>(ctx.metadata.at("debug_dir"));
+                std::ofstream errOut(debugDir + "/tonemap_gl_error.txt");
+                if (errOut) {
+                    errOut << errorLog;
+                    errOut.close();
+                }
+            } catch (...) {}
+        }
+        // CPU fallback: run spatial NLM luma denoiser if requested
+        if (nlmStrengthMultiplier > 0.0f) {
+            RgbImage denoisedImage;
+            denoisedImage.resize(w, h);
+
+            int numThreads = 8;
+            int rowsPerThread = (h + numThreads - 1) / numThreads;
+            std::vector<std::future<void>> futures;
+
+            for (int t = 0; t < numThreads; ++t) {
+                int rStart = t * rowsPerThread;
+                int rEnd = std::min(rStart + rowsPerThread, h);
+                if (rStart >= h) break;
+
+                futures.push_back(std::async(std::launch::async, [rStart, rEnd, w, h, S, O, nlmStrengthMultiplier, &ctx, &denoisedImage]() {
+                    for (int r = rStart; r < rEnd; ++r) {
+                        for (int c = 0; c < w; ++c) {
+                            float sumW = 0.0f;
+                            float sumR = 0.0f, sumG = 0.0f, sumB = 0.0f;
+                            
+                            float centerL = luma(
+                                ctx.colorImage.rowPtr(r)[c*3],
+                                ctx.colorImage.rowPtr(r)[c*3+1],
+                                ctx.colorImage.rowPtr(r)[c*3+2]
+                            ) / 255.0f;
+
+                            // Parabolic boost curve to strengthen NLM in both shadows and highlights (scaled for CPU 0-255 RGB values)
+                            float boost = 1.5f - 2.0f * centerL * (1.0f - centerL);
+                            float h2 = (S * centerL + O) * nlmStrengthMultiplier * 65025.0f * boost;
+                            if (h2 < 1e-6f) h2 = 1e-6f;
+
+                            for (int dy = -2; dy <= 2; ++dy) {
+                                for (int dx = -2; dx <= 2; ++dx) {
+                                    int nr = std::clamp(r + dy, 0, h - 1);
+                                    int nc = std::clamp(c + dx, 0, w - 1);
+
+                                    float ssd = 0.0f;
+                                    for (int py = -1; py <= 1; ++py) {
+                                        for (int px = -1; px <= 1; ++px) {
+                                            int p1r = std::clamp(r + py, 0, h - 1);
+                                            int p1c = std::clamp(c + px, 0, w - 1);
+                                            int p2r = std::clamp(nr + py, 0, h - 1);
+                                            int p2c = std::clamp(nc + px, 0, w - 1);
+
+                                            float l1 = luma(
+                                                ctx.colorImage.rowPtr(p1r)[p1c*3],
+                                                ctx.colorImage.rowPtr(p1r)[p1c*3+1],
+                                                ctx.colorImage.rowPtr(p1r)[p1c*3+2]
+                                            );
+                                            float l2 = luma(
+                                                ctx.colorImage.rowPtr(p2r)[p2c*3],
+                                                ctx.colorImage.rowPtr(p2r)[p2c*3+1],
+                                                ctx.colorImage.rowPtr(p2r)[p2c*3+2]
+                                            );
+                                            float diff = l1 - l2;
+                                            ssd += diff * diff;
+                                        }
+                                    }
+
+                                    // Spatial-bilateral falloff to preserve local contrast/brightness
+                                    float wVal = std::exp(-(ssd / 9.0f) / h2) * std::exp(-static_cast<float>(dx*dx + dy*dy) / 12.5f);
+                                    uint8_t nrVal = ctx.colorImage.rowPtr(nr)[nc*3];
+                                    uint8_t ngVal = ctx.colorImage.rowPtr(nr)[nc*3+1];
+                                    uint8_t nbVal = ctx.colorImage.rowPtr(nr)[nc*3+2];
+
+                                    sumR += wVal * nrVal;
+                                    sumG += wVal * ngVal;
+                                    sumB += wVal * nbVal;
+                                    sumW += wVal;
+                                }
+                            }
+
+                            denoisedImage.rowPtr(r)[c*3]   = std::clamp(sumR / sumW, 0.0f, 255.0f);
+                            denoisedImage.rowPtr(r)[c*3+1] = std::clamp(sumG / sumW, 0.0f, 255.0f);
+                            denoisedImage.rowPtr(r)[c*3+2] = std::clamp(sumB / sumW, 0.0f, 255.0f);
+                        }
+                    }
+                }));
+            }
+
+            for (auto& fut : futures) {
+                fut.wait();
+            }
+            ctx.colorImage = std::move(denoisedImage);
+        }
+
         // CPU fallback: build bilateral grid in log-domain
         BilateralGrid grid;
         grid.init(w, h);
@@ -701,7 +1356,8 @@ bool ToneMapStage::process(FrameContext& ctx) {
             int rStart = t * rowsPerThread;
             int rEnd = (t == numThreads - 1) ? h : (t + 1) * rowsPerThread;
 
-            futures.push_back(std::async(std::launch::async, [&ctx, &grid, rStart, rEnd, w, h, adaptiveGamma, isNight, blackPointClamp, detailAlpha, saturationBoost, appliedEvCompensation]() {
+            futures.push_back(std::async(std::launch::async, [&ctx, &grid, rStart, rEnd, w, h, adaptiveGamma, isNight, blackPointClamp, detailAlpha, saturationBoost, appliedEvCompensation, ccm, finalGamma, effectiveIso]() {
+                // Dynamically compensate exposure bias (scale = 2^(-EV))
                 float evScale = std::powf(2.0f, -appliedEvCompensation);
                 for (int r = rStart; r < rEnd; ++r) {
                     const uint8_t* src = ctx.colorImage.rowPtr(r);
@@ -716,9 +1372,8 @@ bool ToneMapStage::process(FrameContext& ctx) {
                         float logL = std::log2f(L + 1.f);
 
                         // Retrieve base illumination (local low-frequency contrast)
-                        float gridVal = grid.sample(c, r, logL * (255.f / 8.f));
-                        float logBase = gridVal * (8.f / 255.f);
-                        logBase = std::clamp(logBase, 0.f, 8.f);
+                        float logBase = grid.sample(c, r, logL * (255.f / 8.f)) * (8.f / 255.f);
+                        logBase = std::clamp(logBase, 0.f, 10.f);
                         float baseL = std::exp2f(logBase) - 1.f;
                         baseL = std::max(1.f, baseL);
 
@@ -735,9 +1390,17 @@ bool ToneMapStage::process(FrameContext& ctx) {
 
                         // Suppress detail boost in dark areas to prevent noise/grain amplification
                         float currentDetailAlpha = detailAlpha;
-                        if (baseL < 50.f) {
-                            float factor = baseL / 50.f;
-                            currentDetailAlpha = 1.0f + factor * (detailAlpha - 1.0f);
+                        if (baseL < 80.f) {
+                            float shadowFactor = baseL / 80.f;
+                            float minDetail = 1.0f;
+                            if (effectiveIso >= 1600.f) {
+                                minDetail = 0.3f;
+                            } else if (effectiveIso >= 800.f) {
+                                minDetail = 0.5f;
+                            } else if (effectiveIso >= 400.f) {
+                                minDetail = 0.7f;
+                            }
+                            currentDetailAlpha = minDetail + shadowFactor * (detailAlpha - minDetail);
                         }
 
                         // Add log details back (Log detail = logL - logBase)
@@ -750,15 +1413,23 @@ bool ToneMapStage::process(FrameContext& ctx) {
                         float scale = (L > 0.1f) ? compL / L : 1.f;
                         scale = std::min(scale, 10.0f);
                         
-                        float oR = R * scale;
-                        float oG = G * scale;
-                        float oB = B * scale;
+                        float sR = R * scale;
+                        float sG = G * scale;
+                        float sB = B * scale;
 
-                        // Apply desaturation / saturation boost
+                        // Apply Color Correction Matrix (CCM) to map sensor RGB to sRGB
+                        float oR = ccm[0] * sR + ccm[1] * sG + ccm[2] * sB;
+                        float oG = ccm[3] * sR + ccm[4] * sG + ccm[5] * sB;
+                        float oB = ccm[6] * sR + ccm[7] * sG + ccm[8] * sB;
+
+                        // Apply desaturation / saturation boost in sRGB space
                         float newL = luma(oR, oG, oB);
                         if (newL > 0.1f) {
                             float factor = saturationBoost;
-                            if (newL > 200.f) {
+                            if (newL < 30.f) {
+                                // Linear ramp down to 0 saturation as luma goes from 30 down to 0
+                                factor = factor * (newL / 30.f);
+                            } else if (newL > 200.f) {
                                 float t = (newL - 200.f) / (255.f - 200.f);
                                 factor = factor * (1.f - std::clamp(t, 0.f, 1.f));
                             }
@@ -780,9 +1451,14 @@ bool ToneMapStage::process(FrameContext& ctx) {
                             }
                         }
 
-                        dst[c*3]   = static_cast<uint8_t>(std::clamp(oR, 0.f, 255.f));
-                        dst[c*3+1] = static_cast<uint8_t>(std::clamp(oG, 0.f, 255.f));
-                        dst[c*3+2] = static_cast<uint8_t>(std::clamp(oB, 0.f, 255.f));
+                        // Apply an ISO-adaptive custom gamma correction to balance brightness
+                        float gammaR = std::powf(std::clamp(oR / 255.f, 0.f, 1.f), 1.f / finalGamma) * 255.f;
+                        float gammaG = std::powf(std::clamp(oG / 255.f, 0.f, 1.f), 1.f / finalGamma) * 255.f;
+                        float gammaB = std::powf(std::clamp(oB / 255.f, 0.f, 1.f), 1.f / finalGamma) * 255.f;
+
+                        dst[c*3]   = static_cast<uint8_t>(std::clamp(gammaR, 0.f, 255.f));
+                        dst[c*3+1] = static_cast<uint8_t>(std::clamp(gammaG, 0.f, 255.f));
+                        dst[c*3+2] = static_cast<uint8_t>(std::clamp(gammaB, 0.f, 255.f));
                     }
                 }
             }));
@@ -791,6 +1467,70 @@ bool ToneMapStage::process(FrameContext& ctx) {
         for (auto& fut : futures) {
             fut.get();
         }
+
+        // Multi-threaded CPU Bilateral Denoise Pass
+        std::vector<uint8_t> denoised(w * h * 3);
+        float spatial_sigma2 = 2.0f * spatialSigma * spatialSigma;
+        float range_sigma2 = 2.0f * chromaRangeSigma * chromaRangeSigma;
+        int radius = (effectiveIso >= 1600.f) ? 3 : 2;
+
+        std::vector<std::future<void>> denoiseFutures;
+        for (int t = 0; t < numThreads; ++t) {
+            int rStart = t * rowsPerThread;
+            int rEnd = (t == numThreads - 1) ? h : (t + 1) * rowsPerThread;
+
+            denoiseFutures.push_back(std::async(std::launch::async, [&ctx, &denoised, rStart, rEnd, w, h, spatial_sigma2, range_sigma2, radius]() {
+                for (int r = rStart; r < rEnd; ++r) {
+                    for (int c = 0; c < w; ++c) {
+                        float sumU = 0.f, sumV = 0.f, sumW = 0.f;
+                        float centerR = ctx.processedImage.data[(r * w + c) * 3 + 0];
+                        float centerG = ctx.processedImage.data[(r * w + c) * 3 + 1];
+                        float centerB = ctx.processedImage.data[(r * w + c) * 3 + 2];
+                        float centerL = 0.299f * centerR + 0.587f * centerG + 0.114f * centerB;
+
+                        for (int dy = -radius; dy <= radius; ++dy) {
+                            int nr = std::clamp(r + dy, 0, h - 1);
+                            for (int dx = -radius; dx <= radius; ++dx) {
+                                int nc = std::clamp(c + dx, 0, w - 1);
+                                
+                                float nR = ctx.processedImage.data[(nr * w + nc) * 3 + 0];
+                                float nG = ctx.processedImage.data[(nr * w + nc) * 3 + 1];
+                                float nB = ctx.processedImage.data[(nr * w + nc) * 3 + 2];
+                                float nL = 0.299f * nR + 0.587f * nG + 0.114f * nB;
+
+                                float dS2 = static_cast<float>(dx * dx + dy * dy);
+                                float dR = nL - centerL;
+                                float dR2 = dR * dR;
+
+                                float weight = std::expf(-dS2 / spatial_sigma2) * std::expf(-dR2 / range_sigma2);
+                                
+                                float nU = -0.1687f * nR - 0.3313f * nG + 0.5f * nB;
+                                float nV = 0.5f * nR - 0.4187f * nG - 0.0813f * nB;
+
+                                sumU += weight * nU;
+                                sumV += weight * nV;
+                                sumW += weight;
+                            }
+                        }
+
+                        float filteredU = sumU / sumW;
+                        float filteredV = sumV / sumW;
+
+                        float rVal = centerL + 1.402f * filteredV;
+                        float gVal = centerL - 0.34414f * filteredU - 0.71414f * filteredV;
+                        float bVal = centerL + 1.772f * filteredU;
+
+                        denoised[(r * w + c) * 3 + 0] = static_cast<uint8_t>(std::clamp(rVal, 0.f, 255.f));
+                        denoised[(r * w + c) * 3 + 1] = static_cast<uint8_t>(std::clamp(gVal, 0.f, 255.f));
+                        denoised[(r * w + c) * 3 + 2] = static_cast<uint8_t>(std::clamp(bVal, 0.f, 255.f));
+                    }
+                }
+            }));
+        }
+        for (auto& fut : denoiseFutures) {
+            fut.get();
+        }
+        ctx.processedImage.data = std::move(denoised);
     }
 
     // Save intermediate tonemapped RGB + JPEG
@@ -812,11 +1552,6 @@ bool ToneMapStage::process(FrameContext& ctx) {
                     out.close();
                 }
             }
-            
-            // JPEG previews
-            saveRgbAsJpeg(
-                ctx.processedImage.data.data(), w, h,
-                debugDir + "/stage_3_tonemap/tonemapped.jpg");
             
             // Saved final output matching name request
             saveRgbAsJpeg(

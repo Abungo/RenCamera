@@ -28,8 +28,8 @@ struct YuvFrame {
 //   Produced by AlignStage, consumed by FusionStage.
 // ─────────────────────────────────────────────────────────────────────────────
 struct MotionVec {
-    int dx = 0;
-    int dy = 0;
+    float dx = 0.f;
+    float dy = 0.f;
 };
 
 struct MotionField {

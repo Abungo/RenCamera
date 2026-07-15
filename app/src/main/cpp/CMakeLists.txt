@@ -78,6 +78,7 @@ set_target_properties(halide_runtime PROPERTIES
 add_library(gcam_core SHARED
     gcam_core.cpp
     pipeline.cpp
+    stages/defect_pixel_stage.cpp
     stages/align_stage.cpp
     stages/fusion_stage.cpp
     stages/debayer_stage.cpp

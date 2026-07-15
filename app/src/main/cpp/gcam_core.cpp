@@ -11,6 +11,7 @@
 #include "pipeline.h"
 #include "frame_context.h"
 #include "debug_utils.h"
+#include "stages/defect_pixel_stage.h"
 #include "stages/align_stage.h"
 #include "stages/fusion_stage.h"
 #include "stages/debayer_stage.h"
@@ -37,6 +38,7 @@ static Pipeline buildPipeline(
     bool enableEncode)
 {
     Pipeline p;
+    p.addStage(std::make_unique<DefectPixelStage>());
     p.addStage(std::make_unique<AlignStage>());
     p.addStage(std::make_unique<FusionStage>());
     p.addStage(std::make_unique<DebayerStage>());
@@ -45,6 +47,7 @@ static Pipeline buildPipeline(
     p.addStage(std::make_unique<ToneMapStage>());
     p.addStage(std::make_unique<EncodeStage>());
 
+    p.setEnabled("defect_pixel", true);
     p.setEnabled("align",   enableAlign);
     p.setEnabled("fuse",    enableFuse);
     p.setEnabled("debayer", enableDebayer);
@@ -473,19 +476,83 @@ Java_com_renskylab_camera_NativeEngine_processCopiedBurst(
             ctx.metadata["debug_images_enabled"] = true;
         }
         
+        if (env->GetArrayLength(configParams) > 19) {
+            ctx.metadata["denoise_pass1_enabled"] = static_cast<bool>(params[15] > 0.5f);
+            ctx.metadata["denoise_pass1_strength"] = static_cast<float>(params[16]);
+            ctx.metadata["denoise_pass2_enabled"] = static_cast<bool>(params[17] > 0.5f);
+            ctx.metadata["denoise_pass2_strength"] = static_cast<float>(params[18]);
+            ctx.metadata["tonemap_exposure_boost"] = static_cast<float>(params[19]);
+        } else {
+            ctx.metadata["denoise_pass1_enabled"] = true;
+            ctx.metadata["denoise_pass1_strength"] = 1.0f;
+            ctx.metadata["denoise_pass2_enabled"] = true;
+            ctx.metadata["denoise_pass2_strength"] = 0.5f;
+            ctx.metadata["tonemap_exposure_boost"] = 1.30f;
+        }
+        
         float digitalGain = 1.0f;
-        if (env->GetArrayLength(configParams) > 15) {
-            digitalGain = params[15];
+        if (env->GetArrayLength(configParams) > 20) {
+            digitalGain = params[20];
         }
         ctx.metadata["digital_gain"] = digitalGain;
         LOGI("Extracted digital gain from JNI: %.3fx", digitalGain);
 
         float appliedEv = 0.0f;
-        if (env->GetArrayLength(configParams) > 16) {
-            appliedEv = params[16];
+        if (env->GetArrayLength(configParams) > 21) {
+            appliedEv = params[21];
         }
         ctx.metadata["applied_ev_compensation"] = appliedEv;
         LOGI("Extracted applied EV compensation from JNI: %.3f EV", appliedEv);
+
+        // Dynamic AWB Gains (Indices 22-24)
+        std::vector<float> awbGains(3);
+        if (env->GetArrayLength(configParams) > 24) {
+            awbGains[0] = params[22];
+            awbGains[1] = params[23];
+            awbGains[2] = params[24];
+        } else {
+            awbGains = {2.1f, 1.0f, 1.9f};
+        }
+        ctx.metadata["awb_gains"] = awbGains;
+        LOGI("Extracted dynamic AWB gains from JNI: R=%.3f, G=%.3f, B=%.3f", awbGains[0], awbGains[1], awbGains[2]);
+
+        // Dynamic Color Correction Matrix (Indices 25-33)
+        std::vector<float> ccm(9);
+        if (env->GetArrayLength(configParams) > 33) {
+            for (int i = 0; i < 9; ++i) {
+                ccm[i] = params[25 + i];
+            }
+        } else {
+            ccm = {
+                1.0f, 0.0f, 0.0f,
+                0.0f, 1.0f, 0.0f,
+                0.0f, 0.0f, 1.0f
+            };
+        }
+        ctx.metadata["color_correction_matrix"] = ccm;
+        LOGI("Extracted dynamic Color Correction Matrix (CCM) from JNI: [%.3f, %.3f, %.3f; %.3f, %.3f, %.3f; %.3f, %.3f, %.3f]",
+             ccm[0], ccm[1], ccm[2], ccm[3], ccm[4], ccm[5], ccm[6], ccm[7], ccm[8]);
+
+        int cfaPattern = 3; // default BGGR
+        if (env->GetArrayLength(configParams) > 34) {
+            cfaPattern = static_cast<int>(params[34]);
+        }
+        ctx.metadata["cfa_pattern"] = cfaPattern;
+        LOGI("Extracted CFA pattern arrangement from JNI: %d", cfaPattern);
+
+        float blackLevel = 1024.f;
+        if (env->GetArrayLength(configParams) > 35) {
+            blackLevel = params[35];
+        }
+        ctx.metadata["black_level"] = blackLevel;
+        LOGI("Extracted black level from JNI: %.1f", blackLevel);
+
+        float whiteLevel = 4095.f;
+        if (env->GetArrayLength(configParams) > 36) {
+            whiteLevel = params[36];
+        }
+        ctx.metadata["white_level"] = whiteLevel;
+        LOGI("Extracted white level from JNI: %.1f", whiteLevel);
 
         env->ReleaseFloatArrayElements(configParams, params, JNI_ABORT);
     }

@@ -48,6 +48,28 @@ static void convertRowScalar(
     }
 }
 
+static inline int getPixelColorPattern(int r, int c, int cfaPattern) {
+    int row = r % 2;
+    int col = c % 2;
+    if (cfaPattern == 0) { // RGGB
+        if (row == 0 && col == 0) return 0; // Red
+        if (row == 1 && col == 1) return 2; // Blue
+        return 1; // Green
+    } else if (cfaPattern == 1) { // GRBG
+        if (row == 0 && col == 1) return 0; // Red
+        if (row == 1 && col == 0) return 2; // Blue
+        return 1; // Green
+    } else if (cfaPattern == 2) { // GBRG
+        if (row == 1 && col == 0) return 0; // Red
+        if (row == 0 && col == 1) return 2; // Blue
+        return 1; // Green
+    } else { // BGGR (3)
+        if (row == 1 && col == 1) return 0; // Red
+        if (row == 0 && col == 0) return 2; // Blue
+        return 1; // Green
+    }
+}
+
 } // anonymous namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -65,6 +87,25 @@ bool DebayerStage::process(FrameContext& ctx) {
     int h = ctx.fusedHeight;
     ctx.colorImage.resize(w, h);
 
+    float rGain = 1.0f;
+    float gGain = 1.0f;
+    float bGain = 1.0f;
+    std::vector<float> ccm = {
+        1.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 1.0f
+    };
+
+    uint16_t minVal = 65535;
+    uint16_t maxVal = 0;
+    float blackLevel = 1024.f;
+    float whiteLevel = 4095.f;
+
+    int cfaPattern = 3; // default BGGR
+    if (ctx.metadata.count("cfa_pattern")) {
+        try { cfaPattern = std::any_cast<int>(ctx.metadata.at("cfa_pattern")); } catch (...) {}
+    }
+
     if (useRaw) {
         if (!ctx.metadata.count("fused_raw")) {
             LOGE("DebayerStage: no fused RAW frame in metadata");
@@ -72,33 +113,45 @@ bool DebayerStage::process(FrameContext& ctx) {
         }
         const auto& fusedRaw = std::any_cast<const std::vector<uint16_t>&>(ctx.metadata.at("fused_raw"));
         
-        // Dynamically detect bit depth and black level from fusedRaw buffer
-        float blackLevel = 1024.f;
-        float whiteLevel = 4095.f;
-        
-        uint16_t minVal = 65535;
-        uint16_t maxVal = 0;
-        for (uint16_t v : fusedRaw) {
-            if (v < minVal) minVal = v;
-            if (v > maxVal) maxVal = v;
+        bool hasMetadataRange = false;
+        if (ctx.metadata.count("black_level") && ctx.metadata.count("white_level")) {
+            try {
+                blackLevel = std::any_cast<float>(ctx.metadata.at("black_level"));
+                whiteLevel = std::any_cast<float>(ctx.metadata.at("white_level"));
+                hasMetadataRange = true;
+                LOGI("DebayerStage: Using JNI metadata black level = %.1f, white level = %.1f", blackLevel, whiteLevel);
+            } catch (...) {}
         }
-        LOGI("DebayerStage: RAW range detection — min = %d, max = %d", minVal, maxVal);
 
-        if (maxVal <= 1023) {
-            // 10-bit RAW (e.g. standard 10-bit Bayer)
-            blackLevel = 64.f;
-            whiteLevel = 1023.f;
-        } else if (maxVal <= 4095) {
-            // 12-bit RAW
+        if (!hasMetadataRange) {
+            // Dynamically detect bit depth and black level from fusedRaw buffer
             blackLevel = 1024.f;
-            if (minVal < 300) blackLevel = 256.f;
-            if (minVal < 100) blackLevel = 64.f;
             whiteLevel = 4095.f;
-        } else {
-            // 14-bit or 16-bit RAW
-            blackLevel = 1024.f;
-            if (minVal < 500) blackLevel = 256.f;
-            whiteLevel = static_cast<float>(maxVal);
+            
+            minVal = 65535;
+            maxVal = 0;
+            for (uint16_t v : fusedRaw) {
+                if (v < minVal) minVal = v;
+                if (v > maxVal) maxVal = v;
+            }
+            LOGI("DebayerStage: RAW range detection — min = %d, max = %d", minVal, maxVal);
+
+            if (maxVal <= 1023) {
+                // 10-bit RAW (e.g. standard 10-bit Bayer)
+                blackLevel = 64.f;
+                whiteLevel = 1023.f;
+            } else if (maxVal <= 4095) {
+                // 12-bit RAW
+                blackLevel = 1024.f;
+                if (minVal < 300) blackLevel = 256.f;
+                if (minVal < 100) blackLevel = 64.f;
+                whiteLevel = 4095.f;
+            } else {
+                // 14-bit or 16-bit RAW
+                blackLevel = 1024.f;
+                if (minVal < 500) blackLevel = 256.f;
+                whiteLevel = static_cast<float>(maxVal);
+            }
         }
 
         float digitalGain = 1.0f;
@@ -107,13 +160,35 @@ bool DebayerStage::process(FrameContext& ctx) {
         }
         LOGI("DebayerStage: applying digital gain = %.3fx", digitalGain);
 
-        // Adjust scaling factor based on calculated dynamic range and digital exposure matching gain
-        float scale = (255.f / std::max(1.f, whiteLevel - blackLevel)) * digitalGain;
+        // Adjust scaling factor based on calculated dynamic range to preserve highlights from clipping
+        float scale = 255.f / std::max(1.f, whiteLevel - blackLevel);
 
         // Sony sensor color channel gain defaults to neutralize green tint
-        float rGain = 2.1f;
-        float bGain = 1.9f;
-        float gGain = 1.0f;
+        rGain = 2.1f;
+        bGain = 1.9f;
+        gGain = 1.0f;
+
+        if (ctx.metadata.count("awb_gains")) {
+            try {
+                auto gains = std::any_cast<std::vector<float>>(ctx.metadata.at("awb_gains"));
+                if (gains.size() >= 3) {
+                    rGain = gains[0];
+                    gGain = gains[1];
+                    bGain = gains[2];
+                }
+            } catch (...) {}
+        }
+
+        ccm = {
+            1.0f, 0.0f, 0.0f,
+            0.0f, 1.0f, 0.0f,
+            0.0f, 0.0f, 1.0f
+        };
+        if (ctx.metadata.count("color_correction_matrix")) {
+            try {
+                ccm = std::any_cast<std::vector<float>>(ctx.metadata.at("color_correction_matrix"));
+            } catch (...) {}
+        }
 
         // ── GPU HEADLESS COMPUTE SHADER SABRE MULTI-FRAME DEMOSAICING ────────────────────────────
         bool success = false;
@@ -146,37 +221,75 @@ bool DebayerStage::process(FrameContext& ctx) {
 
                 uniform float u_black_level;
                 uniform float u_scale;
+                uniform float u_raw_range_sigma;
                 uniform float u_r_gain;
                 uniform float u_g_gain;
                 uniform float u_b_gain;
+                uniform int u_cfa_pattern;
 
                 layout(std430, binding = 0) writeonly buffer OutputBuffer {
                     uint outRGB[];
                 };
 
+                int getPixelColor(ivec2 p) {
+                    int r = p.y % 2;
+                    int c = p.x % 2;
+                    if (u_cfa_pattern == 0) { // RGGB
+                        if (r == 0 && c == 0) return 0;
+                        if (r == 1 && c == 1) return 2;
+                        return 1;
+                    } else if (u_cfa_pattern == 1) { // GRBG
+                        if (r == 0 && c == 1) return 0;
+                        if (r == 1 && c == 0) return 2;
+                        return 1;
+                    } else if (u_cfa_pattern == 2) { // GBRG
+                        if (r == 1 && c == 0) return 0;
+                        if (r == 0 && c == 1) return 2;
+                        return 1;
+                    } else { // BGGR (3)
+                        if (r == 1 && c == 1) return 0;
+                        if (r == 0 && c == 0) return 2;
+                        return 1;
+                    }
+                }
+
                 float getRawCorrected(ivec2 p, int frameIdx) {
                     int cx = clamp(p.x, 0, u_width - 1);
                     int cy = clamp(p.y, 0, u_height - 1);
                     uint val = texelFetch(u_raw_frames, ivec3(cx, cy, frameIdx), 0).r;
-                    float cleanVal = max(0.0, (float(val) - u_black_level) * u_scale);
+                    float centerCleanVal = max(0.0, (float(val) - u_black_level) * u_scale);
 
-                    bool isEvenRow = (cy % 2 == 0);
-                    bool isEvenCol = (cx % 2 == 0);
-                    if (isEvenRow && isEvenCol) {
-                        return cleanVal * u_b_gain; // Blue (BGGR)
-                    } else if (!isEvenRow && !isEvenCol) {
-                        return cleanVal * u_r_gain; // Red
-                    } else {
-                        return cleanVal * u_g_gain; // Green
+                    // Bayer spatial bilateral filter on same-color pixels
+                    float sumVal = 0.0;
+                    float sumW = 0.0;
+                    
+                    float rSigma2 = 2.0 * u_raw_range_sigma * u_raw_range_sigma;
+                    float sSigma2 = 2.0 * 1.5 * 1.5;
+
+                    for (int dy = -2; dy <= 2; dy += 2) {
+                        for (int dx = -2; dx <= 2; dx += 2) {
+                            ivec2 np = clamp(p + ivec2(dx, dy), ivec2(0), ivec2(u_width - 1, u_height - 1));
+                            uint nRawVal = texelFetch(u_raw_frames, ivec3(np.x, np.y, frameIdx), 0).r;
+                            float nCleanVal = max(0.0, (float(nRawVal) - u_black_level) * u_scale);
+
+                            float diff = nCleanVal - centerCleanVal;
+                            float dS2 = float((dx/2)*(dx/2) + (dy/2)*(dy/2));
+                            float w = exp(-dS2 / sSigma2) * exp(-diff*diff / rSigma2);
+
+                            sumVal += w * nCleanVal;
+                            sumW += w;
+                        }
                     }
-                }
+                    float cleanVal = (sumW > 1e-4) ? (sumVal / sumW) : centerCleanVal;
 
-                int getPixelColor(ivec2 p) {
-                    bool isEvenRow = (p.y % 2 == 0);
-                    bool isEvenCol = (p.x % 2 == 0);
-                    if (isEvenRow && isEvenCol) return 2; // Blue
-                    if (!isEvenRow && !isEvenCol) return 0; // Red
-                    return 1; // Green
+                    int color = getPixelColor(p);
+                    if (color == 0) {
+                        return cleanVal * u_r_gain;
+                    } else if (color == 2) {
+                        return cleanVal * u_b_gain;
+                    } else {
+                        return cleanVal * u_g_gain;
+                    }
                 }
 
                 void main() {
@@ -318,9 +431,11 @@ bool DebayerStage::process(FrameContext& ctx) {
                         if (needB) finalB = fallbackB;
                     }
 
-                    uint uR = uint(clamp(finalR, 0.0, 255.0));
-                    uint uG = uint(clamp(finalG, 0.0, 255.0));
-                    uint uB = uint(clamp(finalB, 0.0, 255.0));
+                    vec3 sensorRgb = vec3(finalR, finalG, finalB);
+
+                    uint uR = uint(clamp(sensorRgb.r, 0.0, 255.0));
+                    uint uG = uint(clamp(sensorRgb.g, 0.0, 255.0));
+                    uint uB = uint(clamp(sensorRgb.b, 0.0, 255.0));
 
                     uint packedVal = uR | (uG << 8) | (uB << 16) | (255u << 24);
                     outRGB[pos.y * u_width + pos.x] = packedVal;
@@ -331,18 +446,14 @@ bool DebayerStage::process(FrameContext& ctx) {
             if (program != 0) {
                 glUseProgram(program);
 
-                // 1. Upload all RAW burst frames to a 2D Texture Array (Frame 0 = fusedRaw)
+                // 1. Upload the temporally fused RAW frame to slice 0 of the texture array
                 GLuint rawTextureArray;
                 glGenTextures(1, &rawTextureArray);
                 glActiveTexture(GL_TEXTURE0);
                 glBindTexture(GL_TEXTURE_2D_ARRAY, rawTextureArray);
-                glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_R16UI, w, h, numFrames);
-                for (int f = 0; f < numFrames; ++f) {
-                    const uint16_t* frameRaw = (f == 0) ? fusedRaw.data() : reinterpret_cast<const uint16_t*>(ctx.inputFrames[f].yPlane);
-                    glPixelStorei(GL_UNPACK_ROW_LENGTH, ctx.inputFrames[f].yRowStride / 2);
-                    glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, f, w, h, 1, GL_RED_INTEGER, GL_UNSIGNED_SHORT, frameRaw);
-                }
+                glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_R16UI, w, h, 1);
                 glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+                glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, w, h, 1, GL_RED_INTEGER, GL_UNSIGNED_SHORT, fusedRaw.data());
                 glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
                 glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
@@ -376,18 +487,32 @@ bool DebayerStage::process(FrameContext& ctx) {
                 // 3. Set Uniforms
                 glUniform1i(glGetUniformLocation(program, "u_raw_frames"), 0);
                 glUniform1i(glGetUniformLocation(program, "u_motion_fields"), 1);
-                glUniform1i(glGetUniformLocation(program, "u_num_frames"), numFrames);
+                glUniform1i(glGetUniformLocation(program, "u_num_frames"), 1);
                 glUniform1i(glGetUniformLocation(program, "u_width"), w);
                 glUniform1i(glGetUniformLocation(program, "u_height"), h);
                 glUniform1i(glGetUniformLocation(program, "u_blocks_wide"), blocksWide);
                 glUniform1i(glGetUniformLocation(program, "u_blocks_tall"), blocksTall);
                 glUniform1f(glGetUniformLocation(program, "u_block_size"), static_cast<float>(blockSize));
 
+                int iso = 100;
+                if (ctx.metadata.count("iso")) {
+                    try { iso = std::any_cast<int>(ctx.metadata.at("iso")); } catch (...) {}
+                }
+                float digitalGain = 1.0f;
+                if (ctx.metadata.count("digital_gain")) {
+                    try { digitalGain = std::any_cast<float>(ctx.metadata.at("digital_gain")); } catch (...) {}
+                }
+                float effectiveIso = iso * digitalGain;
+                float rawRangeSigma = 0.015f + (effectiveIso / 100.0f) * 0.012f;
+                rawRangeSigma = std::clamp(rawRangeSigma, 0.015f, 0.25f);
+
                 glUniform1f(glGetUniformLocation(program, "u_black_level"), blackLevel);
                 glUniform1f(glGetUniformLocation(program, "u_scale"), scale);
+                glUniform1f(glGetUniformLocation(program, "u_raw_range_sigma"), rawRangeSigma);
                 glUniform1f(glGetUniformLocation(program, "u_r_gain"), rGain);
                 glUniform1f(glGetUniformLocation(program, "u_g_gain"), gGain);
                 glUniform1f(glGetUniformLocation(program, "u_b_gain"), bGain);
+                glUniform1i(glGetUniformLocation(program, "u_cfa_pattern"), cfaPattern);
 
                 // Create output SSBO for packed RGB
                 GLuint outBuffer;
@@ -427,29 +552,63 @@ bool DebayerStage::process(FrameContext& ctx) {
 
     if (!success) {
             LOGE("GL Demosaicing failed, falling back to CPU multi-threaded Bilinear demosaicing. GL Errors:\n%s", errorLog.c_str());
-            // Bilinear Demosaicing (BGGR layout) - Multi-threaded CPU Fallback
+            // Bilinear Demosaicing (Dynamic CFA pattern layout) - Multi-threaded CPU Fallback
             int numThreads = 8;
             int rowsPerThread = h / numThreads;
             std::vector<std::future<void>> futures;
             futures.reserve(numThreads);
 
+            int iso = 100;
+            if (ctx.metadata.count("iso")) {
+                try { iso = std::any_cast<int>(ctx.metadata.at("iso")); } catch (...) {}
+            }
+            float digitalGain = 1.0f;
+            if (ctx.metadata.count("digital_gain")) {
+                try { digitalGain = std::any_cast<float>(ctx.metadata.at("digital_gain")); } catch (...) {}
+            }
+            float effectiveIso = iso * digitalGain;
+            float rawRangeSigma = 0.015f + (effectiveIso / 100.0f) * 0.012f;
+            rawRangeSigma = std::clamp(rawRangeSigma, 0.015f, 0.25f);
+
             for (int t = 0; t < numThreads; ++t) {
                 int rStart = t * rowsPerThread;
                 int rEnd = (t == numThreads - 1) ? h : (t + 1) * rowsPerThread;
 
-                futures.push_back(std::async(std::launch::async, [&ctx, &fusedRaw, rStart, rEnd, w, h, blackLevel, scale, rGain, gGain, bGain]() {
-                    auto getRaw = [&](int r, int cc) -> float {
+                futures.push_back(std::async(std::launch::async, [&ctx, &fusedRaw, rStart, rEnd, w, h, blackLevel, scale, rGain, gGain, bGain, ccm, cfaPattern, rawRangeSigma]() {
+                    auto getRaw = [&fusedRaw, w, h, blackLevel, scale, rGain, gGain, bGain, cfaPattern, rawRangeSigma](int r, int cc) -> float {
                         int cr = std::clamp(r, 0, h - 1);
                         int c_clamped = std::clamp(cc, 0, w - 1);
-                        float val = static_cast<float>(fusedRaw[cr * w + c_clamped]);
-                        float cleanVal = std::max(0.f, (val - blackLevel) * scale);
+                        float centerVal = static_cast<float>(fusedRaw[cr * w + c_clamped]);
+                        float centerClean = std::max(0.f, (centerVal - blackLevel) * scale);
 
-                        bool isEvenRow = (cr % 2 == 0);
-                        bool isEvenCol = (c_clamped % 2 == 0);
-                        if (isEvenRow && isEvenCol) {
-                            return cleanVal * bGain; // Blue
-                        } else if (!isEvenRow && !isEvenCol) {
+                        // CPU same-color Bayer bilateral filter
+                        float sumVal = 0.f;
+                        float sumW = 0.f;
+                        float rSigma2 = 2.f * rawRangeSigma * rawRangeSigma;
+                        float sSigma2 = 2.f * 1.5f * 1.5f;
+
+                        for (int dy = -2; dy <= 2; dy += 2) {
+                            for (int dx = -2; dx <= 2; dx += 2) {
+                                int nr = std::clamp(cr + dy, 0, h - 1);
+                                int nc = std::clamp(c_clamped + dx, 0, w - 1);
+                                float val = static_cast<float>(fusedRaw[nr * w + nc]);
+                                float clean = std::max(0.f, (val - blackLevel) * scale);
+
+                                float diff = clean - centerClean;
+                                float dS2 = static_cast<float>((dx/2)*(dx/2) + (dy/2)*(dy/2));
+                                float weight = std::expf(-dS2 / sSigma2) * std::expf(-diff*diff / rSigma2);
+
+                                sumVal += weight * clean;
+                                sumW += weight;
+                            }
+                        }
+                        float cleanVal = (sumW > 1e-4f) ? (sumVal / sumW) : centerClean;
+
+                        int color = getPixelColorPattern(cr, c_clamped, cfaPattern);
+                        if (color == 0) {
                             return cleanVal * rGain; // Red
+                        } else if (color == 2) {
+                            return cleanVal * bGain; // Blue
                         } else {
                             return cleanVal * gGain; // Green
                         }
@@ -459,29 +618,27 @@ bool DebayerStage::process(FrameContext& ctx) {
                         uint8_t* rgbRow = ctx.colorImage.rowPtr(r);
                         for (int c = 0; c < w; ++c) {
                             float R = 0.f, G = 0.f, B = 0.f;
-                            bool isEvenRow = (r % 2 == 0);
-                            bool isEvenCol = (c % 2 == 0);
+                            int color = getPixelColorPattern(r, c, cfaPattern);
 
-                            if (isEvenRow && isEvenCol) {
-                                // Blue pixel
-                                R = (getRaw(r-1, c-1) + getRaw(r-1, c+1) + getRaw(r+1, c-1) + getRaw(r+1, c+1)) * 0.25f;
-                                G = (getRaw(r-1, c) + getRaw(r+1, c) + getRaw(r, c-1) + getRaw(r, c+1)) * 0.25f;
-                                B = getRaw(r, c);
-                            } else if (!isEvenRow && !isEvenCol) {
-                                // Red pixel
+                            if (color == 0) { // Red pixel
                                 R = getRaw(r, c);
                                 G = (getRaw(r-1, c) + getRaw(r+1, c) + getRaw(r, c-1) + getRaw(r, c+1)) * 0.25f;
                                 B = (getRaw(r-1, c-1) + getRaw(r-1, c+1) + getRaw(r+1, c-1) + getRaw(r+1, c+1)) * 0.25f;
-                            } else if (isEvenRow && !isEvenCol) {
-                                // Green pixel on Blue row
-                                R = (getRaw(r-1, c) + getRaw(r+1, c)) * 0.5f;
-                                G = getRaw(r, c);
-                                B = (getRaw(r, c-1) + getRaw(r, c+1)) * 0.5f;
-                            } else {
-                                // Green pixel on Red row
-                                R = (getRaw(r, c-1) + getRaw(r, c+1)) * 0.5f;
-                                G = getRaw(r, c);
-                                B = (getRaw(r-1, c) + getRaw(r+1, c)) * 0.5f;
+                            } else if (color == 2) { // Blue pixel
+                                R = (getRaw(r-1, c-1) + getRaw(r-1, c+1) + getRaw(r+1, c-1) + getRaw(r+1, c+1)) * 0.25f;
+                                G = (getRaw(r-1, c) + getRaw(r+1, c) + getRaw(r, c-1) + getRaw(r, c+1)) * 0.25f;
+                                B = getRaw(r, c);
+                            } else { // Green pixel
+                                bool isRedRow = (getPixelColorPattern(r, c-1, cfaPattern) == 0 || getPixelColorPattern(r, c+1, cfaPattern) == 0);
+                                if (isRedRow) {
+                                    R = (getRaw(r, c-1) + getRaw(r, c+1)) * 0.5f;
+                                    G = getRaw(r, c);
+                                    B = (getRaw(r-1, c) + getRaw(r+1, c)) * 0.5f;
+                                } else {
+                                    R = (getRaw(r-1, c) + getRaw(r+1, c)) * 0.5f;
+                                    G = getRaw(r, c);
+                                    B = (getRaw(r, c-1) + getRaw(r, c+1)) * 0.5f;
+                                }
                             }
 
                             rgbRow[c * 3 + 0] = static_cast<uint8_t>(std::clamp(R, 0.f, 255.f));
@@ -552,10 +709,38 @@ bool DebayerStage::process(FrameContext& ctx) {
                 }
             }
             
+            // Create a gamma-corrected copy for preview visualization (without modifying the linear pipeline data)
+            std::vector<uint8_t> previewRgb(ctx.colorImage.data.size());
+            for (size_t i = 0; i < previewRgb.size(); ++i) {
+                float norm = ctx.colorImage.data[i] / 255.f;
+                previewRgb[i] = static_cast<uint8_t>(std::clamp(std::sqrt(norm) * 255.f, 0.f, 255.f));
+            }
+
             // JPEG preview
             saveRgbAsJpeg(
-                ctx.colorImage.data.data(), w, h,
+                previewRgb.data(), w, h,
                 debugDir + "/stage_2_debayer/debayered.jpg");
+
+            // Save white balance and CCM info
+            std::string infoPath = debugDir + "/stage_2_debayer/color_info.txt";
+            std::ofstream infoOut(infoPath);
+            if (infoOut) {
+                infoOut << "AWB Gains:\n";
+                infoOut << "R: " << rGain << "\n";
+                infoOut << "G: " << gGain << "\n";
+                infoOut << "B: " << bGain << "\n\n";
+                infoOut << "CCM Matrix:\n";
+                infoOut << ccm[0] << ", " << ccm[1] << ", " << ccm[2] << "\n";
+                infoOut << ccm[3] << ", " << ccm[4] << ", " << ccm[5] << "\n";
+                infoOut << ccm[6] << ", " << ccm[7] << ", " << ccm[8] << "\n\n";
+                infoOut << "CFA Pattern: " << cfaPattern << "\n\n";
+                infoOut << "RAW detection:\n";
+                infoOut << "Min Val: " << minVal << "\n";
+                infoOut << "Max Val: " << maxVal << "\n";
+                infoOut << "Black Level: " << blackLevel << "\n";
+                infoOut << "White Level: " << whiteLevel << "\n";
+                infoOut.close();
+            }
         } catch (...) {}
     }
 

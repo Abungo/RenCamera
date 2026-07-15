@@ -41,11 +41,13 @@ data class ProcessingJob(
     val onSaved: (Uri) -> Unit,
     val onError: (String) -> Unit,
     val awbGains: FloatArray? = null,
+    val colorCorrectionMatrix: FloatArray? = null,
     val blackLevel: Float = 1024f,
     val whiteLevel: Float = 4095f,
     val digitalGain: Float = 1.0f,
     val sensorOrientation: Int = 90,
-    val appliedEvCompensation: Float = 0.0f
+    val appliedEvCompensation: Float = 0.0f,
+    val colorFilterArrangement: Int = 3
 )
 
 /**

@@ -72,6 +72,7 @@ fun RenCameraApp(viewModel: CameraViewModel) {
     val uiState by viewModel.uiState.collectAsState()
     val config by viewModel.pipelineConfig.collectAsState()
     val captureProgress by viewModel.controller.captureProgress.collectAsState()
+    val context = LocalContext.current
     var showSettings by remember { mutableStateOf(false) }
     var showDropdownSettings by remember { mutableStateOf(false) }
 
@@ -95,6 +96,66 @@ fun RenCameraApp(viewModel: CameraViewModel) {
         }
     )
 
+    // Launcher for Custom Noise Model C file import (Back Camera)
+    val backNoiseImportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+        onResult = { uri ->
+            if (uri != null) {
+                try {
+                    val content = context.contentResolver.openInputStream(uri)?.use { 
+                        it.bufferedReader().readText() 
+                    }
+                    if (content != null) {
+                        val parsed = parseCNoiseModel(content)
+                        if (parsed != null) {
+                            viewModel.updateConfig(config.copy(
+                                backNoiseA = parsed[0],
+                                backNoiseB = parsed[1],
+                                backNoiseC = parsed[2],
+                                backNoiseD = parsed[3]
+                            ))
+                            android.widget.Toast.makeText(context, "Rear camera noise model loaded successfully!", android.widget.Toast.LENGTH_SHORT).show()
+                        } else {
+                            android.widget.Toast.makeText(context, "Error: Could not parse .c noise model variables!", android.widget.Toast.LENGTH_LONG).show()
+                        }
+                    }
+                } catch (e: Exception) {
+                    android.widget.Toast.makeText(context, "Error reading file: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    )
+
+    // Launcher for Custom Noise Model C file import (Front Camera)
+    val frontNoiseImportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+        onResult = { uri ->
+            if (uri != null) {
+                try {
+                    val content = context.contentResolver.openInputStream(uri)?.use { 
+                        it.bufferedReader().readText() 
+                    }
+                    if (content != null) {
+                        val parsed = parseCNoiseModel(content)
+                        if (parsed != null) {
+                            viewModel.updateConfig(config.copy(
+                                frontNoiseA = parsed[0],
+                                frontNoiseB = parsed[1],
+                                frontNoiseC = parsed[2],
+                                frontNoiseD = parsed[3]
+                            ))
+                            android.widget.Toast.makeText(context, "Front camera noise model loaded successfully!", android.widget.Toast.LENGTH_SHORT).show()
+                        } else {
+                            android.widget.Toast.makeText(context, "Error: Could not parse .c noise model variables!", android.widget.Toast.LENGTH_LONG).show()
+                        }
+                    }
+                } catch (e: Exception) {
+                    android.widget.Toast.makeText(context, "Error reading file: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    )
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -102,7 +163,6 @@ fun RenCameraApp(viewModel: CameraViewModel) {
     ) {
         // Bind CameraController to Activity Lifecycle events
         val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
-        val context = LocalContext.current
         var currentTexture by remember { mutableStateOf<SurfaceTexture?>(null) }
 
         DisposableEffect(lifecycleOwner) {
@@ -309,12 +369,13 @@ fun RenCameraApp(viewModel: CameraViewModel) {
                 modifier  = Modifier.padding(bottom = 24.dp),
             )
 
-            // Main controls: gallery | shutter | (placeholder for front cam)
+            // Main controls: gallery | shutter | front camera flip
             BottomControlsRow(
                 isProcessing    = uiState.isProcessing,
                 captureProgress = captureProgress,
                 lastCapturedUri = uiState.lastCapturedUri,
                 onShutter       = viewModel::onShutterPressed,
+                onFlipCamera    = viewModel::toggleCameraFacing,
                 modifier        = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 40.dp, vertical = 16.dp),
@@ -351,6 +412,8 @@ fun RenCameraApp(viewModel: CameraViewModel) {
                 onConfigChange = viewModel::updateConfig,
                 onExport = { exportLauncher.launch("ren_camera_config.xml") },
                 onImport = { importLauncher.launch(arrayOf("text/xml", "application/xml")) },
+                onImportBackNoise = { backNoiseImportLauncher.launch(arrayOf("*/*")) },
+                onImportFrontNoise = { frontNoiseImportLauncher.launch(arrayOf("*/*")) },
                 onClose = { showSettings = false }
             )
         }
@@ -622,6 +685,7 @@ private fun BottomControlsRow(
     captureProgress: Float,
     lastCapturedUri: android.net.Uri?,
     onShutter: () -> Unit,
+    onFlipCamera: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Row(
@@ -705,18 +769,19 @@ private fun BottomControlsRow(
             onPress      = onShutter,
         )
 
-        // Flip camera (placeholder)
+        // Flip camera
         Box(
             modifier = Modifier
                 .size(52.dp)
                 .clip(CircleShape)
-                .background(SurfaceGlass),
+                .background(SurfaceGlass)
+                .clickable(enabled = !isProcessing) { onFlipCamera() },
             contentAlignment = Alignment.Center,
         ) {
             Icon(
                 imageVector        = Icons.Default.Cameraswitch,
                 contentDescription = "Flip camera",
-                tint               = White60,
+                tint               = if (isProcessing) White60.copy(alpha = 0.5f) else White60,
                 modifier           = Modifier.size(24.dp),
             )
         }
@@ -916,6 +981,8 @@ private fun SettingsScreen(
     onConfigChange: (PipelineConfig) -> Unit,
     onExport: () -> Unit,
     onImport: () -> Unit,
+    onImportBackNoise: () -> Unit,
+    onImportFrontNoise: () -> Unit,
     onClose: () -> Unit
 ) {
     var infoDialogText by remember { mutableStateOf<Pair<String, String>?>(null) }
@@ -926,6 +993,7 @@ private fun SettingsScreen(
     var expandedFuse by remember { mutableStateOf(false) }
     var expandedAwb by remember { mutableStateOf(false) }
     var expandedToneMap by remember { mutableStateOf(false) }
+    var expandedNoise by remember { mutableStateOf(false) }
     var expandedDebug by remember { mutableStateOf(false) }
 
     Box(
@@ -1087,7 +1155,11 @@ private fun SettingsScreen(
                         onConfigChange(config.copy(
                             fusionNoiseMultiplier = 3.0f,
                             chromaDenoiseEnabled = true,
-                            spatialDenoiseStrength = 8
+                            spatialDenoiseStrength = 8,
+                            denoisePass1Enabled = true,
+                            denoisePass1Strength = 1.0f,
+                            denoisePass2Enabled = true,
+                            denoisePass2Strength = 0.5f
                         ))
                     }
                 ) {
@@ -1112,6 +1184,48 @@ private fun SettingsScreen(
                         onValueChange = { onConfigChange(config.copy(spatialDenoiseStrength = it.toInt())) },
                         onShowInfo = { infoDialogText = "Spatial Denoise Strength" to "Applies Non-Local Means (NLM) denoising on the fused luma (Y) plane before tonemapping. Unlike a blur, NLM preserves sharp edges by averaging only patches with similar texture. 'h' parameter controls smoothing aggressiveness." }
                     )
+
+                    SwitchSetting(
+                        label = "Denoise Pass 1",
+                        checked = config.denoisePass1Enabled,
+                        description = "Enables primary luma NLM pass to clean mid-level noise.",
+                        onCheckedChange = { onConfigChange(config.copy(denoisePass1Enabled = it)) },
+                        onShowInfo = { infoDialogText = "Denoise Pass 1" to "Runs the first pass of Non-Local Means luma denoising. This cleans fine grain across the image." }
+                    )
+
+                    if (config.denoisePass1Enabled) {
+                        SliderSetting(
+                            label = "Denoise Pass 1 Strength",
+                            value = config.denoisePass1Strength,
+                            valueRange = 0.1f..3.0f,
+                            steps = 29,
+                            valueFormatter = { String.format("%.2fx", it) },
+                            description = "Strength multiplier for the first luma NLM pass.",
+                            onValueChange = { onConfigChange(config.copy(denoisePass1Strength = it)) },
+                            onShowInfo = { infoDialogText = "Pass 1 Strength" to "Scales the baseline NLM smoothing factor for the first pass. Lower values preserve more fine high-frequency noise texture." }
+                        )
+                    }
+
+                    SwitchSetting(
+                        label = "Denoise Pass 2",
+                        checked = config.denoisePass2Enabled,
+                        description = "Enables secondary luma NLM pass to wash out residual noise.",
+                        onCheckedChange = { onConfigChange(config.copy(denoisePass2Enabled = it)) },
+                        onShowInfo = { infoDialogText = "Denoise Pass 2" to "Runs a second pass of luma NLM denoising using the output of the first pass to resolve persistent noise blotches." }
+                    )
+
+                    if (config.denoisePass2Enabled) {
+                        SliderSetting(
+                            label = "Denoise Pass 2 Strength",
+                            value = config.denoisePass2Strength,
+                            valueRange = 0.1f..2.0f,
+                            steps = 19,
+                            valueFormatter = { String.format("%.2fx", it) },
+                            description = "Strength multiplier for the second luma NLM pass.",
+                            onValueChange = { onConfigChange(config.copy(denoisePass2Strength = it)) },
+                            onShowInfo = { infoDialogText = "Pass 2 Strength" to "Scales the baseline smoothing factor for the second pass. Kept lower by default (0.50x) to avoid over-softening." }
+                        )
+                    }
 
                     SwitchSetting(
                         label = "Chroma Denoise",
@@ -1166,9 +1280,10 @@ private fun SettingsScreen(
                     infoText = "Configures dynamic range compression, local micro-contrast detail boosting, and black levels.",
                     onResetDefaults = {
                         onConfigChange(config.copy(
-                            detailAlpha = 1.15f,
-                            saturationBoost = 1.15f,
-                            blackPointClamp = 0.08f
+                            detailAlpha = 1.00f,
+                            saturationBoost = 1.00f,
+                            blackPointClamp = 0.008f,
+                            tonemapExposureBoost = 1.30f
                         ))
                     }
                 ) {
@@ -1204,11 +1319,139 @@ private fun SettingsScreen(
                         onValueChange = { onConfigChange(config.copy(blackPointClamp = it)) },
                         onShowInfo = { infoDialogText = "Black-Point Clamp" to "Applies quadratic compression to normalized base luminance values below this threshold. Prevents dark night skies from being lifted into noisy gray layers." }
                     )
+
+                    SliderSetting(
+                        label = "Tonemap Exposure Boost",
+                        value = config.tonemapExposureBoost,
+                        valueRange = 1.0f..3.0f,
+                        steps = 40,
+                        valueFormatter = { String.format("%.2fx", it) },
+                        description = "Computational scaling factor to boost image brightness inside the tonemap stage.",
+                        onValueChange = { onConfigChange(config.copy(tonemapExposureBoost = it)) },
+                        onShowInfo = { infoDialogText = "Tonemap Exposure Boost" to "Linearly scales the brightness of raw frames before applying the tone mapping curve. Compensates for negative exposure bias captures computationally without amplifying digital gain noise." }
+                    )
                 }
 
-                // 6. Debug Settings Category
+                // 6. Custom Lens Noise Models
                 CategoryCard(
-                    title = "6. Debug & Diagnostics",
+                    title = "6. Custom Lens Noise Models",
+                    expanded = expandedNoise,
+                    onToggle = { expandedNoise = !expandedNoise },
+                    infoText = "Configure custom DNG noise model parameters (A, B, C, D) per lens. If all values are set to 0.0, the app defaults to the dynamic hardware system profile.",
+                    onResetDefaults = {
+                        onConfigChange(config.copy(
+                            backNoiseA = 0f, backNoiseB = 0f, backNoiseC = 0f, backNoiseD = 0f,
+                            frontNoiseA = 0f, frontNoiseB = 0f, frontNoiseC = 0f, frontNoiseD = 0f
+                        ))
+                    }
+                ) {
+                    Text(text = "Rear Camera (IMX882 / Main)", color = AccentCyan, fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp, bottom = 4.dp))
+                    
+                    NoiseModelInputRow(label = "Parameter A (Shot scale)", value = config.backNoiseA) {
+                        onConfigChange(config.copy(backNoiseA = it))
+                    }
+                    NoiseModelInputRow(label = "Parameter B (Shot offset)", value = config.backNoiseB) {
+                        onConfigChange(config.copy(backNoiseB = it))
+                    }
+                    NoiseModelInputRow(label = "Parameter C (Read scale)", value = config.backNoiseC) {
+                        onConfigChange(config.copy(backNoiseC = it))
+                    }
+                    NoiseModelInputRow(label = "Parameter D (Read offset)", value = config.backNoiseD) {
+                        onConfigChange(config.copy(backNoiseD = it))
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)
+                    ) {
+                        if (config.backNoiseA != 0f || config.backNoiseB != 0f || config.backNoiseC != 0f || config.backNoiseD != 0f) {
+                            Button(
+                                onClick = {
+                                    onConfigChange(config.copy(backNoiseA = 0f, backNoiseB = 0f, backNoiseC = 0f, backNoiseD = 0f))
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF301E1E)),
+                                shape = RoundedCornerShape(6.dp)
+                            ) {
+                                Icon(Icons.Default.Clear, contentDescription = null, modifier = Modifier.size(14.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("Clear", color = ErrorRed, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                            }
+                        }
+                        Button(
+                            onClick = onImportBackNoise,
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E2430)),
+                            shape = RoundedCornerShape(6.dp)
+                        ) {
+                            Icon(Icons.Default.UploadFile, contentDescription = null, modifier = Modifier.size(14.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("Import .c Profile", color = AccentCyan, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                        Button(
+                            onClick = {
+                                // Pre-fill Álvaro Recoba García's IMX882 calibrated noise profile values
+                                onConfigChange(config.copy(
+                                    backNoiseA = 1.2210107e-06f,
+                                    backNoiseB = 1.2737597e-05f,
+                                    backNoiseC = 1.9620154e-12f,
+                                    backNoiseD = 3.5510901e-07f
+                                ))
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E2830)),
+                            shape = RoundedCornerShape(6.dp)
+                        ) {
+                            Text("Load IMX882 Defaults", color = AccentCyan, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+
+                    Spacer(Modifier.height(12.dp))
+                    Text(text = "Front Camera (Selfie)", color = AccentCyan, fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp, bottom = 4.dp))
+
+                    NoiseModelInputRow(label = "Parameter A (Shot scale)", value = config.frontNoiseA) {
+                        onConfigChange(config.copy(frontNoiseA = it))
+                    }
+                    NoiseModelInputRow(label = "Parameter B (Shot offset)", value = config.frontNoiseB) {
+                        onConfigChange(config.copy(frontNoiseB = it))
+                    }
+                    NoiseModelInputRow(label = "Parameter C (Read scale)", value = config.frontNoiseC) {
+                        onConfigChange(config.copy(frontNoiseC = it))
+                    }
+                    NoiseModelInputRow(label = "Parameter D (Read offset)", value = config.frontNoiseD) {
+                        onConfigChange(config.copy(frontNoiseD = it))
+                    }
+                    
+                    Spacer(Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)
+                    ) {
+                        if (config.frontNoiseA != 0f || config.frontNoiseB != 0f || config.frontNoiseC != 0f || config.frontNoiseD != 0f) {
+                            Button(
+                                onClick = {
+                                    onConfigChange(config.copy(frontNoiseA = 0f, frontNoiseB = 0f, frontNoiseC = 0f, frontNoiseD = 0f))
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF301E1E)),
+                                shape = RoundedCornerShape(6.dp)
+                            ) {
+                                Icon(Icons.Default.Clear, contentDescription = null, modifier = Modifier.size(14.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("Clear", color = ErrorRed, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                            }
+                        }
+                        Button(
+                            onClick = onImportFrontNoise,
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E2430)),
+                            shape = RoundedCornerShape(6.dp)
+                        ) {
+                            Icon(Icons.Default.UploadFile, contentDescription = null, modifier = Modifier.size(14.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("Import .c Profile", color = AccentCyan, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                }
+
+                // 7. Debug Settings Category
+                CategoryCard(
+                    title = "7. Debug & Diagnostics",
                     expanded = expandedDebug,
                     onToggle = { expandedDebug = !expandedDebug },
                     infoText = "Developer diagnostics. These options write extra files to disk and may slow down capture.",
@@ -1472,4 +1715,64 @@ private fun SwitchSetting(
         Spacer(Modifier.height(2.dp))
         Text(text = description, color = White60, fontSize = 11.sp, lineHeight = 14.sp)
     }
+}
+
+@Composable
+private fun NoiseModelInputRow(
+    label: String,
+    value: Float,
+    onValueChange: (Float) -> Unit
+) {
+    var textState by remember(value) { mutableStateOf(if (value == 0f) "" else value.toString()) }
+    
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(text = label, color = White90, fontSize = 13.sp, modifier = Modifier.weight(1f))
+        
+        OutlinedTextField(
+            value = textState,
+            onValueChange = { newValue ->
+                textState = newValue
+                val parsed = newValue.toFloatOrNull()
+                if (parsed != null) {
+                    onValueChange(parsed)
+                } else if (newValue.isEmpty()) {
+                    onValueChange(0f)
+                }
+            },
+            modifier = Modifier.width(180.dp),
+            textStyle = androidx.compose.ui.text.TextStyle(color = AccentCyan, fontSize = 13.sp),
+            singleLine = true,
+            placeholder = { Text("0.0 (System)", color = White60.copy(alpha = 0.5f), fontSize = 13.sp) },
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = AccentCyan,
+                unfocusedBorderColor = Color(0xFF333338),
+                cursorColor = AccentCyan,
+                focusedContainerColor = Color(0xFF121214),
+                unfocusedContainerColor = Color(0xFF0F0F10)
+            )
+        )
+    }
+}
+
+private fun parseCNoiseModel(cFileContent: String): FloatArray? {
+    val results = FloatArray(4) // average A, B, C, D
+    val patterns = listOf("noise_model_A", "noise_model_B", "noise_model_C", "noise_model_D")
+    
+    for (i in 0 until 4) {
+        val name = patterns[i]
+        // Match the array content after the name, up to closing brace
+        val regex = Regex("$name\\s*\\[\\s*\\]\\s*=\\s*\\{([^}]+)\\}")
+        val match = regex.find(cFileContent) ?: return null
+        val valuesStr = match.groupValues[1]
+        val values = valuesStr.split(",").mapNotNull { it.trim().toDoubleOrNull() }
+        if (values.size < 4) return null
+        results[i] = (values.sum() / values.size).toFloat()
+    }
+    return results
 }

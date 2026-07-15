@@ -16,6 +16,7 @@ import android.view.Surface
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import android.view.OrientationEventListener
 import java.nio.ByteBuffer
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
@@ -54,6 +55,10 @@ class CameraController(
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
     private var imageReader: ImageReader? = null
+    private var orientationListener: OrientationEventListener? = null
+    @Volatile private var deviceOrientation: Int = 0
+    var isFrontFacing: Boolean = false
+        private set
 
     // ── Background thread for camera callbacks ─────────────────────────────────
     private var cameraThread: HandlerThread? = null
@@ -66,6 +71,11 @@ class CameraController(
     private val pendingMetadata = java.util.concurrent.ConcurrentHashMap<Long, TotalCaptureResult>()
 
     private val burstTimestamps = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+
+    @Volatile
+    private var lastViewfinderAwbGains: FloatArray? = null
+    @Volatile
+    private var lastViewfinderCcm: FloatArray? = null
 
     /**
      * Attempts to pair an incoming [Image] buffer with its matching [TotalCaptureResult] metadata.
@@ -94,8 +104,10 @@ class CameraController(
                 
                 // Run preview frame histogram analysis periodically (every 10th frame) to dynamically adapt AE EV
                 if (!isCapturingPsl && analysisFrameCount++ % 10 == 0) {
+                    val whiteLvl = cameraWhiteLevel
+                    val samples = LumaHistogramAnalyzer.extractLumaSamples(img, whiteLvl)
                     scope.launch(Dispatchers.Default) {
-                        val result = LumaHistogramAnalyzer.analyze(img)
+                        val result = LumaHistogramAnalyzer.analyzeSamples(samples)
                         activeDynamicEv = result.targetEv
                         Log.i(TAG, "Luma Analyzer: shadow=${result.shadowLuma}, highlight=${result.highlightLuma}, DR stops=${result.drStops}, targetEv=${result.targetEv}")
                         
@@ -103,23 +115,16 @@ class CameraController(
                         val session = captureSession
                         val surface = lastPreviewSurface
                         if (session != null && surface != null) {
-                            runCatching { startRepeatingRequest(session, surface) }
+                            val diff = Math.abs(activeDynamicEv - appliedEv)
+                            if (diff >= 0.33f) {
+                                runCatching { startRepeatingRequest(session, surface) }
+                            }
                         }
                     }
                 }
 
-                val rawProfile: Array<out android.util.Pair<Double, Double>>? = meta.get(CaptureResult.SENSOR_NOISE_PROFILE)
-                val noiseProfile = if (rawProfile != null && rawProfile.size >= 4) {
-                    floatArrayOf(
-                        rawProfile[0].first.toFloat(), rawProfile[0].second.toFloat(),
-                        rawProfile[1].first.toFloat(), rawProfile[1].second.toFloat(),
-                        rawProfile[2].first.toFloat(), rawProfile[2].second.toFloat(),
-                        rawProfile[3].first.toFloat(), rawProfile[3].second.toFloat()
-                    )
-                } else {
-                    staticNoiseProfile
-                }
-                ringBuffer.push(CapturedFrame(img, iso, expTime, noiseProfile))
+                val noiseProfile = getNoiseProfileForFrame(meta, iso)
+                ringBuffer.push(CapturedFrame(img, iso, expTime, noiseProfile, meta))
             }
         }
         
@@ -149,6 +154,8 @@ class CameraController(
     @Volatile private var isCapturingPsl = false
     @Volatile private var staticNoiseProfile: FloatArray? = null
     @Volatile @JvmField var activeDynamicEv: Float = 0.0f
+    @Volatile private var appliedEv: Float = 0.0f
+    @Volatile private var cameraWhiteLevel: Float = 4095.0f
     private var analysisFrameCount = 0
     private val rawBufferPool = ArrayList<ByteBuffer>()
 
@@ -167,6 +174,15 @@ class CameraController(
     fun startCamera(texture: android.graphics.SurfaceTexture) {
         lastTexture = texture
         startBackgroundThread()
+        if (orientationListener == null) {
+            orientationListener = object : OrientationEventListener(context) {
+                override fun onOrientationChanged(orientation: Int) {
+                    if (orientation == ORIENTATION_UNKNOWN) return
+                    deviceOrientation = (orientation + 45) / 90 * 90 % 360
+                }
+            }
+        }
+        orientationListener?.enable()
         scope.launch(Dispatchers.IO) {
             try {
                 openCamera(texture)
@@ -181,6 +197,7 @@ class CameraController(
      * background thread handler.
      */
     fun stopCamera() {
+        orientationListener?.disable()
         lastPreviewSurface = null
         lastTexture = null
         ringBuffer.flush()
@@ -194,6 +211,16 @@ class CameraController(
         imageReader?.close()
         imageReader = null
         stopBackgroundThread()
+    }
+
+    /**
+     * Toggles between front and back camera sensors, restarting the capture session.
+     */
+    fun toggleCameraFacing() {
+        val texture = lastTexture ?: return
+        isFrontFacing = !isFrontFacing
+        stopCamera()
+        startCamera(texture)
     }
 
     /**
@@ -268,8 +295,9 @@ class CameraController(
                         pendingMetadata.clear()
                         
                         // Recreate ImageReader and capture session using the new format
-                        val cameraId = pickBackCamera() ?: return@launch
+                        val cameraId = pickCameraId() ?: return@launch
                         val characteristics = manager.getCameraCharacteristics(cameraId)
+                        cameraWhiteLevel = characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL)?.toFloat() ?: 4095.0f
                         
                         var format = ImageFormat.YUV_420_888
                         if (useRawCapture) {
@@ -334,10 +362,11 @@ class CameraController(
      * @param texture The drawing surface texture.
      */
     private fun openCamera(texture: android.graphics.SurfaceTexture) {
-        val cameraId = pickBackCamera() ?: run {
-            Log.e(TAG, "No back camera found"); return
+        val cameraId = pickCameraId() ?: run {
+            Log.e(TAG, "No camera found"); return
         }
         val characteristics = manager.getCameraCharacteristics(cameraId)
+        cameraWhiteLevel = characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL)?.toFloat() ?: 4095.0f
 
         var format = ImageFormat.YUV_420_888
         if (useRawCapture) {
@@ -444,7 +473,7 @@ class CameraController(
      */
     private fun startRepeatingRequest(session: CameraCaptureSession, previewSurface: Surface) {
         val characteristics = manager.getCameraCharacteristics(
-            pickBackCamera() ?: return
+            pickCameraId() ?: return
         )
 
         // Compute EV compensation steps
@@ -454,6 +483,7 @@ class CameraController(
         val bias = if (isNightMode) 1.5f else activeDynamicEv
         val evSteps = (bias / stepSize).toInt()
             .coerceIn(aeRange?.lower ?: -6, aeRange?.upper ?: 0)
+        appliedEv = evSteps * stepSize
 
         val requestBuilder = cameraDevice!!
             .createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
@@ -462,6 +492,9 @@ class CameraController(
                 set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, evSteps)
                 set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
                 set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+
+                // Force digital post-RAW gain boost to unity (100) to ensure the driver uses analog sensitivity (ISO) instead of digital gain
+                set(CaptureRequest.CONTROL_POST_RAW_SENSITIVITY_BOOST, 100)
 
                 // Enable Optical Image Stabilization (OIS) if supported
                 val oisModes = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
@@ -487,14 +520,9 @@ class CameraController(
                 request: CaptureRequest,
                 result: TotalCaptureResult
             ) {
-                val rawProfile: Array<out android.util.Pair<Double, Double>>? = result.get(CaptureResult.SENSOR_NOISE_PROFILE)
-                if (rawProfile != null && rawProfile.size >= 4 && staticNoiseProfile == null) {
-                    staticNoiseProfile = floatArrayOf(
-                        rawProfile[0].first.toFloat(), rawProfile[0].second.toFloat(),
-                        rawProfile[1].first.toFloat(), rawProfile[1].second.toFloat(),
-                        rawProfile[2].first.toFloat(), rawProfile[2].second.toFloat(),
-                        rawProfile[3].first.toFloat(), rawProfile[3].second.toFloat()
-                    )
+                val rawProfile = getNoiseProfileForFrame(result, currentIso)
+                if (rawProfile != null && staticNoiseProfile == null) {
+                    staticNoiseProfile = rawProfile
                     Log.i(TAG, "Cached static device noise profile from preview frame")
                 }
                 val iso = result.get(CaptureResult.SENSOR_SENSITIVITY)
@@ -509,6 +537,24 @@ class CameraController(
                 if (ts != null) {
                     pendingMetadata[ts] = result
                     tryMatchAndPushFrame(ts)
+                }
+
+                // Extract active white balance gains from viewfinder AWB
+                val gains = result.get(CaptureResult.COLOR_CORRECTION_GAINS)
+                if (gains != null) {
+                    val g = (gains.greenEven + gains.greenOdd) / 2.0f
+                    val gVal = if (g > 0f) g else 1.0f
+                    lastViewfinderAwbGains = floatArrayOf(gains.red / gVal, 1.0f, gains.blue / gVal)
+                }
+
+                // Extract active Color Correction Matrix (CCM) mapping sensor RGB to sRGB
+                val transform = result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
+                if (transform != null) {
+                    lastViewfinderCcm = FloatArray(9) { idx ->
+                       val col = idx % 3
+                       val row = idx / 3
+                       transform.getElement(col, row).toFloat()
+                    }
                 }
             }
         }, cameraHandler)
@@ -543,7 +589,15 @@ class CameraController(
             val isNight = config.nightMode
             val isHdrEnhanced = hdrMode == HdrMode.HDR_ENHANCED
             val forceBurst = !isNight && !isHdrEnhanced && hdrMode != HdrMode.OFF && currentIso > 400
-            val burst = if ((isNight || forceBurst || isHdrEnhanced) && hdrMode != HdrMode.OFF) {
+            
+            // Dynamic burst size based on lighting (current ISO)
+            val dynamicFrameCount = when {
+                currentIso < 150 -> 6
+                currentIso < 800 -> 10
+                else -> 15
+            }.coerceAtMost(config.captureFrameCount)
+            
+            val burst = if (isNight || isHdrEnhanced || (forceBurst && hdrMode != HdrMode.OFF)) {
                 isCapturingPsl = true
                 _captureProgress.value = 0f
                 ringBuffer.flush() // Clear preview frames
@@ -551,30 +605,44 @@ class CameraController(
 
                 val targetExposureTime: Long
                 val targetIso: Int
-                val numFrames: Int
+                val numFrames = dynamicFrameCount
 
+                // exposureBoost: for negative bias (e.g. -1.5 EV), this is 2^(-1.5) = 0.35x target brightness
+                val exposureBoost = Math.pow(2.0, config.exposureBias.toDouble()).toFloat()
+                
                 if (isNight) {
-                    numFrames = config.captureFrameCount
-                    targetExposureTime = 125_000_000L // 125ms
-                    val calculatedIso = (currentIso * (currentExposureTime.toDouble() / targetExposureTime.toDouble())).toInt()
-                    targetIso = calculatedIso.coerceIn(50, currentIso)
+                    // Capped handheld-safe exposure limit: 66.6ms to prevent motion/handshake blur
+                    val safeHandheldLimit = 66_666_666L
+                    targetExposureTime = currentExposureTime.coerceAtMost(safeHandheldLimit)
+                    
+                    // Scale ISO to cover target exposure bias and exposure time reduction
+                    val neededIso = currentIso.toDouble() * (currentExposureTime.toDouble() / targetExposureTime.toDouble()) * exposureBoost
+                    targetIso = neededIso.toInt().coerceIn(50, 6400)
                 } else if (isHdrEnhanced) {
-                    numFrames = config.captureFrameCount
-                    // HDR+ Enhanced: Base exposure target (normal frames)
-                    targetExposureTime = currentExposureTime.coerceAtMost(50_000_000L) // Limit to 50ms to prevent extreme handshake blur
-                    targetIso = currentIso
+                    // HDR+ Enhanced: Base exposure target (normal frames) capped to 50ms
+                    targetExposureTime = currentExposureTime.coerceAtMost(50_000_000L)
+                    targetIso = (currentIso.toDouble() * exposureBoost).toInt().coerceIn(50, 3200)
                 } else {
-                    // Normal mode: divide viewfinder ISO by the configured factor and keep shutter fast to prevent blur
-                    val factor = config.normalModeIsoReductionFactor.toDouble()
-                    numFrames = config.captureFrameCount
-                    targetIso = (currentIso / factor).toInt().coerceIn(50, currentIso)
-                    // Cap shutter speed at 1/30s (33.3ms) to prevent motion blur and handshake
-                    targetExposureTime = currentExposureTime.coerceAtMost(33_333_333L)
+                    // Normal mode: Cap exposure time at 33.3ms to avoid handshake blur
+                    val maxNormalExposure = 33_333_333L
+                    targetExposureTime = currentExposureTime.coerceAtMost(maxNormalExposure)
+                    
+                    // Scale ISO to cover target exposure bias and exposure time reduction
+                    val neededIso = currentIso.toDouble() * (currentExposureTime.toDouble() / targetExposureTime.toDouble()) * exposureBoost
+                    targetIso = neededIso.toInt().coerceIn(50, 3200)
                 }
-                            captureIso = targetIso
-                val exposureBoost = Math.pow(2.0, -config.exposureBias.toDouble()).toFloat()
-                calculatedDigitalGain = (((currentIso.toDouble() * currentExposureTime.toDouble()) / (targetIso.toDouble() * targetExposureTime.toDouble())) * exposureBoost).toFloat()
-                Log.i(TAG, "Still capture burst: isNight=$isNight, forceBurst=$forceBurst, isHdrEnhanced=$isHdrEnhanced -> targetIso=$targetIso, targetExp=${targetExposureTime / 1_000_000}ms, digitalGain=$calculatedDigitalGain, exposureBoost=$exposureBoost")
+                captureIso = targetIso
+                
+                // Calculate digital gain to cover any exposure deficit after maxing out hardware ISO
+                val totalExposureProduct = currentIso.toDouble() * currentExposureTime.toDouble() * exposureBoost
+                val hardwareExposureProduct = targetIso.toDouble() * targetExposureTime.toDouble()
+                calculatedDigitalGain = (totalExposureProduct / hardwareExposureProduct).toFloat()
+                
+                // Avoid digital gain scaling below 1.0x
+                if (calculatedDigitalGain < 1.0f) {
+                    calculatedDigitalGain = 1.0f
+                }
+                Log.i(TAG, "Still capture burst: isNight=$isNight, forceBurst=$forceBurst -> targetIso=$targetIso, targetExp=${targetExposureTime / 1_000_000}ms, digitalGain=${calculatedDigitalGain}x, exposureBoost=$exposureBoost, frames=$numFrames")
 
                 // Create a manual still capture burst using TEMPLATE_MANUAL to guarantee hardware register gains are applied
                 val requests = List(numFrames) { idx ->
@@ -591,10 +659,11 @@ class CameraController(
                         set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
                         set(CaptureRequest.SENSOR_EXPOSURE_TIME, frameExp)
                         set(CaptureRequest.SENSOR_SENSITIVITY, targetIso)
+                        set(CaptureRequest.CONTROL_POST_RAW_SENSITIVITY_BOOST, 100)
                         set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                         
                         // Enable Optical Image Stabilization (OIS) if supported
-                        val chars = manager.getCameraCharacteristics(pickBackCamera() ?: "")
+                        val chars = manager.getCameraCharacteristics(pickCameraId() ?: "")
                         val oisModes = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
                         if (oisModes != null && oisModes.contains(CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)) {
                             set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
@@ -651,8 +720,6 @@ class CameraController(
                 pslFrames
             } else {
                 _captureProgress.value = 1.0f
-                val exposureBoost = Math.pow(2.0, -config.exposureBias.toDouble()).toFloat()
-                calculatedDigitalGain = exposureBoost
                 val fullDrained = ringBuffer.snapshot()
                 if (fullDrained.isEmpty()) {
                     _isProcessing.value = false
@@ -661,18 +728,37 @@ class CameraController(
                     }
                     withContext(Dispatchers.Main) {
                         onDispatched()
-                        onError("Ring buffer is empty — point camera at subject")
+                        onError("Ring buffer is empty — point camera at subject and try again")
                     }
                     return@launch
                 }
+                
+                calculatedDigitalGain = 1.0f
 
-                val needed = if (hdrMode == HdrMode.OFF) 1 else config.captureFrameCount
-                if (fullDrained.size > needed) {
-                    val discard = fullDrained.size - needed
-                    fullDrained.subList(0, discard).forEach { runCatching { it.image.close() } }
-                    fullDrained.subList(discard, fullDrained.size)
+                // Filter for stable exposure settings (ZSL Exposure Lock Convergence)
+                val convergedFrames = if (fullDrained.isNotEmpty() && hdrMode != HdrMode.OFF) {
+                    val refFrame = fullDrained.last()
+                    fullDrained.filter { frame ->
+                        val expDev = Math.abs(frame.exposureTimeNs - refFrame.exposureTimeNs).toDouble() / refFrame.exposureTimeNs.toDouble()
+                        val isoDev = Math.abs(frame.iso - refFrame.iso).toDouble() / refFrame.iso.toDouble()
+                        expDev <= 0.15 && isoDev <= 0.15
+                    }
                 } else {
                     fullDrained
+                }
+
+                val needed = if (hdrMode == HdrMode.OFF) 1 else dynamicFrameCount
+                if (convergedFrames.size > needed) {
+                    val discard = convergedFrames.size - needed
+                    // Close discarded frames
+                    convergedFrames.subList(0, discard).forEach { runCatching { it.image.close() } }
+                    // Also close any frames filtered out completely
+                    fullDrained.filter { it !in convergedFrames }.forEach { runCatching { it.image.close() } }
+                    convergedFrames.subList(discard, convergedFrames.size)
+                } else {
+                    // Close any frames filtered out completely
+                    fullDrained.filter { it !in convergedFrames }.forEach { runCatching { it.image.close() } }
+                    convergedFrames
                 }
             }
 
@@ -738,7 +824,8 @@ class CameraController(
                 }
                 frameIsos[idx] = frame.iso
                 frameExposures[idx] = frame.exposureTimeNs
-                val profile = frame.noiseProfile
+                val customProfile = getCustomNoiseProfile(config, frame.iso)
+                val profile = customProfile ?: frame.noiseProfile
                 if (profile != null && profile.size == 8) {
                     System.arraycopy(profile, 0, frameNoiseProfiles, idx * 8, 8)
                 } else {
@@ -784,8 +871,31 @@ class CameraController(
             val timestamp = System.currentTimeMillis()
             val jobId = "job_$timestamp"
             
-            val characteristics = manager.getCameraCharacteristics(pickBackCamera() ?: "")
+            val characteristics = manager.getCameraCharacteristics(pickCameraId() ?: "")
             val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+
+            val lensFacing = characteristics.get(CameraCharacteristics.LENS_FACING)
+            val isFrontFacing = lensFacing == CameraMetadata.LENS_FACING_FRONT
+            val jpegOrientation = if (isFrontFacing) {
+                (sensorOrientation - deviceOrientation + 360) % 360
+            } else {
+                (sensorOrientation + deviceOrientation) % 360
+            }
+
+            // Use converged AWB gains and CCM from the viewfinder right before still capture
+            val awbGains = lastViewfinderAwbGains ?: floatArrayOf(2.1f, 1.0f, 1.9f)
+            val ccm = lastViewfinderCcm ?: floatArrayOf(
+                1.0f, 0.0f, 0.0f,
+                0.0f, 1.0f, 0.0f,
+                0.0f, 0.0f, 1.0f
+            )
+
+            val cfa = characteristics.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT) ?: 3
+            val blackPattern = characteristics.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN)
+            val blackOffsets = IntArray(4)
+            blackPattern?.copyTo(blackOffsets, 0)
+            val blackLvl = blackOffsets.getOrNull(0)?.toFloat() ?: 64f
+            val whiteLvl = characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL)?.toFloat() ?: 1023f
 
             val job = ProcessingJob(
                 id = jobId,
@@ -798,9 +908,14 @@ class CameraController(
                 config = config.copy(useRawCapture = isRaw),
                 onSaved = onSaved,
                 onError = onError,
+                awbGains = awbGains,
+                colorCorrectionMatrix = ccm,
+                blackLevel = blackLvl,
+                whiteLevel = whiteLvl,
                 digitalGain = calculatedDigitalGain,
-                sensorOrientation = sensorOrientation,
-                appliedEvCompensation = activeDynamicEv
+                sensorOrientation = jpegOrientation,
+                appliedEvCompensation = activeDynamicEv,
+                colorFilterArrangement = cfa
             )
             
             ProcessingManager.addJob(job)
@@ -842,34 +957,14 @@ class CameraController(
     // Helpers
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * Picks the back-facing camera device ID. If raw capture is requested, prioritizes camera sensors
-     * that explicitly expose raw capture capabilities.
-     *
-     * @return The camera ID string of the chosen back camera, or null if none is found.
-     */
-    private fun pickBackCamera(): String? {
-        val backCameras = manager.cameraIdList.filter { id ->
-            manager.getCameraCharacteristics(id)
-                .get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
+    private fun pickCameraId(): String? {
+        val targetFacing = if (isFrontFacing) CameraMetadata.LENS_FACING_FRONT else CameraMetadata.LENS_FACING_BACK
+        for (id in manager.cameraIdList) {
+            val characteristics = manager.getCameraCharacteristics(id)
+            val facing = characteristics.get(CameraCharacteristics.LENS_FACING)
+            if (facing == targetFacing) return id
         }
-        
-        // If we want RAW capture, look for a back camera that supports the RAW capability
-        if (useRawCapture) {
-            val rawCamera = backCameras.firstOrNull { id ->
-                val characteristics = manager.getCameraCharacteristics(id)
-                val capabilities = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
-                capabilities?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW) == true
-            }
-            if (rawCamera != null) {
-                Log.i(TAG, "Selected camera $rawCamera because it explicitly supports RAW")
-                return rawCamera
-            }
-        }
-        
-        val defaultCamera = backCameras.firstOrNull()
-        Log.i(TAG, "Selected default camera $defaultCamera (RAW requested=$useRawCapture)")
-        return defaultCamera
+        return manager.cameraIdList.firstOrNull()
     }
 
     /**
@@ -890,5 +985,46 @@ class CameraController(
         cameraThread?.join()
         cameraThread  = null
         cameraHandler = null
+    }
+
+    private fun getNoiseProfileForFrame(meta: CaptureResult, iso: Int): FloatArray? {
+        val rawProfile: Array<out android.util.Pair<Double, Double>>? = meta.get(CaptureResult.SENSOR_NOISE_PROFILE)
+        if (rawProfile != null && rawProfile.size >= 4) {
+            return floatArrayOf(
+                rawProfile[0].first.toFloat(), rawProfile[0].second.toFloat(),
+                rawProfile[1].first.toFloat(), rawProfile[1].second.toFloat(),
+                rawProfile[2].first.toFloat(), rawProfile[2].second.toFloat(),
+                rawProfile[3].first.toFloat(), rawProfile[3].second.toFloat()
+            )
+        }
+        return staticNoiseProfile
+    }
+
+    private fun getCustomNoiseProfile(config: PipelineConfig, iso: Int): FloatArray? {
+        val useBack = !isFrontFacing
+        val hasCustom = if (useBack) {
+            config.backNoiseA != 0f || config.backNoiseB != 0f || config.backNoiseC != 0f || config.backNoiseD != 0f
+        } else {
+            config.frontNoiseA != 0f || config.frontNoiseB != 0f || config.frontNoiseC != 0f || config.frontNoiseD != 0f
+        }
+        
+        if (!hasCustom) return null
+        
+        val a = if (useBack) config.backNoiseA else config.frontNoiseA
+        val b = if (useBack) config.backNoiseB else config.frontNoiseB
+        val c = if (useBack) config.backNoiseC else config.frontNoiseC
+        val d = if (useBack) config.backNoiseD else config.frontNoiseD
+        
+        val sens = iso.toDouble()
+        val digitalGain = if (sens / 3200.0 < 1.0) 1.0 else sens / 3200.0
+        
+        val profile = FloatArray(8)
+        for (i in 0 until 4) {
+            val sVal = a * sens + b
+            val oVal = c * sens * sens + d * digitalGain * digitalGain
+            profile[i * 2] = Math.max(0.0, sVal).toFloat()
+            profile[i * 2 + 1] = Math.max(0.0, oVal).toFloat()
+        }
+        return profile
     }
 }

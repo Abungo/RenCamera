@@ -210,14 +210,7 @@ class ProcessingService : Service() {
 
                 val pipelineDeferred = async(Dispatchers.Default) {
                     runNativeEngine(
-                        job.nativeBurstHandle,
-                        job.config,
-                        job.iso,
-                        job.frameIsos,
-                        job.frameExposures ?: LongArray(job.frameIsos.size),
-                        job.frameNoiseProfiles ?: FloatArray(0),
-                        job.digitalGain,
-                        job.appliedEvCompensation,
+                        job,
                         if (job.config.debugImagesEnabled) rawDir.absolutePath else "", // master debug toggle
                         object : NativeEngine.ProgressListener {
                             override fun onProgress(step: String, percentage: Int) {
@@ -343,31 +336,47 @@ class ProcessingService : Service() {
      * @return Processed JPEG ByteArray, or null if native execution fails.
      */
     private fun runNativeEngine(
-        nativeBurstHandle: Long,
-        config: PipelineConfig,
-        iso: Int,
-        frameIsos: IntArray,
-        frameExposures: LongArray,
-        frameNoiseProfiles: FloatArray,
-        digitalGain: Float,
-        appliedEvCompensation: Float,
+        job: ProcessingJob,
         debugDir: String,
         progressListener: NativeEngine.ProgressListener
     ): ByteArray? {
-        val mergedParams = config.toFloatArray().toMutableList().apply {
-            add(digitalGain) // Index 15
-            add(appliedEvCompensation) // Index 16
+        val mergedParams = job.config.toFloatArray().toMutableList().apply {
+            add(job.digitalGain) // Index 15
+            add(job.appliedEvCompensation) // Index 16
+
+            // Dynamic AWB Gains (Indices 17-19)
+            val awb = job.awbGains ?: floatArrayOf(2.1f, 1.0f, 1.9f)
+            add(awb.getOrNull(0) ?: 2.1f)
+            add(awb.getOrNull(1) ?: 1.0f)
+            add(awb.getOrNull(2) ?: 1.9f)
+
+            // Dynamic CCM Matrix (Indices 20-28)
+            val ccm = job.colorCorrectionMatrix ?: floatArrayOf(
+                1f, 0f, 0f,
+                0f, 1f, 0f,
+                0f, 0f, 1f
+            )
+            for (v in ccm) {
+                add(v)
+            }
+
+            // Dynamic CFA Arrangement Pattern (Index 29)
+            add(job.colorFilterArrangement.toFloat())
+
+            // Dynamic Black Level and White Level (Indices 30-31)
+            add(job.blackLevel)
+            add(job.whiteLevel)
         }.toFloatArray()
 
         return NativeEngine.processCopiedBurst(
-            handle      = nativeBurstHandle,
-            jpegQuality = config.jpegQuality,
-            stageFlags  = config.toStageFlagArray(),
-            nightMode   = config.nightMode,
-            iso         = iso,
-            frameIsos   = frameIsos,
-            frameExposures = frameExposures,
-            frameNoiseProfiles = frameNoiseProfiles,
+            handle      = job.nativeBurstHandle,
+            jpegQuality = job.config.jpegQuality,
+            stageFlags  = job.config.toStageFlagArray(),
+            nightMode   = job.config.nightMode,
+            iso         = job.iso,
+            frameIsos   = job.frameIsos,
+            frameExposures = job.frameExposures ?: LongArray(job.frameIsos.size),
+            frameNoiseProfiles = job.frameNoiseProfiles ?: FloatArray(0),
             configParams = mergedParams,
             debugDir    = debugDir,
             listener    = progressListener

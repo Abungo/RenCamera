@@ -158,7 +158,7 @@ static inline MotionVec interpolateMotion(const MotionField& mf, int r, int c) {
     float dy = (1.f - fy) * ((1.f - fx) * mv00.dy + fx * mv10.dy)
              +        fy  * ((1.f - fx) * mv01.dy + fx * mv11.dy);
 
-    return { static_cast<int>(std::round(dx)), static_cast<int>(std::round(dy)) };
+    return { dx, dy };
 }
 
 /// Fuse one luma (Y) plane from frames into a float accumulator buffer,
@@ -560,17 +560,38 @@ void main() {
 
         vec2 mv = texture(u_motion_fields, vec3(mv_uv, float(f - 1))).rg;
 
-        // Round to nearest Bayer-aligned 2-pixel boundary
-        int dx = int(round(mv.x * 0.5)) * 2;
-        int dy = int(round(mv.y * 0.5)) * 2;
-
-        // Patch-based residual for robustness
+        // Patch-based residual for robustness with subpixel-precise Bayer warping
         float warped_val = 0.0;
-        for (int pdy = -2; pdy <= 2; pdy += 2)
+        for (int pdy = -2; pdy <= 2; pdy += 2) {
             for (int pdx = -2; pdx <= 2; pdx += 2) {
-                ivec2 p = clamp(pos + ivec2(dx + pdx, dy + pdy), ivec2(0), ivec2(u_width-1, u_height-1));
-                warped_val += float(texelFetch(u_input_frames, ivec3(p, f), 0).r);
+                ivec2 p = pos + ivec2(pdx, pdy);
+                vec2 p_target = vec2(p) + mv;
+                int pxMod = p.x % 2;
+                int pyMod = p.y % 2;
+                if (pxMod < 0) pxMod += 2;
+                if (pyMod < 0) pyMod += 2;
+
+                int px0 = int(floor((p_target.x - float(pxMod)) / 2.0)) * 2 + pxMod;
+                int py0 = int(floor((p_target.y - float(pyMod)) / 2.0)) * 2 + pyMod;
+                int px1 = px0 + 2;
+                int py1 = py0 + 2;
+
+                int pcx0 = clamp(px0, pxMod, u_width - 2 + pxMod);
+                int pcx1 = clamp(px1, pxMod, u_width - 2 + pxMod);
+                int pcy0 = clamp(py0, pyMod, u_height - 2 + pyMod);
+                int pcy1 = clamp(py1, pyMod, u_height - 2 + pyMod);
+
+                float pwx = (p_target.x - float(px0)) / 2.0;
+                float pwy = (p_target.y - float(py0)) / 2.0;
+
+                float pv00 = float(texelFetch(u_input_frames, ivec3(pcx0, pcy0, f), 0).r);
+                float pv10 = float(texelFetch(u_input_frames, ivec3(pcx1, pcy0, f), 0).r);
+                float pv01 = float(texelFetch(u_input_frames, ivec3(pcx0, pcy1, f), 0).r);
+                float pv11 = float(texelFetch(u_input_frames, ivec3(pcx1, pcy1, f), 0).r);
+
+                warped_val += mix(mix(pv00, pv10, pwx), mix(pv01, pv11, pwx), pwy);
             }
+        }
         warped_val /= 9.0;
 
         float residual = warped_val - ref_val;
@@ -584,9 +605,32 @@ void main() {
         // Hard ghost rejection: clamp near-zero weights to exactly 0
         w_val = (w_val < 0.05) ? 0.0 : w_val;
 
-        // Accumulate center pixel only
-        ivec2 center_warped_pos = clamp(pos + ivec2(dx, dy), ivec2(0), ivec2(u_width - 1, u_height - 1));
-        float center_warped = float(texelFetch(u_input_frames, ivec3(center_warped_pos, f), 0).r);
+        // Subpixel bilinear warping on same-color channels for the center pixel
+        vec2 target = vec2(pos) + mv;
+        int xMod = pos.x % 2;
+        int yMod = pos.y % 2;
+        if (xMod < 0) xMod += 2;
+        if (yMod < 0) yMod += 2;
+
+        int x0 = int(floor((target.x - float(xMod)) / 2.0)) * 2 + xMod;
+        int y0 = int(floor((target.y - float(yMod)) / 2.0)) * 2 + yMod;
+        int x1 = x0 + 2;
+        int y1 = y0 + 2;
+
+        int cx0 = clamp(x0, xMod, u_width - 2 + xMod);
+        int cx1 = clamp(x1, xMod, u_width - 2 + xMod);
+        int cy0 = clamp(y0, yMod, u_height - 2 + yMod);
+        int cy1 = clamp(y1, yMod, u_height - 2 + yMod);
+
+        float wx = (target.x - float(x0)) / 2.0;
+        float wy = (target.y - float(y0)) / 2.0;
+
+        float v00 = float(texelFetch(u_input_frames, ivec3(cx0, cy0, f), 0).r);
+        float v10 = float(texelFetch(u_input_frames, ivec3(cx1, cy0, f), 0).r);
+        float v01 = float(texelFetch(u_input_frames, ivec3(cx0, cy1, f), 0).r);
+        float v11 = float(texelFetch(u_input_frames, ivec3(cx1, cy1, f), 0).r);
+        float center_warped = mix(mix(v00, v10, wx), mix(v01, v11, wx), wy);
+
         acc += center_warped * w_val;
         wgt += w_val;
     }
@@ -775,8 +819,8 @@ static void fuseRawBayer(const std::vector<YuvFrame>& frames,
 
                         for (int c = 0; c < w; ++c) {
                             MotionVec mv = interpolateMotion(mf, r, c);
-                            int dx = (mv.dx / 2) * 2;
-                            int dy = (mv.dy / 2) * 2;
+                            int dx = static_cast<int>(std::round(mv.dx / 2.f)) * 2;
+                            int dy = static_cast<int>(std::round(mv.dy / 2.f)) * 2;
 
                             int sc = std::clamp(c + dx, 0, w - 1);
                             int sr = std::clamp(r + dy, 0, h - 1);
@@ -985,22 +1029,24 @@ bool FusionStage::process(FrameContext& ctx) {
             } catch (...) {}
         }
 
-        if (isNight && chromaDenoise) {
+        if (chromaDenoise) {
             denoiseChroma(ctx.fusedU, uvW, uvH);
             denoiseChroma(ctx.fusedV, uvW, uvH);
         }
 
         // ── Spatial Luma Denoising (NL-Means) ──────────────────────────────────────
-        // Applied after temporal fusion to clean up residual noise from imperfect alignment.
-        // h_strength = 0 means disabled.
+        // Applied after temporal fusion to clean up residual noise.
         {
-            int spatialStrength = 8; // default
-            if (ctx.metadata.count("spatial_denoise_strength")) {
+            int spatialStrength = 6;
+            if (ctx.metadata.count("iso")) {
                 try {
-                    spatialStrength = std::any_cast<int>(ctx.metadata.at("spatial_denoise_strength"));
+                    int iso = std::any_cast<int>(ctx.metadata.at("iso"));
+                    spatialStrength = 6 + (iso / 100) * 2;
                 } catch (...) {}
             }
-            if (isNight && spatialStrength > 0) {
+            spatialStrength = std::clamp(spatialStrength, 4, 30);
+
+            if (spatialStrength > 0) {
                 LOGI("FusionStage: applying spatial NL-Means luma denoise (h=%d)", spatialStrength);
                 spatialDenoiseLuma(ctx.fusedY, w, h, spatialStrength, /*template_half=*/0, /*search_half=*/2);
             }

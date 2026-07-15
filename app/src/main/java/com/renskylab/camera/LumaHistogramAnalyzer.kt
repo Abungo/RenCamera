@@ -3,6 +3,7 @@ package com.renskylab.camera
 import android.graphics.ImageFormat
 import android.media.Image
 import android.util.Log
+import java.nio.ByteBuffer
 
 /**
  * Real-time luminance histogram analyzer for dynamic range estimation
@@ -20,81 +21,95 @@ object LumaHistogramAnalyzer {
     )
 
     /**
-     * Builds a fast, downsampled luminance histogram from a preview/captured frame.
-     * Computes shadow/highlight percentiles and recommends a target EV offset to prevent highlight clipping.
+     * Synchronously extracts downsampled luma samples from the image buffer.
+     * Run this on the camera handler thread BEFORE the image is closed or recycled.
      */
-    fun analyze(image: Image): AnalysisResult {
+    fun extractLumaSamples(image: Image, whiteLevel: Float): FloatArray {
         try {
             val width = image.width
             val height = image.height
             val format = image.format
 
-            val hist = IntArray(BINS)
-            var totalPixels = 0
+            val step = 16
+            val sampleW = (width + step - 1) / step
+            val sampleH = (height + step - 1) / step
+            val samples = FloatArray(sampleW * sampleH)
+            var count = 0
 
             if (format == ImageFormat.YUV_420_888) {
-                // YUV: analyze Y-plane directly
                 val plane = image.planes[0]
                 val buffer = plane.buffer
                 val rowStride = plane.rowStride
                 val pixelStride = plane.pixelStride
 
-                // Highly downsampled (step by 16 in row & col) to keep computation instant (~0.5ms)
-                val step = 16
+                val oldPos = buffer.position()
                 val rowData = ByteArray(width)
+
                 for (y in 0 until height step step) {
-                    buffer.position(y * rowStride)
+                    buffer.position(oldPos + y * rowStride)
                     val remaining = buffer.remaining()
                     val toRead = Math.min(width, remaining)
                     buffer.get(rowData, 0, toRead)
 
                     for (x in 0 until toRead step step) {
                         val pixelIdx = x * pixelStride
-                        if (pixelIdx < toRead) {
+                        if (pixelIdx < toRead && count < samples.size) {
                             val yVal = rowData[pixelIdx].toInt() and 0xFF
-                            val bin = (yVal * (BINS - 1)) / 255
-                            hist[bin.coerceIn(0, BINS - 1)]++
-                            totalPixels++
+                            samples[count++] = yVal / 255.0f
                         }
                     }
                 }
+                buffer.position(oldPos) // restore original position
             } else if (format == ImageFormat.RAW_SENSOR) {
-                // RAW: analyze Green pixels (standard Bayer layout)
                 val plane = image.planes[0]
                 val buffer = plane.buffer
                 val rowStride = plane.rowStride
                 val pixelStride = plane.pixelStride
 
-                // Raw values are usually 10/12/14/16-bit. We normalize to 12-bit (4095) for consistency.
-                val step = 16
+                val oldPos = buffer.position()
                 buffer.position(0)
-                // Read sample pixels
+
                 for (y in 0 until height step step) {
                     val rowOffset = y * rowStride
                     for (x in 0 until width step step) {
                         val pos = rowOffset + x * pixelStride
-                        if (pos + 1 < buffer.capacity()) {
+                        if (pos + 1 < buffer.capacity() && count < samples.size) {
                             val valLow = buffer.get(pos).toInt() and 0xFF
                             val valHigh = buffer.get(pos + 1).toInt() and 0xFF
                             val rawVal = (valHigh shl 8) or valLow
-                            // Max green range fallback estimation
-                            // Max green range fallback estimation
-                            val normVal = Math.min(1.0f, Math.max(0.0f, rawVal.toFloat() / 4095.0f))
-                            val bin = (normVal * (BINS - 1)).toInt()
-                            hist[bin.coerceIn(0, BINS - 1)]++
-                            totalPixels++
+                            val normVal = Math.min(1.0f, Math.max(0.0f, rawVal.toFloat() / whiteLevel))
+                            samples[count++] = normVal
                         }
                     }
                 }
+                buffer.position(oldPos) // restore original position
             }
 
+            return if (count == 0) FloatArray(0) else samples.copyOf(count)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to extract luma samples", e)
+            return FloatArray(0)
+        }
+    }
+
+    /**
+     * Recommend a target EV offset to prevent highlight clipping based on extracted samples.
+     * Safe to run asynchronously on any background dispatcher.
+     */
+    fun analyzeSamples(samples: FloatArray): AnalysisResult {
+        try {
+            val totalPixels = samples.size
             if (totalPixels == 0) {
                 return AnalysisResult(10.0f, 240.0f, 4.5f, 0.0f)
             }
 
-            // Compute cumulative percentiles
-            // Shadows: 2nd percentile
-            // Highlights: 98th percentile
+            val hist = IntArray(BINS)
+            for (i in 0 until totalPixels) {
+                val bin = (samples[i] * (BINS - 1)).toInt()
+                hist[bin.coerceIn(0, BINS - 1)]++
+            }
+
+            // Compute cumulative percentiles (2nd and 98th)
             val shadowCount = (totalPixels * 0.02f).toInt()
             val highlightCount = (totalPixels * 0.98f).toInt()
 
@@ -122,26 +137,22 @@ object LumaHistogramAnalyzer {
             val maxRatio = Math.max(1.0f, highlightLuma) / Math.max(1.0f, shadowLuma)
             val drStops = (Math.log(maxRatio.toDouble()) / Math.log(2.0)).toFloat()
 
-            // Recommend Target EV offset to protect highlights from clipping
             // Highlight clipping threshold: ~245 in 8-bit luma
             val targetHighlight = 245.0f
             val targetEv = if (highlightLuma > targetHighlight) {
-                // Highlight is clipping; compute how much EV underexposure we need to pull it down to targetHighlight
                 val evRatio = targetHighlight / highlightLuma
                 val computedEv = (Math.log(evRatio.toDouble()) / Math.log(2.0)).toFloat()
                 Math.min(0.0f, Math.max(-2.5f, computedEv))
             } else if (highlightLuma < 180.0f) {
-                // Scene has low dynamic range and highlights are dim; we can safely raise EV compensation
                 0.0f
             } else {
-                // Highlights are close but safe; slight negative bias to guarantee protection
                 val computedEv = (highlightLuma - targetHighlight) / targetHighlight
                 Math.min(0.0f, Math.max(-0.5f, computedEv))
             }
 
             return AnalysisResult(shadowLuma, highlightLuma, drStops, targetEv)
         } catch (e: Exception) {
-            Log.e(TAG, "LumaHistogramAnalyzer failed", e)
+            Log.e(TAG, "LumaHistogramAnalyzer analyzeSamples failed", e)
             return AnalysisResult(10.0f, 240.0f, 4.5f, 0.0f)
         }
     }

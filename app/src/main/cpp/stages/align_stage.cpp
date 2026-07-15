@@ -248,7 +248,8 @@ static MotionVec matchBlock(
                 if (cost < bestCost) {
                     bestCost = cost;
                     bestSSD = ssd;
-                    best = {tdx, tdy};
+                    best.dx = static_cast<float>(tdx);
+                    best.dy = static_cast<float>(tdy);
                 }
             }
         }
@@ -305,7 +306,8 @@ static MotionVec matchBlock(
                 if (valid && cost < bestCost) {
                     bestCost = cost;
                     bestSSD = ssd;
-                    best = {tdx, tdy};
+                    best.dx = static_cast<float>(tdx);
+                    best.dy = static_cast<float>(tdy);
                 }
             }
         }
@@ -316,6 +318,73 @@ static MotionVec matchBlock(
 // ─────────────────────────────────────────────────────────────────────────────
 // Coarse-to-fine alignment for one frame pair
 // ─────────────────────────────────────────────────────────────────────────────
+
+static inline int evaluateBlockSSD(
+    const FloatImage& ref,
+    const FloatImage& src,
+    int bx, int by,
+    int blockPx,
+    int dx, int dy
+) {
+    int imgW = ref.width, imgH = ref.height;
+    int ssd = 0;
+    for (int ry = 0; ry < blockPx; ++ry) {
+        int refY = by * blockPx + ry;
+        int srcY = refY + dy;
+        if (refY >= imgH || srcY < 0 || srcY >= imgH) return -1;
+        
+        const float* refRow = ref.ptr(refY);
+        const float* srcRow = src.ptr(srcY);
+        
+        for (int rx = 0; rx < blockPx; ++rx) {
+            int refX = bx * blockPx + rx;
+            int srcX = refX + dx;
+            if (refX >= imgW || srcX < 0 || srcX >= imgW) return -1;
+            float diff = refRow[refX] - srcRow[srcX];
+            ssd += static_cast<int>(diff * diff);
+        }
+    }
+    return ssd;
+}
+
+static MotionVec refineSubpixel(
+    const FloatImage& ref,
+    const FloatImage& src,
+    int bx, int by,
+    int blockPx,
+    MotionVec bestInt,
+    float regFactor
+) {
+    int idx = static_cast<int>(std::round(bestInt.dx));
+    int idy = static_cast<int>(std::round(bestInt.dy));
+    
+    int c = evaluateBlockSSD(ref, src, bx, by, blockPx, idx, idy);
+    int l = evaluateBlockSSD(ref, src, bx, by, blockPx, idx - 1, idy);
+    int r = evaluateBlockSSD(ref, src, bx, by, blockPx, idx + 1, idy);
+    int u = evaluateBlockSSD(ref, src, bx, by, blockPx, idx, idy - 1);
+    int d = evaluateBlockSSD(ref, src, bx, by, blockPx, idx, idy + 1);
+    
+    if (c < 0 || l < 0 || r < 0 || u < 0 || d < 0) {
+        return bestInt;
+    }
+    
+    float dx = 0.f;
+    float dy = 0.f;
+    
+    float denomX = 2.f * (l - 2.f * c + r);
+    if (std::abs(denomX) > 1e-4f) {
+        dx = (l - r) / denomX;
+        dx = std::clamp(dx, -0.5f, 0.5f);
+    }
+    
+    float denomY = 2.f * (u - 2.f * c + d);
+    if (std::abs(denomY) > 1e-4f) {
+        dy = (u - d) / denomY;
+        dy = std::clamp(dy, -0.5f, 0.5f);
+    }
+    
+    return { bestInt.dx + dx, bestInt.dy + dy };
+}
 
 static MotionField alignFrame(const Pyramid& refPyr, const Pyramid& srcPyr, float regFactor) {
     const int levels = static_cast<int>(refPyr.size()); // 3
@@ -336,13 +405,13 @@ static MotionField alignFrame(const Pyramid& refPyr, const Pyramid& srcPyr, floa
     mf.vectors.resize(static_cast<size_t>(bwFull) * bhFull);
 
     // Coarse level motion field
-    std::vector<MotionVec> coarse(static_cast<size_t>(bw) * bh, {0, 0});
+    std::vector<MotionVec> coarse(static_cast<size_t>(bw) * bh, {0.f, 0.f});
 
     // ── Level 2 (coarsest): full search ──────────────────────────────────────
     for (int row = 0; row < bh; ++row) {
         for (int col = 0; col < bw; ++col) {
             coarse[row * bw + col] = matchBlock(
-                refPyr[2], srcPyr[2], col, row, blockPxL2, SEARCH_RANGE, {0, 0}, regFactor);
+                refPyr[2], srcPyr[2], col, row, blockPxL2, SEARCH_RANGE, {0.f, 0.f}, regFactor);
         }
     }
 
@@ -365,10 +434,16 @@ static MotionField alignFrame(const Pyramid& refPyr, const Pyramid& srcPyr, floa
                 int pr = std::min(row, prevBh - 1);
                 int pc = std::min(col, prevBw - 1);
                 // Scale displacement ×2 (one more pyramid level = ×2 pixels)
-                MotionVec hint = {prev[pr * prevBw + pc].dx * 2,
-                                  prev[pr * prevBw + pc].dy * 2};
-                cur[row * curBw + col] = matchBlock(
+                MotionVec hint = {prev[pr * prevBw + pc].dx * 2.f,
+                                  prev[pr * prevBw + pc].dy * 2.f};
+                MotionVec bestInt = matchBlock(
                     refL, srcL, col, row, blockPx, REFINE_RANGE, hint, regFactor);
+                if (lvl == 0) {
+                    cur[row * curBw + col] = refineSubpixel(
+                        refL, srcL, col, row, blockPx, bestInt, regFactor);
+                } else {
+                    cur[row * curBw + col] = bestInt;
+                }
             }
         }
         prev = cur; prevBw = curBw; prevBh = curBh;

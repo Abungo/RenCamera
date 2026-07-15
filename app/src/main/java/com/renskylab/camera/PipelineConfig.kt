@@ -50,9 +50,9 @@ data class PipelineConfig(
     val awbSoftnessNight: Float = 0.85f,
 
     // Tone mapping parameters
-    val detailAlpha: Float = 1.15f,
-    val saturationBoost: Float = 1.15f,
-    val blackPointClamp: Float = 0.03f, // Reduced default from 0.08f to 0.03f so dark parts are naturally brighter
+    val detailAlpha: Float = 1.00f,
+    val saturationBoost: Float = 1.00f,
+    val blackPointClamp: Float = 0.008f, // Reduced from 0.03f to 0.008f so dark shadow details are fully visible
 
     // ISO override for noise model (0 = use actual capture ISO from EXIF/metadata)
     val isoOverride: Int = 0,
@@ -73,7 +73,24 @@ data class PipelineConfig(
     val normalModeIsoReductionFactor: Float = 2.0f,
 
     // Dynamic capture burst frame count (default is 15)
-    val captureFrameCount: Int = 15
+    val captureFrameCount: Int = 15,
+
+    // Custom noise model parameters per lens (0.0f = use system noise profile)
+    val backNoiseA: Float = 0f,
+    val backNoiseB: Float = 0f,
+    val backNoiseC: Float = 0f,
+    val backNoiseD: Float = 0f,
+    val frontNoiseA: Float = 0f,
+    val frontNoiseB: Float = 0f,
+    val frontNoiseC: Float = 0f,
+    val frontNoiseD: Float = 0f,
+
+    // Post-tonemap luma passes switches and strengths
+    val denoisePass1Enabled: Boolean = true,
+    val denoisePass1Strength: Float = 1.0f,
+    val denoisePass2Enabled: Boolean = true,
+    val denoisePass2Strength: Float = 0.5f,
+    val tonemapExposureBoost: Float = 1.30f
 ) : Serializable {
 
     companion object {
@@ -107,15 +124,28 @@ data class PipelineConfig(
             var spatialDenoiseStrength = 8
             var awbSoftnessNormal = 0.60f
             var awbSoftnessNight = 0.85f
-            var detailAlpha = 1.15f
-            var saturationBoost = 1.15f
-            var blackPointClamp = 0.03f
+            var detailAlpha = 1.00f
+            var saturationBoost = 1.00f
+            var blackPointClamp = 0.008f
             var isoOverride = 0
             var useRawCapture = true
             var debugRawDumps = false
             var debugImagesEnabled = true
             var normalModeIsoReductionFactor = 2.0f
             var captureFrameCount = 15
+            var backNoiseA = 0f
+            var backNoiseB = 0f
+            var backNoiseC = 0f
+            var backNoiseD = 0f
+            var frontNoiseA = 0f
+            var frontNoiseB = 0f
+            var frontNoiseC = 0f
+            var frontNoiseD = 0f
+            var denoisePass1Enabled = true
+            var denoisePass1Strength = 1.0f
+            var denoisePass2Enabled = true
+            var denoisePass2Strength = 0.5f
+            var tonemapExposureBoost = 1.30f
 
             val tagRegex = "<([^>]+)>([^<]*)</\\1>".toRegex()
             val matches = tagRegex.findAll(xml)
@@ -142,6 +172,19 @@ data class PipelineConfig(
                     "debugImagesEnabled" -> debugImagesEnabled = value.toBooleanStrictOrNull() ?: true
                     "normalModeIsoReductionFactor" -> normalModeIsoReductionFactor = value.toFloatOrNull() ?: 2.0f
                     "captureFrameCount" -> captureFrameCount = value.toIntOrNull() ?: 15
+                    "backNoiseA" -> backNoiseA = value.toFloatOrNull() ?: 0f
+                    "backNoiseB" -> backNoiseB = value.toFloatOrNull() ?: 0f
+                    "backNoiseC" -> backNoiseC = value.toFloatOrNull() ?: 0f
+                    "backNoiseD" -> backNoiseD = value.toFloatOrNull() ?: 0f
+                    "frontNoiseA" -> frontNoiseA = value.toFloatOrNull() ?: 0f
+                    "frontNoiseB" -> frontNoiseB = value.toFloatOrNull() ?: 0f
+                    "frontNoiseC" -> frontNoiseC = value.toFloatOrNull() ?: 0f
+                    "frontNoiseD" -> frontNoiseD = value.toFloatOrNull() ?: 0f
+                    "denoisePass1Enabled" -> denoisePass1Enabled = value.toBooleanStrictOrNull() ?: true
+                    "denoisePass1Strength" -> denoisePass1Strength = value.toFloatOrNull() ?: 1.0f
+                    "denoisePass2Enabled" -> denoisePass2Enabled = value.toBooleanStrictOrNull() ?: true
+                    "denoisePass2Strength" -> denoisePass2Strength = value.toFloatOrNull() ?: 0.5f
+                    "tonemapExposureBoost" -> tonemapExposureBoost = value.toFloatOrNull() ?: 1.30f
                     else -> {
                         if (tag.startsWith("stage_")) {
                             val stageName = tag.substringAfter("stage_")
@@ -170,7 +213,20 @@ data class PipelineConfig(
                 debugRawDumps = debugRawDumps,
                 debugImagesEnabled = debugImagesEnabled,
                 normalModeIsoReductionFactor = normalModeIsoReductionFactor,
-                captureFrameCount = captureFrameCount
+                captureFrameCount = captureFrameCount,
+                backNoiseA = backNoiseA,
+                backNoiseB = backNoiseB,
+                backNoiseC = backNoiseC,
+                backNoiseD = backNoiseD,
+                frontNoiseA = frontNoiseA,
+                frontNoiseB = frontNoiseB,
+                frontNoiseC = frontNoiseC,
+                frontNoiseD = frontNoiseD,
+                denoisePass1Enabled = denoisePass1Enabled,
+                denoisePass1Strength = denoisePass1Strength,
+                denoisePass2Enabled = denoisePass2Enabled,
+                denoisePass2Strength = denoisePass2Strength,
+                tonemapExposureBoost = tonemapExposureBoost
             )
         }
     }
@@ -197,7 +253,12 @@ data class PipelineConfig(
             if (debugRawDumps) 1.0f else 0.0f,    // 11
             if (debugImagesEnabled) 1.0f else 0.0f, // 12
             normalModeIsoReductionFactor,              // 13
-            captureFrameCount.toFloat()                // 14
+            captureFrameCount.toFloat(),               // 14
+            if (denoisePass1Enabled) 1.0f else 0.0f,   // 15
+            denoisePass1Strength,                      // 16
+            if (denoisePass2Enabled) 1.0f else 0.0f,   // 17
+            denoisePass2Strength,                      // 18
+            tonemapExposureBoost                       // 19
         )
     }
 
@@ -248,6 +309,19 @@ data class PipelineConfig(
         sb.append("  <debugImagesEnabled>${debugImagesEnabled}</debugImagesEnabled>\n")
         sb.append("  <normalModeIsoReductionFactor>${normalModeIsoReductionFactor}</normalModeIsoReductionFactor>\n")
         sb.append("  <captureFrameCount>${captureFrameCount}</captureFrameCount>\n")
+        sb.append("  <backNoiseA>${backNoiseA}</backNoiseA>\n")
+        sb.append("  <backNoiseB>${backNoiseB}</backNoiseB>\n")
+        sb.append("  <backNoiseC>${backNoiseC}</backNoiseC>\n")
+        sb.append("  <backNoiseD>${backNoiseD}</backNoiseD>\n")
+        sb.append("  <frontNoiseA>${frontNoiseA}</frontNoiseA>\n")
+        sb.append("  <frontNoiseB>${frontNoiseB}</frontNoiseB>\n")
+        sb.append("  <frontNoiseC>${frontNoiseC}</frontNoiseC>\n")
+        sb.append("  <frontNoiseD>${frontNoiseD}</frontNoiseD>\n")
+        sb.append("  <denoisePass1Enabled>${denoisePass1Enabled}</denoisePass1Enabled>\n")
+        sb.append("  <denoisePass1Strength>${denoisePass1Strength}</denoisePass1Strength>\n")
+        sb.append("  <denoisePass2Enabled>${denoisePass2Enabled}</denoisePass2Enabled>\n")
+        sb.append("  <denoisePass2Strength>${denoisePass2Strength}</denoisePass2Strength>\n")
+        sb.append("  <tonemapExposureBoost>${tonemapExposureBoost}</tonemapExposureBoost>\n")
         stageEnabled.forEach { (k, v) ->
             sb.append("  <stage_${k}>${v}</stage_${k}>\n")
         }

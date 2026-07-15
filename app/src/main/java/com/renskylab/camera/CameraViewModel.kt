@@ -311,6 +311,13 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     /**
+     * Toggles the camera sensor between front-facing and back-facing modes.
+     */
+    fun toggleCameraFacing() {
+        controller.toggleCameraFacing()
+    }
+
+    /**
      * Called when the ViewModel is no longer in use and will be destroyed.
      * Closes camera resources to prevent memory or hardware context leaks.
      */
