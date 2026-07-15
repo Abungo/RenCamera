@@ -55,12 +55,13 @@ float getRawCorrected(ivec2 p, int frameIdx) {
     uint val = texelFetch(u_raw_frames, ivec3(cx, cy, frameIdx), 0).r;
     float centerCleanVal = max(0.0, (float(val) - u_black_level) * u_scale);
 
-    // Bayer spatial bilateral filter on same-color pixels
+    // Tighten spatial bilateral filter footprint to preserve extreme details
     float sumVal = 0.0;
     float sumW = 0.0;
     
-    float rSigma2 = 2.0 * u_raw_range_sigma * u_raw_range_sigma;
-    float sSigma2 = 2.0 * 1.5 * 1.5;
+    // Scale sigma values down to prevent details from washing out
+    float rSigma2 = 2.0 * (u_raw_range_sigma * 0.4) * (u_raw_range_sigma * 0.4);
+    float sSigma2 = 2.0 * 0.8 * 0.8; // tighter spatial sigma
 
     for (int dy = -2; dy <= 2; dy += 2) {
         for (int dx = -2; dx <= 2; dx += 2) {
@@ -181,10 +182,10 @@ void main() {
     float finalG = (weightG > 0.01) ? (sumG / weightG) : 0.0;
     float finalB = (weightB > 0.01) ? (sumB / weightB) : 0.0;
 
-    // Fallback to high-quality local demosaicing if any channel lacks enough samples
-    bool needR = (weightR <= 0.2);
-    bool needG = (weightG <= 0.2);
-    bool needB = (weightB <= 0.2);
+    // Fallback to high-quality local demosaicing ONLY if a channel lacks virtually any samples
+    bool needR = (weightR <= 0.01);
+    bool needG = (weightG <= 0.01);
+    bool needB = (weightB <= 0.01);
 
     if (needR || needG || needB) {
         int r = pos.y;
