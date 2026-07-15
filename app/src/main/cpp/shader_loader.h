@@ -507,14 +507,13 @@ void main() {
         vVal = (sumV / sumChromaW) * scale;
     }
 
-    // Shadow desaturation to suppress chroma noise in dark regions
-    if (newL < 30.0) {
-        float desatFactor = clamp(newL / 30.0, 0.0, 1.0);
-        uVal *= desatFactor;
-        vVal *= desatFactor;
+    // Convert back from YUV to RGB space using denoised U & V (which are already in sRGB)
+    // Tone down yellow-red casts specifically in skin tone regions (V > 0.02, U is between -0.15 and -0.01)
+    if (vVal > 0.02 && uVal > -0.15 && uVal < -0.01) {
+        vVal *= 0.88; // reduce red-yellow excess selectively for skin
+        uVal *= 0.95; // tone down green-yellow shift slightly
     }
 
-    // Convert back from YUV to RGB space using denoised U & V (which are already in sRGB)
     vec3 finalRgb;
     finalRgb.r = newL + 1.402 * vVal;
     finalRgb.g = newL - 0.34414 * uVal - 0.71414 * vVal;

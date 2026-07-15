@@ -965,6 +965,17 @@ bool ToneMapStage::process(FrameContext& ctx) {
                             oB = newL + factor * (oB - newL);
                         }
 
+                        // Apply skin tone adjustments to tone down yellowish skin in CPU fallback
+                        float uVal = -0.1687f * oR - 0.3313f * oG + 0.5f * oB;
+                        float vVal = 0.5f * oR - 0.4187f * oG - 0.0813f * oB;
+                        if (vVal > 0.02f && uVal > -0.15f && uVal < -0.01f) {
+                            vVal *= 0.88f;
+                            uVal *= 0.95f;
+                            oR = newL + 1.402f * vVal;
+                            oG = newL - 0.34414f * uVal - 0.71414f * vVal;
+                            oB = newL + 1.772f * uVal;
+                        }
+
                         // Soft highlight roll-off
                         float maxChan = std::max({oR, oG, oB});
                         if (maxChan > 255.f) {
