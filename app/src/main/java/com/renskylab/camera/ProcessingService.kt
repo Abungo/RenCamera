@@ -296,10 +296,27 @@ class ProcessingService : Service() {
                             val segmenter = ImageSegmenterHelper(this@ProcessingService)
                             val segResult = segmenter.segmentImage(bmp)
                             if (segResult != null) {
-                                // ==========================================
-                                // LEVEL 1: Main Subject Segmentation (Foreground vs Background)
-                                // ==========================================
-                                val subjectMaskBmp = Bitmap.createBitmap(segResult.width, segResult.height, Bitmap.Config.ARGB_8888)
+                                // Validate if there is actually a person in the frame.
+                                // Count subject pixels (Hair=1, Body=2, Face=3, Clothes=4, Others=5)
+                                var subjectPixelCount = 0
+                                for (b in segResult.bytes) {
+                                    if (b.toInt() and 0xFF in 1..5) {
+                                        subjectPixelCount++
+                                    }
+                                }
+                                val totalPixels = segResult.width * segResult.height
+                                val subjectRatio = subjectPixelCount.toFloat() / totalPixels.toFloat()
+                                Log.i(TAG, "Segmentation foreground ratio: ${String.format("%.4f", subjectRatio)}")
+
+                                if (subjectRatio < 0.015f) {
+                                    Log.i(TAG, "No person detected (foreground ratio < 1.5%). Skipping overlay debug files generation.")
+                                    segmenter.close()
+                                    bmp.recycle()
+                                } else {
+                                    // ==========================================
+                                    // LEVEL 1: Main Subject Segmentation (Foreground vs Background)
+                                    // ==========================================
+                                    val subjectMaskBmp = Bitmap.createBitmap(segResult.width, segResult.height, Bitmap.Config.ARGB_8888)
                                 val subjectMaskPixels = IntArray(segResult.width * segResult.height)
                                 for (i in subjectMaskPixels.indices) {
                                     val classVal = segResult.bytes[i].toInt() and 0xFF
@@ -465,8 +482,9 @@ class ProcessingService : Service() {
                                     fusedBmp.compress(Bitmap.CompressFormat.JPEG, 90, out)
                                 }
                                 fusedBmp.recycle()
-                                segmenter.close()
-                                Log.i(TAG, "Dumping multi-class segmentation mask debug images completed.")
+                                    segmenter.close()
+                                    Log.i(TAG, "Dumping multi-class segmentation mask debug images completed.")
+                                }
                             }
                             bmp.recycle()
                         }
