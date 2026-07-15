@@ -19,6 +19,8 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
+import com.google.mediapipe.framework.image.MPImage
+import com.google.mediapipe.tasks.vision.imagesegmenter.ImageSegmenter
 
 /**
  * Foreground Service that handles the CPU/GPU-intensive image processing pipeline sequentially.
@@ -430,26 +432,95 @@ class ProcessingService : Service() {
                                 }
 
                                 // Overlay category mask pixels
+                                var containsPerson = false
                                 for (y in 0 until segResult.height) {
                                     for (x in 0 until segResult.width) {
                                         val classVal = segResult.bytes[y * segResult.width + x].toInt() and 0xFF
+                                        if (classVal == 15) {
+                                            containsPerson = true
+                                        }
                                         if (classVal in 1..20) {
                                             canvas.drawPoint(x.toFloat(), y.toFloat(), paints[classVal])
                                         }
                                     }
                                 }
 
+                                // If person is detected, run the Selfie multiclass model to segment face, hair, body, clothes
+                                if (containsPerson) {
+                                    try {
+                                        Log.i(TAG, "Person detected. Running secondary Selfie Multiclass segmenter for fine details...")
+                                        val selfieOptions = com.google.mediapipe.tasks.core.BaseOptions.builder()
+                                            .setModelAssetPath("selfie_multiclass_256x256.tflite")
+                                            .build()
+                                        val options = ImageSegmenter.ImageSegmenterOptions.builder()
+                                            .setBaseOptions(selfieOptions)
+                                            .setRunningMode(com.google.mediapipe.tasks.vision.core.RunningMode.IMAGE)
+                                            .setOutputCategoryMask(true)
+                                            .setOutputConfidenceMasks(false)
+                                            .build()
+                                        val selfieSegmenter = ImageSegmenter.createFromOptions(this@ProcessingService, options)
+                                        val selfieResult = selfieSegmenter.segment(com.google.mediapipe.framework.image.BitmapImageBuilder(bmp).build())
+                                        val categoryMask = selfieResult.categoryMask().orElse(null) as? MPImage
+                                        if (categoryMask != null) {
+                                            val sW = categoryMask.width
+                                            val sH = categoryMask.height
+                                            val byteBuffer = com.google.mediapipe.framework.image.ByteBufferExtractor.extract(categoryMask)
+                                            val selfieBytes = ByteArray(sW * sH)
+                                            byteBuffer.rewind()
+                                            byteBuffer.get(selfieBytes, 0, selfieBytes.size)
+
+                                            // Setup paints for selfie regions
+                                            val sHairPaint = Paint().apply { color = Color.argb(130, 255, 50, 50); style = Paint.Style.FILL }     // Bright Red
+                                            val sFacePaint = Paint().apply { color = Color.argb(130, 50, 255, 255); style = Paint.Style.FILL }    // Bright Cyan
+                                            val sBodyPaint = Paint().apply { color = Color.argb(130, 50, 50, 255); style = Paint.Style.FILL }     // Bright Blue
+                                            val sClothesPaint = Paint().apply { color = Color.argb(130, 255, 255, 50); style = Paint.Style.FILL }  // Bright Yellow
+                                            val sOthersPaint = Paint().apply { color = Color.argb(130, 255, 50, 255); style = Paint.Style.FILL }   // Bright Magenta
+
+                                            // Map coordinate scaling between DeepLab mask resolution and Selfie mask resolution if they differ
+                                            for (y in 0 until sH) {
+                                                for (x in 0 until sW) {
+                                                    // Map Selfie pixel coordinate to DeepLab coordinate to ensure we only paint where the DeepLab person mask exists
+                                                    val dlX = (x * segResult.width) / sW
+                                                    val dlY = (y * segResult.height) / sH
+                                                    val dlClassVal = segResult.bytes[dlY * segResult.width + dlX].toInt() and 0xFF
+
+                                                    if (dlClassVal == 15) { // Only refine inside DeepLab's Person region
+                                                        val selfieVal = selfieBytes[y * sW + x].toInt() and 0xFF
+                                                        when (selfieVal) {
+                                                            1 -> canvas.drawPoint(dlX.toFloat(), dlY.toFloat(), sHairPaint)
+                                                            2 -> canvas.drawPoint(dlX.toFloat(), dlY.toFloat(), sBodyPaint)
+                                                            3 -> canvas.drawPoint(dlX.toFloat(), dlY.toFloat(), sFacePaint)
+                                                            4 -> canvas.drawPoint(dlX.toFloat(), dlY.toFloat(), sClothesPaint)
+                                                            5 -> canvas.drawPoint(dlX.toFloat(), dlY.toFloat(), sOthersPaint)
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        selfieSegmenter.close()
+                                    } catch (ex: Exception) {
+                                        Log.e(TAG, "Failed secondary selfie segmentation pass", ex)
+                                    }
+                                }
+
                                 // Draw labels at the top left corner in a legend layout
                                 val labelSize = (segResult.height / 38f).coerceAtLeast(14f)
                                 // We list key labels of interest on the overlay
-                                val legendItems = listOf(
-                                    Pair("PERSON (Red)", Color.RED),
+                                val legendItems = mutableListOf(
                                     Pair("CAT (Blue)", Color.BLUE),
                                     Pair("DOG (Cyan)", Color.CYAN),
                                     Pair("BOTTLE (Yellow)", Color.YELLOW),
                                     Pair("CHAIR (Magenta)", Color.MAGENTA),
                                     Pair("TV (Orange)", Color.rgb(255, 128, 0))
                                 )
+                                if (containsPerson) {
+                                    legendItems.add(0, Pair("PERSON HAIR (Red)", Color.RED))
+                                    legendItems.add(1, Pair("PERSON FACE (Cyan)", Color.CYAN))
+                                    legendItems.add(2, Pair("PERSON BODY (Blue)", Color.BLUE))
+                                    legendItems.add(3, Pair("PERSON CLOTHES (Yellow)", Color.YELLOW))
+                                } else {
+                                    legendItems.add(0, Pair("PERSON (Red)", Color.RED))
+                                }
 
                                 var currentY = 24f
                                 for (item in legendItems) {
@@ -504,7 +575,7 @@ class ProcessingService : Service() {
             }
             
             if (jpegBytes != null) {
-                val uri = PhotoSaver.save(this, jpegBytes, filename, job.sensorOrientation)
+                val uri = PhotoSaver.save(this@ProcessingService, jpegBytes, filename, job.sensorOrientation)
                 if (uri != null) {
                     Log.i(TAG, "Job $jobId completed. Saved URI: $uri")
                     withContext(Dispatchers.Main) {
