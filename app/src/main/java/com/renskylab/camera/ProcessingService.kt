@@ -297,10 +297,10 @@ class ProcessingService : Service() {
                             val segResult = segmenter.segmentImage(bmp)
                             if (segResult != null) {
                                 // Validate if there is actually a person in the frame.
-                                // Count subject pixels (Hair=1, Body=2, Face=3, Clothes=4, Others=5)
+                                // Count subject pixels (any non-background class in DeepLabv3: 1..20)
                                 var subjectPixelCount = 0
                                 for (b in segResult.bytes) {
-                                    if (b.toInt() and 0xFF in 1..5) {
+                                    if (b.toInt() and 0xFF in 1..20) {
                                         subjectPixelCount++
                                     }
                                 }
@@ -308,8 +308,8 @@ class ProcessingService : Service() {
                                 val subjectRatio = subjectPixelCount.toFloat() / totalPixels.toFloat()
                                 Log.i(TAG, "Segmentation foreground ratio: ${String.format("%.4f", subjectRatio)}")
 
-                                if (subjectRatio < 0.015f) {
-                                    Log.i(TAG, "No person detected (foreground ratio < 1.5%). Skipping overlay debug files generation.")
+                                if (subjectRatio < 0.005f) {
+                                    Log.i(TAG, "No foreground objects detected (foreground ratio < 0.5%). Skipping overlay debug files generation.")
                                     segmenter.close()
                                     bmp.recycle()
                                 } else {
@@ -320,8 +320,8 @@ class ProcessingService : Service() {
                                 val subjectMaskPixels = IntArray(segResult.width * segResult.height)
                                 for (i in subjectMaskPixels.indices) {
                                     val classVal = segResult.bytes[i].toInt() and 0xFF
-                                    // Main Subject includes: Hair (1), Body (2), Face (3), Clothes (4), Others (5)
-                                    val isSubject = (classVal in 1..5)
+                                    // Any detected object is foreground
+                                    val isSubject = (classVal in 1..20)
                                     val grayVal = if (isSubject) 255 else 0
                                     subjectMaskPixels[i] = Color.rgb(grayVal, grayVal, grayVal)
                                 }
@@ -343,7 +343,7 @@ class ProcessingService : Service() {
                                 for (y in 0 until segResult.height) {
                                     for (x in 0 until segResult.width) {
                                         val classVal = segResult.bytes[y * segResult.width + x].toInt() and 0xFF
-                                        if (classVal in 1..5) {
+                                        if (classVal in 1..20) {
                                             subjectCanvas.drawPoint(x.toFloat(), y.toFloat(), subjectPaint)
                                         }
                                     }
@@ -357,7 +357,7 @@ class ProcessingService : Service() {
                                     style = Paint.Style.FILL
                                     typeface = android.graphics.Typeface.DEFAULT_BOLD
                                 }
-                                val subjectText = "SUBJECT (Foreground)"
+                                val subjectText = "OBJECTS & PETS (Foreground)"
                                 val subjectTextBounds = android.graphics.Rect()
                                 subjectLabelPaint.getTextBounds(subjectText, 0, subjectText.length, subjectTextBounds)
                                 val subjectPadding = 12f
@@ -384,22 +384,15 @@ class ProcessingService : Service() {
                                 subjectFusedBmp.recycle()
 
                                 // ==========================================
-                                // LEVEL 2: Finer Multiclass Segmentation
+                                // LEVEL 2: Finer Multiclass Segmentation (DeepLabv3 Pascal VOC)
                                 // ==========================================
                                 // Save Category Mask as an Image representation where each class gets a custom pixel value for diagnostics
                                 val maskBmp = Bitmap.createBitmap(segResult.width, segResult.height, Bitmap.Config.ARGB_8888)
                                 val maskPixels = IntArray(segResult.width * segResult.height)
                                 for (i in maskPixels.indices) {
                                     val classVal = segResult.bytes[i].toInt() and 0xFF
-                                    // Map categories to high-contrast grayscale steps
-                                    val grayVal = when (classVal) {
-                                        1 -> 50   // Hair
-                                        2 -> 100  // Body
-                                        3 -> 150  // Face
-                                        4 -> 200  // Clothes
-                                        5 -> 255  // Others
-                                        else -> 0 // Background
-                                    }
+                                    // Scale to 255 grayscale range dynamically
+                                    val grayVal = (classVal * 12).coerceAtMost(255)
                                     maskPixels[i] = Color.rgb(grayVal, grayVal, grayVal)
                                 }
                                 maskBmp.setPixels(maskPixels, 0, segResult.width, 0, 0, segResult.width, segResult.height)
@@ -414,34 +407,48 @@ class ProcessingService : Service() {
                                 val fusedBmp = bmp.copy(Bitmap.Config.ARGB_8888, true)
                                 val canvas = Canvas(fusedBmp)
 
-                                val hairPaint = Paint().apply { color = Color.argb(100, 255, 0, 0); style = Paint.Style.FILL }       // Red for Hair
-                                val bodyPaint = Paint().apply { color = Color.argb(100, 0, 0, 255); style = Paint.Style.FILL }       // Blue for Body
-                                val facePaint = Paint().apply { color = Color.argb(100, 0, 255, 255); style = Paint.Style.FILL }     // Cyan for Face
-                                val clothesPaint = Paint().apply { color = Color.argb(100, 255, 255, 0); style = Paint.Style.FILL }  // Yellow for Clothes
-                                val othersPaint = Paint().apply { color = Color.argb(100, 255, 0, 255); style = Paint.Style.FILL }   // Magenta for Accessories
+                                // PASCAL VOC 20 Colors mapping
+                                val paints = Array(21) { idx ->
+                                    Paint().apply {
+                                        color = when (idx) {
+                                            15 -> Color.argb(120, 255, 0, 0)      // Person -> Red
+                                            8 -> Color.argb(120, 0, 0, 255)       // Cat -> Blue
+                                            12 -> Color.argb(120, 0, 255, 255)    // Dog -> Cyan
+                                            5 -> Color.argb(120, 255, 255, 0)     // Bottle -> Yellow
+                                            9 -> Color.argb(120, 255, 0, 255)     // Chair -> Magenta
+                                            20 -> Color.argb(120, 255, 128, 0)    // TV/Monitor -> Orange
+                                            else -> {
+                                                // Generate distinct values for other object categories
+                                                val r = (idx * 37) % 256
+                                                val g = (idx * 59) % 256
+                                                val b = (idx * 83) % 256
+                                                Color.argb(100, r, g, b)
+                                            }
+                                        }
+                                        style = Paint.Style.FILL
+                                    }
+                                }
 
                                 // Overlay category mask pixels
                                 for (y in 0 until segResult.height) {
                                     for (x in 0 until segResult.width) {
                                         val classVal = segResult.bytes[y * segResult.width + x].toInt() and 0xFF
-                                        when (classVal) {
-                                            1 -> canvas.drawPoint(x.toFloat(), y.toFloat(), hairPaint)
-                                            2 -> canvas.drawPoint(x.toFloat(), y.toFloat(), bodyPaint)
-                                            3 -> canvas.drawPoint(x.toFloat(), y.toFloat(), facePaint)
-                                            4 -> canvas.drawPoint(x.toFloat(), y.toFloat(), clothesPaint)
-                                            5 -> canvas.drawPoint(x.toFloat(), y.toFloat(), othersPaint)
+                                        if (classVal in 1..20) {
+                                            canvas.drawPoint(x.toFloat(), y.toFloat(), paints[classVal])
                                         }
                                     }
                                 }
 
                                 // Draw labels at the top left corner in a legend layout
                                 val labelSize = (segResult.height / 38f).coerceAtLeast(14f)
+                                // We list key labels of interest on the overlay
                                 val legendItems = listOf(
-                                    Pair("HAIR (Red)", Color.RED),
-                                    Pair("FACE (Cyan)", Color.CYAN),
-                                    Pair("BODY (Blue)", Color.BLUE),
-                                    Pair("CLOTHES (Yellow)", Color.YELLOW),
-                                    Pair("OTHERS (Magenta)", Color.MAGENTA)
+                                    Pair("PERSON (Red)", Color.RED),
+                                    Pair("CAT (Blue)", Color.BLUE),
+                                    Pair("DOG (Cyan)", Color.CYAN),
+                                    Pair("BOTTLE (Yellow)", Color.YELLOW),
+                                    Pair("CHAIR (Magenta)", Color.MAGENTA),
+                                    Pair("TV (Orange)", Color.rgb(255, 128, 0))
                                 )
 
                                 var currentY = 24f

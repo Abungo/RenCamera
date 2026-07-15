@@ -34,7 +34,7 @@ class ImageSegmenterHelper(private val context: Context) {
     init {
         try {
             val baseOptions = BaseOptions.builder()
-                .setModelAssetPath("selfie_multiclass_256x256.tflite")
+                .setModelAssetPath("deeplabv3.tflite")
                 .build()
 
             val options = ImageSegmenter.ImageSegmenterOptions.builder()
