@@ -20,6 +20,7 @@ import android.view.OrientationEventListener
 import java.nio.ByteBuffer
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
+import android.hardware.camera2.params.LensShadingMap
 
 private const val TAG = "RenCamera/CameraCtrl"
 private const val RING_BUFFER_SIZE = 15
@@ -76,6 +77,12 @@ class CameraController(
     private var lastViewfinderAwbGains: FloatArray? = null
     @Volatile
     private var lastViewfinderCcm: FloatArray? = null
+    @Volatile
+    private var lastViewfinderLsc: FloatArray? = null // 4-channel R/Gr/Gb/B gain map, row-major
+    @Volatile
+    private var lastViewfinderLscW: Int = 0
+    @Volatile
+    private var lastViewfinderLscH: Int = 0
 
     /**
      * Attempts to pair an incoming [Image] buffer with its matching [TotalCaptureResult] metadata.
@@ -496,6 +503,9 @@ class CameraController(
                 // Force digital post-RAW gain boost to unity (100) to ensure the driver uses analog sensitivity (ISO) instead of digital gain
                 set(CaptureRequest.CONTROL_POST_RAW_SENSITIVITY_BOOST, 100)
 
+                // Enable Lens Shading Map statistics
+                set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE_ON)
+
                 // Enable Optical Image Stabilization (OIS) if supported
                 val oisModes = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
                 if (oisModes != null && oisModes.contains(CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)) {
@@ -555,6 +565,30 @@ class CameraController(
                        val row = idx / 3
                        transform.getElement(col, row).toFloat()
                     }
+                }
+
+                // Extract lens shading correction map (4-channel: R, Gr, Gb, B per pixel)
+                // LensShadingMap.getGainFactor(ch, column, row): ch 0=R, 1=Gr, 2=Gb, 3=B
+                @Suppress("UNCHECKED_CAST")
+                val lscMap: LensShadingMap? = result.get(
+                    CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP as CaptureResult.Key<LensShadingMap>
+                )
+                if (lscMap != null) {
+                    val mapW = lscMap.columnCount
+                    val mapH = lscMap.rowCount
+                    val lscData = FloatArray(4 * mapW * mapH)
+                    for (r in 0 until mapH) {
+                        for (c in 0 until mapW) {
+                            val base = (r * mapW + c) * 4
+                            lscData[base + 0] = lscMap.getGainFactor(0, c, r)
+                            lscData[base + 1] = lscMap.getGainFactor(1, c, r)
+                            lscData[base + 2] = lscMap.getGainFactor(2, c, r)
+                            lscData[base + 3] = lscMap.getGainFactor(3, c, r)
+                        }
+                    }
+                    lastViewfinderLsc = lscData
+                    lastViewfinderLscW = mapW
+                    lastViewfinderLscH = mapH
                 }
             }
         }, cameraHandler)
@@ -668,6 +702,9 @@ class CameraController(
                         if (oisModes != null && oisModes.contains(CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON)) {
                             set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
                         }
+
+                        // Enable Lens Shading Map statistics
+                        set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE_ON)
 
                         setTag("BURST")
                     }.build()
@@ -915,7 +952,10 @@ class CameraController(
                 digitalGain = calculatedDigitalGain,
                 sensorOrientation = jpegOrientation,
                 appliedEvCompensation = activeDynamicEv,
-                colorFilterArrangement = cfa
+                colorFilterArrangement = cfa,
+                lensShadingMap = lastViewfinderLsc,
+                lscMapWidth = lastViewfinderLscW,
+                lscMapHeight = lastViewfinderLscH
             )
             
             ProcessingManager.addJob(job)

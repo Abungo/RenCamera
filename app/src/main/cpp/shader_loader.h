@@ -61,28 +61,34 @@ float getRawCorrected(ivec2 p, int frameIdx) {
     uint val = texelFetch(u_raw_frames, ivec3(cx, cy, frameIdx), 0).r;
     float centerCleanVal = max(0.0, (float(val) - u_black_level) * u_scale);
 
-    // Bayer spatial bilateral filter on same-color pixels
-    float sumVal = 0.0;
-    float sumW = 0.0;
-    
-    float rSigma2 = 2.0 * u_raw_range_sigma * u_raw_range_sigma;
-    float sSigma2 = 2.0 * 1.5 * 1.5;
+    float cleanVal = centerCleanVal;
 
-    for (int dy = -2; dy <= 2; dy += 2) {
-        for (int dx = -2; dx <= 2; dx += 2) {
-            ivec2 np = clamp(p + ivec2(dx, dy), ivec2(0), ivec2(u_width - 1, u_height - 1));
-            uint nRawVal = texelFetch(u_raw_frames, ivec3(np.x, np.y, frameIdx), 0).r;
-            float nCleanVal = max(0.0, (float(nRawVal) - u_black_level) * u_scale);
+    // Apply spatial bilateral filter ONLY for a single noisy raw frame (no temporal fusion)
+    if (u_num_frames == 1) {
+        float sumVal = 0.0;
+        float sumW = 0.0;
+        
+        float rSigma2 = 2.0 * u_raw_range_sigma * u_raw_range_sigma;
+        float sSigma2 = 2.0 * 1.5 * 1.5;
 
-            float diff = nCleanVal - centerCleanVal;
-            float dS2 = float((dx/2)*(dx/2) + (dy/2)*(dy/2));
-            float w = exp(-dS2 / sSigma2) * exp(-diff*diff / rSigma2);
+        for (int dy = -2; dy <= 2; dy += 2) {
+            for (int dx = -2; dx <= 2; dx += 2) {
+                ivec2 np = clamp(p + ivec2(dx, dy), ivec2(0), ivec2(u_width - 1, u_height - 1));
+                uint nRawVal = texelFetch(u_raw_frames, ivec3(np.x, np.y, frameIdx), 0).r;
+                float nCleanVal = max(0.0, (float(nRawVal) - u_black_level) * u_scale);
 
-            sumVal += w * nCleanVal;
-            sumW += w;
+                float diff = nCleanVal - centerCleanVal;
+                float dS2 = float((dx/2)*(dx/2) + (dy/2)*(dy/2));
+                float w = exp(-dS2 / sSigma2) * exp(-diff*diff / rSigma2);
+
+                sumVal += w * nCleanVal;
+                sumW += w;
+            }
+        }
+        if (sumW > 1e-4) {
+            cleanVal = sumVal / sumW;
         }
     }
-    float cleanVal = (sumW > 1e-4) ? (sumVal / sumW) : centerCleanVal;
 
     int color = getPixelColor(p);
     if (color == 0) {
@@ -98,20 +104,60 @@ void main() {
     ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
     if (pos.x >= u_width || pos.y >= u_height) return;
 
-    // Edge-adaptive kernel: compute horizontal and vertical green gradients on reference frame
-    float gLeft = getRawCorrected(pos + ivec2(-1, 0), 0);
-    float gRight = getRawCorrected(pos + ivec2(1, 0), 0);
-    float gUp = getRawCorrected(pos + ivec2(0, -1), 0);
-    float gDown = getRawCorrected(pos + ivec2(0, 1), 0);
-    float edgeStrength = abs(gLeft - gRight) + abs(gUp - gDown);
-    // Ramps from 3.5 (flat regions, strong denoising) to 8.0 (sharp edges, detail preservation)
-    float kExponent = mix(3.5, 8.0, clamp(edgeStrength / 15.0, 0.0, 1.0));
+    // Compute Structure Tensor on reference frame to steer kernel anisotropically
+    // Ix/Iy are local horizontal and vertical gradients
+    float Ix = (getRawCorrected(pos + ivec2(1, 0), 0) - getRawCorrected(pos + ivec2(-1, 0), 0)) * 0.5;
+    float Iy = (getRawCorrected(pos + ivec2(0, 1), 0) - getRawCorrected(pos + ivec2(0, -1), 0)) * 0.5;
+
+    // Structure Tensor elements
+    float jXX = Ix * Ix;
+    float jYY = Iy * Iy;
+    float jXY = Ix * Iy;
+
+    // Solve for eigenvalues of the local structure tensor:
+    // lambda1 (direction across edge - gradient), lambda2 (direction along edge)
+    float trace = jXX + jYY;
+    float det = jXX * jYY - jXY * jXY;
+    float discriminant = sqrt(max(0.0, trace * trace - 4.0 * det));
+    float l1 = (trace + discriminant) * 0.5; // gradient magnitude
+    float l2 = max(0.0, (trace - discriminant) * 0.5);
+
+    // Compute steering parameters (orientation angle and anisotropic scaling)
+    float angle = 0.0;
+    if (abs(jXY) > 1e-5) {
+        angle = atan(l1 - jXX, jXY);
+    } else if (jXX > jYY) {
+        angle = 0.0;
+    } else {
+        angle = 1.5707963;
+    }
+
+    // Determine scale factors along eigenvectors: stretch along the edge (low gradient direction)
+    // and squeeze across the edge (high gradient direction)
+    float edgeContrast = l1 + l2;
+    float anisotropy = (edgeContrast > 1e-4) ? ((l1 - l2) / edgeContrast) : 0.0;
+    
+    // Base kernel spread parameter (tuning range of spread)
+    float sigmaBase = mix(1.2, 0.7, clamp(edgeContrast / 10.0, 0.0, 1.0));
+    float scaleAlong = sigmaBase * (1.0 + 1.5 * anisotropy);
+    float scaleAcross = sigmaBase / (1.0 + 1.5 * anisotropy);
+
+    // Coordinate transformation matrix elements for the covariance steering ellipse:
+    // cos(theta), sin(theta) rotation matrix scaled by directional spreads
+    float cosA = cos(angle);
+    float sinA = sin(angle);
+    float invAlong2 = 1.0 / (2.0 * scaleAlong * scaleAlong);
+    float invAcross2 = 1.0 / (2.0 * scaleAcross * scaleAcross);
+
+    float mXX = cosA * cosA * invAlong2 + sinA * sinA * invAcross2;
+    float mYY = sinA * sinA * invAlong2 + cosA * cosA * invAcross2;
+    float mXY = cosA * sinA * (invAlong2 - invAcross2);
 
     float sumR = 0.0, weightR = 0.0;
     float sumG = 0.0, weightG = 0.0;
     float sumB = 0.0, weightB = 0.0;
 
-    // 1. Reference frame (Frame 0, pre-fused) local neighborhood contribution
+    // 1. Reference frame (Frame 0, pre-fused) local neighborhood contribution using anisotropic distance metric
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
             ivec2 samplePos = pos + ivec2(dx, dy);
@@ -119,8 +165,9 @@ void main() {
                 float val = getRawCorrected(samplePos, 0);
                 int color = getPixelColor(samplePos);
                 
-                float dist2 = float(dx * dx + dy * dy);
-                float spatialW = exp(-dist2 * kExponent);
+                // Anisotropic mahalanobis distance metric
+                float distMetric = float(dx * dx) * mXX + float(dy * dy) * mYY + 2.0 * float(dx * dy) * mXY;
+                float spatialW = exp(-distMetric);
 
                 if (color == 0) {
                     sumR += val * spatialW;
@@ -136,7 +183,7 @@ void main() {
         }
     }
 
-    // 2. Subpixel multi-frame accumulation (with noise weight filtering)
+    // 2. Subpixel multi-frame accumulation (with noise weight filtering and anisotropic steering)
     float noiseTolerance = 12.f / u_scale; // scaled to RAW pixel domain (12.f out of 255.f)
     for (int f = 1; f < u_num_frames; ++f) {
         float bx = (float(pos.x) - u_block_size * 0.5) / u_block_size;
@@ -160,13 +207,14 @@ void main() {
                     
                     // Smoothly reject unaligned/noisy pixels
                     float weightFactor = exp(-diff * diff / (2.f * noiseTolerance * noiseTolerance));
-                    if (weightFactor < 0.2) continue; // Tightened threshold from 0.1 to 0.2
+                    if (weightFactor < 0.2) continue; // Reject mismatched pixels
 
                     int color = getPixelColor(samplePos);
 
                     vec2 delta = vec2(samplePos) - targetPos;
-                    float dist2 = dot(delta, delta);
-                    float spatialW = exp(-dist2 * kExponent) * weightFactor;
+                    // Compute anisotropic metric for offset vector to align with the edge
+                    float distMetric = delta.x * delta.x * mXX + delta.y * delta.y * mYY + 2.0 * delta.x * delta.y * mXY;
+                    float spatialW = exp(-distMetric) * weightFactor;
 
                     if (color == 0) {
                         sumR += val * spatialW;
@@ -192,45 +240,84 @@ void main() {
     bool needG = (weightG <= 0.2);
     bool needB = (weightB <= 0.2);
 
-    if (needR || needG || needB) {
-        int r = pos.y;
-        int c = pos.x;
-        bool isEvenRow = (r % 2 == 0);
-        bool isEvenCol = (c % 2 == 0);
+    int r = pos.y;
+    int c = pos.x;
+    bool isEvenRow = (r % 2 == 0);
+    bool isEvenCol = (c % 2 == 0);
 
-        float fallbackR = 0.0;
-        float fallbackG = 0.0;
-        float fallbackB = 0.0;
+    float fallbackR = 0.0;
+    float fallbackG = 0.0;
+    float fallbackB = 0.0;
 
-        if (isEvenRow && isEvenCol) {
-            fallbackB = getRawCorrected(pos, 0);
-            fallbackG = (getRawCorrected(ivec2(c-1, r), 0) + getRawCorrected(ivec2(c+1, r), 0) + getRawCorrected(ivec2(c, r-1), 0) + getRawCorrected(ivec2(c, r+1), 0)) * 0.25 + 
-                        (4.0 * fallbackB - getRawCorrected(ivec2(c-2, r), 0) - getRawCorrected(ivec2(c+2, r), 0) - getRawCorrected(ivec2(c, r-2), 0) - getRawCorrected(ivec2(c, r+2), 0)) * 0.125;
-            fallbackR = (getRawCorrected(ivec2(c-1, r-1), 0) + getRawCorrected(ivec2(c+1, r-1), 0) + getRawCorrected(ivec2(c-1, r+1), 0) + getRawCorrected(ivec2(c+1, r+1), 0)) * 0.25 + 
-                        (6.0 * fallbackB - 1.5 * (getRawCorrected(ivec2(c-2, r), 0) + getRawCorrected(ivec2(c+2, r), 0) + getRawCorrected(ivec2(c, r-2), 0) + getRawCorrected(ivec2(c, r+2), 0))) * 0.0625;
-        } else if (!isEvenRow && !isEvenCol) {
-            fallbackR = getRawCorrected(pos, 0);
-            fallbackG = (getRawCorrected(ivec2(c-1, r), 0) + getRawCorrected(ivec2(c+1, r), 0) + getRawCorrected(ivec2(c, r-1), 0) + getRawCorrected(ivec2(c, r+1), 0)) * 0.25 + 
-                        (4.0 * fallbackR - getRawCorrected(ivec2(c-2, r), 0) - getRawCorrected(ivec2(c+2, r), 0) - getRawCorrected(ivec2(c, r-2), 0) - getRawCorrected(ivec2(c, r+2), 0)) * 0.125;
-            fallbackB = (getRawCorrected(ivec2(c-1, r-1), 0) + getRawCorrected(ivec2(c+1, r-1), 0) + getRawCorrected(ivec2(c-1, r+1), 0) + getRawCorrected(ivec2(c+1, r+1), 0)) * 0.25 + 
-                        (6.0 * fallbackR - 1.5 * (getRawCorrected(ivec2(c-2, r), 0) + getRawCorrected(ivec2(c+2, r), 0) + getRawCorrected(ivec2(c, r-2), 0) + getRawCorrected(ivec2(c, r+2), 0))) * 0.0625;
-        } else if (isEvenRow && !isEvenCol) {
-            fallbackG = getRawCorrected(pos, 0);
-            fallbackB = (getRawCorrected(ivec2(c-1, r), 0) + getRawCorrected(ivec2(c+1, r), 0)) * 0.5 + 
-                        (2.0 * fallbackG - getRawCorrected(ivec2(c-2, r), 0) - getRawCorrected(ivec2(c+2, r), 0)) * 0.125;
-            fallbackR = (getRawCorrected(ivec2(c, r-1), 0) + getRawCorrected(ivec2(c, r+1), 0)) * 0.5 + 
-                        (2.0 * fallbackG - getRawCorrected(ivec2(c, r-2), 0) - getRawCorrected(ivec2(c, r+2), 0)) * 0.125;
-        } else {
-            fallbackG = getRawCorrected(pos, 0);
-            fallbackR = (getRawCorrected(ivec2(c-1, r), 0) + getRawCorrected(ivec2(c+1, r), 0)) * 0.5 + 
-                        (2.0 * fallbackG - getRawCorrected(ivec2(c-2, r), 0) - getRawCorrected(ivec2(c+2, r), 0)) * 0.125;
-            fallbackB = (getRawCorrected(ivec2(c, r-1), 0) + getRawCorrected(ivec2(c, r+1), 0)) * 0.5 + 
-                        (2.0 * fallbackG - getRawCorrected(ivec2(c, r-2), 0) - getRawCorrected(ivec2(c, r+2), 0)) * 0.125;
+    // Adaptive Homogeneity-Directed (AHD) Demosaicing
+    // 1. Calculate Horizontal vs. Vertical Gradients to choose optimal Green interpolation
+    float hGrad = abs(getRawCorrected(pos + ivec2(-2, 0), 0) - 2.0 * getRawCorrected(pos, 0) + getRawCorrected(pos + ivec2(2, 0), 0)) +
+                  abs(getRawCorrected(pos + ivec2(-1, 0), 0) - getRawCorrected(pos + ivec2(1, 0), 0));
+    float vGrad = abs(getRawCorrected(pos + ivec2(0, -2), 0) - 2.0 * getRawCorrected(pos, 0) + getRawCorrected(pos + ivec2(0, 2), 0)) +
+                  abs(getRawCorrected(pos + ivec2(0, -1), 0) - getRawCorrected(pos + ivec2(0, 1), 0));
+
+    float greenH = 0.0;
+    float greenV = 0.0;
+
+    int pixelColor = getPixelColor(pos);
+    if (pixelColor == 1) { // Already Green
+        greenH = getRawCorrected(pos, 0);
+        greenV = greenH;
+    } else {
+        // Horizontal green interpolation guided by Red/Blue Laplacian
+        greenH = (getRawCorrected(pos + ivec2(-1, 0), 0) + getRawCorrected(pos + ivec2(1, 0), 0)) * 0.5 +
+                 (2.0 * getRawCorrected(pos, 0) - getRawCorrected(pos + ivec2(-2, 0), 0) - getRawCorrected(pos + ivec2(2, 0), 0)) * 0.25;
+        // Vertical green interpolation guided by Red/Blue Laplacian
+        greenV = (getRawCorrected(pos + ivec2(0, -1), 0) + getRawCorrected(pos + ivec2(0, 1), 0)) * 0.5 +
+                 (2.0 * getRawCorrected(pos, 0) - getRawCorrected(pos + ivec2(0, -2), 0) - getRawCorrected(pos + ivec2(0, 2), 0)) * 0.25;
+    }
+
+    // Interpolate along the edge with lower gradient
+    fallbackG = (hGrad < vGrad) ? greenH : ((vGrad < hGrad) ? greenV : (greenH + greenV) * 0.5);
+
+    // 2. Interpolate Red and Blue using the edge-directed Green as a guide
+    if (pixelColor == 0) { // Red pixel
+        fallbackR = getRawCorrected(pos, 0);
+        
+        // Interpolate Blue at Red site: average of 4 diagonal Blue pixels guided by Green differences
+        float b_g_topleft  = getRawCorrected(pos + ivec2(-1, -1), 0) - fallbackG;
+        float b_g_topright = getRawCorrected(pos + ivec2(1, -1), 0) - fallbackG;
+        float b_g_botleft  = getRawCorrected(pos + ivec2(-1, 1), 0) - fallbackG;
+        float b_g_botright = getRawCorrected(pos + ivec2(1, 1), 0) - fallbackG;
+        fallbackB = fallbackG + (b_g_topleft + b_g_topright + b_g_botleft + b_g_botright) * 0.25;
+    } else if (pixelColor == 2) { // Blue pixel
+        fallbackB = getRawCorrected(pos, 0);
+        
+        // Interpolate Red at Blue site
+        float r_g_topleft  = getRawCorrected(pos + ivec2(-1, -1), 0) - fallbackG;
+        float r_g_topright = getRawCorrected(pos + ivec2(1, -1), 0) - fallbackG;
+        float r_g_botleft  = getRawCorrected(pos + ivec2(-1, 1), 0) - fallbackG;
+        float r_g_botright = getRawCorrected(pos + ivec2(1, 1), 0) - fallbackG;
+        fallbackR = fallbackG + (r_g_topleft + r_g_topright + r_g_botleft + r_g_botright) * 0.25;
+    } else { // Green pixel
+        // Interpolate Red & Blue at Green sites: average of 2 horizontal or vertical neighbors
+        if (isEvenRow) { // Row has G and B
+            fallbackB = (getRawCorrected(pos + ivec2(-1, 0), 0) + getRawCorrected(pos + ivec2(1, 0), 0)) * 0.5;
+            fallbackR = (getRawCorrected(pos + ivec2(0, -1), 0) + getRawCorrected(pos + ivec2(0, 1), 0)) * 0.5;
+        } else { // Row has R and G
+            fallbackR = (getRawCorrected(pos + ivec2(-1, 0), 0) + getRawCorrected(pos + ivec2(1, 0), 0)) * 0.5;
+            fallbackB = (getRawCorrected(pos + ivec2(0, -1), 0) + getRawCorrected(pos + ivec2(0, 1), 0)) * 0.5;
         }
+    }
 
-        if (needR) finalR = fallbackR;
-        if (needG) finalG = fallbackG;
-        if (needB) finalB = fallbackB;
+    if (needR) finalR = fallbackR;
+    if (needG) finalG = fallbackG;
+    if (needB) finalB = fallbackB;
+
+    // CRITICAL: Direct Original Pixel Injection
+    // Inject the raw home pixel value directly to preserve 100% of the original sensor detail
+    float homeVal = getRawCorrected(pos, 0);
+    if (pixelColor == 0) {
+        finalR = homeVal;
+    } else if (pixelColor == 1) {
+        finalG = homeVal;
+    } else {
+        finalB = homeVal;
     }
 
     vec3 sensorRgb = vec3(finalR, finalG, finalB);
@@ -261,7 +348,7 @@ uniform float u_strength_multiplier;
 layout(rgba8, binding = 0) writeonly uniform image2D u_output_image;
 
 float luma(vec3 rgb) {
-    return 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
+    return 0.2722 * rgb.r + 0.6740 * rgb.g + 0.0538 * rgb.b;
 }
 
 void main() {
@@ -359,7 +446,7 @@ layout(std430, binding = 0) writeonly buffer OutputBuffer {
 };
 
 float luma(vec3 rgb) {
-    return 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
+    return 0.2722 * rgb.r + 0.6740 * rgb.g + 0.0538 * rgb.b;
 }
 
 float acesFilm(float x) {
@@ -384,6 +471,7 @@ void main() {
     // Single-pass bilateral filter on the GPU to extract local low-frequency base layer
     float sumVal = 0.0;
     float sumW = 0.0;
+    float sumSqDiff = 0.0; // To measure local standard deviation for contrast compensation
     
     float spatial_sigma2 = 2.0 * 16.0 * 16.0;
     float range_sigma2 = 2.0 * 15.0 * 15.0;
@@ -401,10 +489,12 @@ void main() {
 
             float w = exp(-dS2 / spatial_sigma2) * exp(-dR2 / range_sigma2);
             sumVal += w * nL;
+            sumSqDiff += w * dR2;
             sumW += w;
         }
     }
     float baseL = max(1.0, sumVal / sumW);
+    float localContrast = sqrt(sumSqDiff / max(1.0, sumW)); // standard deviation metric
     
     float logL = log2(L + 1.0);
     float logBase = log2(baseL + 1.0);
@@ -430,6 +520,12 @@ void main() {
         }
         currentDetailAlpha = minDetail + shadowFactor * (u_detail_alpha - minDetail);
     }
+
+    // Dynamic Low-Contrast Adaptive Boost
+    // If local contrast is very low (e.g. gray text on gray paper), multiply gain by up to 1.8x.
+    // As contrast increases, factor rolls back to 1.0 to prevent halos.
+    float contrastBoostFactor = mix(1.8, 1.0, clamp(localContrast / 25.0, 0.0, 1.0));
+    currentDetailAlpha *= contrastBoostFactor;
 
     float logDetail = logL - logBase;
     
@@ -578,7 +674,7 @@ vec3 unpackRGB(uint val) {
 }
 
 float luma(vec3 rgb) {
-    return 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
+    return 0.2722 * rgb.r + 0.6740 * rgb.g + 0.0538 * rgb.b;
 }
 
 void main() {

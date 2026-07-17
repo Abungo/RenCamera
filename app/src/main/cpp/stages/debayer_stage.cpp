@@ -191,6 +191,85 @@ bool DebayerStage::process(FrameContext& ctx) {
             } catch (...) {}
         }
 
+        // ── Lens Shading Correction (LSC) applied in-place to fused RAW before debayering
+        // The LSC gain map corrects vignetting: each pixel's raw value is divided by its
+        // channel-specific shading gain (which is >= 1.0, highest in corners).
+        std::vector<float> lscData;
+        int lscMapW = 0, lscMapH = 0;
+        if (ctx.metadata.count("lsc_data") && ctx.metadata.count("lsc_map_width") && ctx.metadata.count("lsc_map_height")) {
+            try {
+                lscData   = std::any_cast<std::vector<float>>(ctx.metadata.at("lsc_data"));
+                lscMapW   = std::any_cast<int>(ctx.metadata.at("lsc_map_width"));
+                lscMapH   = std::any_cast<int>(ctx.metadata.at("lsc_map_height"));
+            } catch (...) {}
+        }
+
+        const bool hasLsc = lscMapW > 1 && lscMapH > 1 &&
+                            static_cast<int>(lscData.size()) == 4 * lscMapW * lscMapH;
+        if (hasLsc) {
+            LOGI("DebayerStage: applying LSC map %d×%d to %d×%d fused RAW", lscMapW, lscMapH, w, h);
+            // The gain map channels: 0=R, 1=Gr, 2=Gb, 3=B
+            // For RGGB CFA: ch 0=R, ch 1=Gr, ch 2=Gb, ch 3=B
+            // We bilinearly interpolate from the low-resolution LSC map to full image coordinates.
+            for (int row = 0; row < h; ++row) {
+                for (int col = 0; col < w; ++col) {
+                    // Map pixel (col, row) to LSC map coordinates
+                    float mapX = (col + 0.5f) * lscMapW / w - 0.5f;
+                    float mapY = (row + 0.5f) * lscMapH / h - 0.5f;
+                    mapX = std::clamp(mapX, 0.f, static_cast<float>(lscMapW - 1));
+                    mapY = std::clamp(mapY, 0.f, static_cast<float>(lscMapH - 1));
+
+                    int mx0 = static_cast<int>(mapX);
+                    int my0 = static_cast<int>(mapY);
+                    int mx1 = std::min(mx0 + 1, lscMapW - 1);
+                    int my1 = std::min(my0 + 1, lscMapH - 1);
+                    float fx = mapX - mx0;
+                    float fy = mapY - my0;
+
+                    // Determine Bayer channel (0=R, 1=Gr, 2=Gb, 3=B)
+                    int bayerCh;
+                    int pr = row % 2, pc = col % 2;
+                    if (cfaPattern == 0) {      // RGGB
+                        if (pr == 0 && pc == 0)      bayerCh = 0; // R
+                        else if (pr == 0 && pc == 1) bayerCh = 1; // Gr
+                        else if (pr == 1 && pc == 0) bayerCh = 2; // Gb
+                        else                         bayerCh = 3; // B
+                    } else if (cfaPattern == 1) { // GRBG
+                        if (pr == 0 && pc == 0)      bayerCh = 1; // Gr
+                        else if (pr == 0 && pc == 1) bayerCh = 0; // R
+                        else if (pr == 1 && pc == 0) bayerCh = 3; // B
+                        else                         bayerCh = 2; // Gb
+                    } else if (cfaPattern == 2) { // GBRG
+                        if (pr == 0 && pc == 0)      bayerCh = 2; // Gb
+                        else if (pr == 0 && pc == 1) bayerCh = 3; // B
+                        else if (pr == 1 && pc == 0) bayerCh = 0; // R
+                        else                         bayerCh = 1; // Gr
+                    } else {                    // BGGR (3)
+                        if (pr == 0 && pc == 0)      bayerCh = 3; // B
+                        else if (pr == 0 && pc == 1) bayerCh = 2; // Gb
+                        else if (pr == 1 && pc == 0) bayerCh = 1; // Gr
+                        else                         bayerCh = 0; // R
+                    }
+
+                    // Bilinear interpolation of the gain from the 4 surrounding map cells
+                    auto getGain = [&](int my, int mx) -> float {
+                        int base = (my * lscMapW + mx) * 4;
+                        return lscData[base + bayerCh];
+                    };
+                    float gain = (1 - fy) * ((1 - fx) * getGain(my0, mx0) + fx * getGain(my0, mx1))
+                               +      fy  * ((1 - fx) * getGain(my1, mx0) + fx * getGain(my1, mx1));
+                    gain = std::max(1.0f, gain); // gains are always >= 1.0 by definition
+
+                    // Multiply raw pixel (pedestal-subtracted) by gain to normalize shading (LSC correction)
+                    auto& pixel = const_cast<std::vector<uint16_t>&>(fusedRaw)[row * w + col];
+                    float val = static_cast<float>(pixel) - blackLevel;
+                    float corrected = std::max(0.f, val) * gain + blackLevel;
+                    pixel = static_cast<uint16_t>(std::clamp(corrected, 0.f, static_cast<float>(whiteLevel)));
+                }
+            }
+            LOGI("DebayerStage: LSC applied successfully");
+        }
+
         // ── GPU HEADLESS COMPUTE SHADER SABRE MULTI-FRAME DEMOSAICING ────────────────────────────
         bool success = false;
         std::string errorLog;
@@ -335,35 +414,41 @@ bool DebayerStage::process(FrameContext& ctx) {
                 int rStart = t * rowsPerThread;
                 int rEnd = (t == numThreads - 1) ? h : (t + 1) * rowsPerThread;
 
-                futures.push_back(std::async(std::launch::async, [&ctx, &fusedRaw, rStart, rEnd, w, h, blackLevel, scale, rGain, gGain, bGain, ccm, cfaPattern, rawRangeSigma]() {
-                    auto getRaw = [&fusedRaw, w, h, blackLevel, scale, rGain, gGain, bGain, cfaPattern, rawRangeSigma](int r, int cc) -> float {
+                futures.push_back(std::async(std::launch::async, [&ctx, &fusedRaw, rStart, rEnd, w, h, blackLevel, scale, rGain, gGain, bGain, ccm, cfaPattern, rawRangeSigma, numFrames]() {
+                    auto getRaw = [&fusedRaw, w, h, blackLevel, scale, rGain, gGain, bGain, cfaPattern, rawRangeSigma, numFrames](int r, int cc) -> float {
                         int cr = std::clamp(r, 0, h - 1);
                         int c_clamped = std::clamp(cc, 0, w - 1);
                         float centerVal = static_cast<float>(fusedRaw[cr * w + c_clamped]);
                         float centerClean = std::max(0.f, (centerVal - blackLevel) * scale);
 
-                        // CPU same-color Bayer bilateral filter
-                        float sumVal = 0.f;
-                        float sumW = 0.f;
-                        float rSigma2 = 2.f * rawRangeSigma * rawRangeSigma;
-                        float sSigma2 = 2.f * 1.5f * 1.5f;
+                        float cleanVal = centerClean;
 
-                        for (int dy = -2; dy <= 2; dy += 2) {
-                            for (int dx = -2; dx <= 2; dx += 2) {
-                                int nr = std::clamp(cr + dy, 0, h - 1);
-                                int nc = std::clamp(c_clamped + dx, 0, w - 1);
-                                float val = static_cast<float>(fusedRaw[nr * w + nc]);
-                                float clean = std::max(0.f, (val - blackLevel) * scale);
+                        // CPU same-color Bayer bilateral filter ONLY for single noisy RAW input
+                        if (numFrames == 1) {
+                            float sumVal = 0.f;
+                            float sumW = 0.f;
+                            float rSigma2 = 2.f * rawRangeSigma * rawRangeSigma;
+                            float sSigma2 = 2.f * 1.5f * 1.5f;
 
-                                float diff = clean - centerClean;
-                                float dS2 = static_cast<float>((dx/2)*(dx/2) + (dy/2)*(dy/2));
-                                float weight = std::expf(-dS2 / sSigma2) * std::expf(-diff*diff / rSigma2);
+                            for (int dy = -2; dy <= 2; dy += 2) {
+                                for (int dx = -2; dx <= 2; dx += 2) {
+                                    int nr = std::clamp(cr + dy, 0, h - 1);
+                                    int nc = std::clamp(c_clamped + dx, 0, w - 1);
+                                    float val = static_cast<float>(fusedRaw[nr * w + nc]);
+                                    float clean = std::max(0.f, (val - blackLevel) * scale);
 
-                                sumVal += weight * clean;
-                                sumW += weight;
+                                    float diff = clean - centerClean;
+                                    float dS2 = static_cast<float>((dx/2)*(dx/2) + (dy/2)*(dy/2));
+                                    float weight = std::expf(-dS2 / sSigma2) * std::expf(-diff*diff / rSigma2);
+
+                                    sumVal += weight * clean;
+                                    sumW += weight;
+                                }
+                            }
+                            if (sumW > 1e-4f) {
+                                cleanVal = sumVal / sumW;
                             }
                         }
-                        float cleanVal = (sumW > 1e-4f) ? (sumVal / sumW) : centerClean;
 
                         int color = getPixelColorPattern(cr, c_clamped, cfaPattern);
                         if (color == 0) {
@@ -381,25 +466,71 @@ bool DebayerStage::process(FrameContext& ctx) {
                             float R = 0.f, G = 0.f, B = 0.f;
                             int color = getPixelColorPattern(r, c, cfaPattern);
 
+                            // Compute Horizontal and Vertical Gradients for Green channel selection
+                            float hGrad = std::abs(getRaw(r, c - 2) - 2.0f * getRaw(r, c) + getRaw(r, c + 2)) +
+                                          std::abs(getRaw(r, c - 1) - getRaw(r, c + 1));
+                            float vGrad = std::abs(getRaw(r - 2, c) - 2.0f * getRaw(r, c) + getRaw(r + 2, c)) +
+                                          std::abs(getRaw(r - 1, c) - getRaw(r + 1, c));
+
+                            float greenH = 0.0f;
+                            float greenV = 0.0f;
+
+                            if (color == 1) { // Green site
+                                greenH = getRaw(r, c);
+                                greenV = greenH;
+                            } else {
+                                // Horizontal interpolation guided by Laplacian
+                                greenH = (getRaw(r, c - 1) + getRaw(r, c + 1)) * 0.5f +
+                                         (2.0f * getRaw(r, c) - getRaw(r, c - 2) - getRaw(r, c + 2)) * 0.25f;
+                                // Vertical interpolation guided by Laplacian
+                                greenV = (getRaw(r - 1, c) + getRaw(r + 1, c)) * 0.5f +
+                                         (2.0f * getRaw(r, c) - getRaw(r - 2, c) - getRaw(r + 2, c)) * 0.25f;
+                            }
+
+                            // Choose green value along the edge with lower gradient
+                            float G_val = (hGrad < vGrad) ? greenH : ((vGrad < hGrad) ? greenV : (greenH + greenV) * 0.5f);
+
                             if (color == 0) { // Red pixel
                                 R = getRaw(r, c);
-                                G = (getRaw(r-1, c) + getRaw(r+1, c) + getRaw(r, c-1) + getRaw(r, c+1)) * 0.25f;
-                                B = (getRaw(r-1, c-1) + getRaw(r-1, c+1) + getRaw(r+1, c-1) + getRaw(r+1, c+1)) * 0.25f;
+                                G = G_val;
+                                
+                                // Interpolate Blue at Red site: guided by Green differences
+                                float b_g_topleft  = getRaw(r - 1, c - 1) - (getRaw(r - 2, c - 1) + getRaw(r, c - 1) + getRaw(r - 1, c - 2) + getRaw(r - 1, c)) * 0.25f;
+                                float b_g_topright = getRaw(r - 1, c + 1) - (getRaw(r - 2, c + 1) + getRaw(r, c + 1) + getRaw(r - 1, c) + getRaw(r - 1, c + 2)) * 0.25f;
+                                float b_g_botleft  = getRaw(r + 1, c - 1) - (getRaw(r, c - 1) + getRaw(r + 2, c - 1) + getRaw(r + 1, c - 2) + getRaw(r + 1, c)) * 0.25f;
+                                float b_g_botright = getRaw(r + 1, c + 1) - (getRaw(r, c + 1) + getRaw(r + 2, c + 1) + getRaw(r + 1, c) + getRaw(r + 1, c + 2)) * 0.25f;
+                                B = G + (b_g_topleft + b_g_topright + b_g_botleft + b_g_botright) * 0.25f;
                             } else if (color == 2) { // Blue pixel
-                                R = (getRaw(r-1, c-1) + getRaw(r-1, c+1) + getRaw(r+1, c-1) + getRaw(r+1, c+1)) * 0.25f;
-                                G = (getRaw(r-1, c) + getRaw(r+1, c) + getRaw(r, c-1) + getRaw(r, c+1)) * 0.25f;
                                 B = getRaw(r, c);
+                                G = G_val;
+                                
+                                // Interpolate Red at Blue site
+                                float r_g_topleft  = getRaw(r - 1, c - 1) - (getRaw(r - 2, c - 1) + getRaw(r, c - 1) + getRaw(r - 1, c - 2) + getRaw(r - 1, c)) * 0.25f;
+                                float r_g_topright = getRaw(r - 1, c + 1) - (getRaw(r - 2, c + 1) + getRaw(r, c + 1) + getRaw(r - 1, c) + getRaw(r - 1, c + 2)) * 0.25f;
+                                float r_g_botleft  = getRaw(r + 1, c - 1) - (getRaw(r, c - 1) + getRaw(r + 2, c - 1) + getRaw(r + 1, c - 2) + getRaw(r + 1, c)) * 0.25f;
+                                float r_g_botright = getRaw(r + 1, c + 1) - (getRaw(r, c + 1) + getRaw(r + 2, c + 1) + getRaw(r + 1, c) + getRaw(r + 1, c + 2)) * 0.25f;
+                                R = G + (r_g_topleft + r_g_topright + r_g_botleft + r_g_botright) * 0.25f;
                             } else { // Green pixel
-                                bool isRedRow = (getPixelColorPattern(r, c-1, cfaPattern) == 0 || getPixelColorPattern(r, c+1, cfaPattern) == 0);
+                                G = G_val;
+                                bool isRedRow = (getPixelColorPattern(r, c - 1, cfaPattern) == 0 || getPixelColorPattern(r, c + 1, cfaPattern) == 0);
                                 if (isRedRow) {
-                                    R = (getRaw(r, c-1) + getRaw(r, c+1)) * 0.5f;
-                                    G = getRaw(r, c);
-                                    B = (getRaw(r-1, c) + getRaw(r+1, c)) * 0.5f;
+                                    R = (getRaw(r, c - 1) + getRaw(r, c + 1)) * 0.5f;
+                                    B = (getRaw(r - 1, c) + getRaw(r + 1, c)) * 0.5f;
                                 } else {
-                                    R = (getRaw(r-1, c) + getRaw(r+1, c)) * 0.5f;
-                                    G = getRaw(r, c);
-                                    B = (getRaw(r, c-1) + getRaw(r, c+1)) * 0.5f;
+                                    R = (getRaw(r - 1, c) + getRaw(r + 1, c)) * 0.5f;
+                                    B = (getRaw(r, c - 1) + getRaw(r, c + 1)) * 0.5f;
                                 }
+                            }
+
+                            // CRITICAL: Direct Original Pixel Injection
+                            // Inject the raw home pixel value directly to preserve 100% of the original sensor detail
+                            float homeVal = getRaw(r, c);
+                            if (color == 0) {
+                                R = homeVal;
+                            } else if (color == 1) {
+                                G = homeVal;
+                            } else {
+                                B = homeVal;
                             }
 
                             rgbRow[c * 3 + 0] = static_cast<uint8_t>(std::clamp(R, 0.f, 255.f));

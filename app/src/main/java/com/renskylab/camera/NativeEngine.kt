@@ -100,6 +100,9 @@ object NativeEngine {
         frameExposures: LongArray,
         frameNoiseProfiles: FloatArray,
         configParams: FloatArray,
+        lscData: FloatArray,    // Lens shading gain map: 4-channel (R,Gr,Gb,B) row-major
+        lscMapWidth: Int,       // Number of columns in the LSC map
+        lscMapHeight: Int,      // Number of rows in the LSC map
         debugDir: String,
         listener: ProgressListener?
     ): ByteArray?

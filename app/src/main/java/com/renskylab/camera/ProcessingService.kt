@@ -717,6 +717,22 @@ class ProcessingService : Service() {
             add(job.whiteLevel)
         }.toFloatArray()
 
+        // Prepare Lens Shading Correction map for native pipeline
+        val lscRaw = job.lensShadingMap
+        val lscData: FloatArray
+        val lscMapWidth: Int
+        val lscMapHeight: Int
+        if (lscRaw != null && lscRaw.size >= 4 && job.lscMapWidth > 0 && job.lscMapHeight > 0) {
+            lscData = lscRaw
+            lscMapWidth = job.lscMapWidth
+            lscMapHeight = job.lscMapHeight
+        } else {
+            // No LSC available — pass a 1×1 unity gain map (all ones = no correction)
+            lscData = floatArrayOf(1f, 1f, 1f, 1f)
+            lscMapWidth = 1
+            lscMapHeight = 1
+        }
+
         return NativeEngine.processCopiedBurst(
             handle      = job.nativeBurstHandle,
             jpegQuality = job.config.jpegQuality,
@@ -727,6 +743,9 @@ class ProcessingService : Service() {
             frameExposures = job.frameExposures ?: LongArray(job.frameIsos.size),
             frameNoiseProfiles = job.frameNoiseProfiles ?: FloatArray(0),
             configParams = mergedParams,
+            lscData     = lscData,
+            lscMapWidth  = lscMapWidth,
+            lscMapHeight = lscMapHeight,
             debugDir    = debugDir,
             listener    = progressListener
         )

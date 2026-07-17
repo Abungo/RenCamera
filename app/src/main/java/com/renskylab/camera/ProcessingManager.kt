@@ -28,6 +28,8 @@ import java.nio.ByteBuffer
  * @property blackLevel The baseline raw black level value.
  * @property whiteLevel The maximum raw white level (saturation threshold).
  * @property digitalGain Computational/digital scaling factor applied post-capture.
+ * @property lensShadingMap Optional 4-channel (R, Gr, Gb, B) lens shading gain map from sensor,
+ *   packed as [R_row0, Gr_row0, Gb_row0, B_row0, R_row1, ...], used for vignetting correction.
  */
 data class ProcessingJob(
     val id: String,
@@ -47,7 +49,10 @@ data class ProcessingJob(
     val digitalGain: Float = 1.0f,
     val sensorOrientation: Int = 90,
     val appliedEvCompensation: Float = 0.0f,
-    val colorFilterArrangement: Int = 3
+    val colorFilterArrangement: Int = 3,
+    val lensShadingMap: FloatArray? = null, // 4 * mapWidth * mapHeight floats: [R, Gr, Gb, B] interleaved per row
+    val lscMapWidth: Int = 0,
+    val lscMapHeight: Int = 0
 )
 
 /**

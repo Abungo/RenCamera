@@ -647,7 +647,8 @@ static void fuseRawBayer(const std::vector<YuvFrame>& frames,
                          std::vector<uint16_t>& outRaw,
                          int w, int h,
                          const std::vector<std::vector<float>>& inv_2sigma2_luts,
-                         float sensorMax)
+                         float sensorMax,
+                         float blackLevel)
 {
     auto tStart = std::chrono::high_resolution_clock::now();
     int numFrames = frames.size();
@@ -787,7 +788,8 @@ static void fuseRawBayer(const std::vector<YuvFrame>& frames,
                 float* a = acc.data() + r * w;
                 float* ww = wgt.data() + r * w;
                 for (int c = 0; c < w; ++c) {
-                    a[c] = static_cast<float>(row[c]);
+                    // Store pedestal-subtracted values in accumulator for unbiased noise weighting
+                    a[c] = std::max(0.f, static_cast<float>(row[c]) - blackLevel);
                     ww[c] = 1.f;
                 }
             }
@@ -811,7 +813,7 @@ static void fuseRawBayer(const std::vector<YuvFrame>& frames,
                 int rStart = t * rowsPerThread;
                 int rEnd = (t == numThreads - 1) ? h : (t + 1) * rowsPerThread;
 
-                futures.push_back(std::async(std::launch::async, [srcRaw, &mf, &inv_2sigma2_lut, &frames, &acc, &wgt, rStart, rEnd, w, h, strideElements]() {
+                futures.push_back(std::async(std::launch::async, [srcRaw, &mf, &inv_2sigma2_lut, &frames, &acc, &wgt, rStart, rEnd, w, h, strideElements, blackLevel]() {
                     for (int r = rStart; r < rEnd; ++r) {
                         const uint16_t* refRawRow = reinterpret_cast<const uint16_t*>(frames[0].yPlane) + r * (frames[0].yRowStride / 2);
                         float* a = acc.data() + r * w;
@@ -824,11 +826,13 @@ static void fuseRawBayer(const std::vector<YuvFrame>& frames,
 
                             int sc = std::clamp(c + dx, 0, w - 1);
                             int sr = std::clamp(r + dy, 0, h - 1);
-                            
-                            float warped = static_cast<float>(srcRaw[sr * strideElements + sc]);
-                            float ref_val = static_cast<float>(refRawRow[c]);
+
+                            // Pedestal-subtracted values for unbiased residual and noise LUT indexing
+                            float warped  = std::max(0.f, static_cast<float>(srcRaw[sr * strideElements + sc]) - blackLevel);
+                            float ref_val = std::max(0.f, static_cast<float>(refRawRow[c]) - blackLevel);
                             float residual = warped - ref_val;
 
+                            // LUT indexed on normalized pedestal-subtracted reference luma
                             int refLumaIdx = std::clamp(static_cast<int>(ref_val / 16.0f), 0, 255);
                             float inv_2sigma2 = inv_2sigma2_lut[refLumaIdx];
                             float w_val = std::exp(-residual * residual * inv_2sigma2);
@@ -844,10 +848,12 @@ static void fuseRawBayer(const std::vector<YuvFrame>& frames,
             }
         }
 
-        // Normalise and store in 16-bit output
+        // Normalise, re-add pedestal, and store in 16-bit output
         outRaw.resize(static_cast<size_t>(w) * h);
         for (size_t i = 0; i < acc.size(); ++i) {
             float v = (wgt[i] > 1e-6f) ? acc[i] / wgt[i] : acc[i];
+            // Re-add black level so downstream debayer sees the original raw DN range
+            v += blackLevel;
             outRaw[i] = static_cast<uint16_t>(std::clamp(v, 0.f, 65535.f));
         }
     }
@@ -981,6 +987,13 @@ bool FusionStage::process(FrameContext& ctx) {
             sensorMax = static_cast<float>(maxVal);
         }
         
+        // Read black level from metadata (set by JNI from CameraCharacteristics)
+        float blackLevel = 1024.f;
+        if (ctx.metadata.count("black_level")) {
+            try { blackLevel = std::any_cast<float>(ctx.metadata.at("black_level")); } catch (...) {}
+        }
+        LOGI("FusionStage: using black level = %.1f for RAW fusion pedestal correction", blackLevel);
+
         if (ctx.inputFrames.size() == 1) {
             LOGI("FusionStage: single frame, copying RAW Bayer reference directly");
             const uint16_t* rawData = reinterpret_cast<const uint16_t*>(ctx.inputFrames[0].yPlane);
@@ -990,7 +1003,7 @@ bool FusionStage::process(FrameContext& ctx) {
                 std::copy(rawData + r * strideElements, rawData + r * strideElements + w, fusedRaw.data() + r * w);
             }
         } else {
-            fuseRawBayer(ctx.inputFrames, ctx.motionFields, fusedRaw, w, h, inv_2sigma2_luts, sensorMax);
+            fuseRawBayer(ctx.inputFrames, ctx.motionFields, fusedRaw, w, h, inv_2sigma2_luts, sensorMax, blackLevel);
         }
         ctx.metadata["fused_raw"] = fusedRaw;
     } else {

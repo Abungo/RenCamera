@@ -369,6 +369,9 @@ Java_com_renskylab_camera_NativeEngine_processCopiedBurst(
     jlongArray frameExposures,
     jfloatArray frameNoiseProfiles,
     jfloatArray configParams,
+    jfloatArray lscDataArr,
+    jint lscMapWidth,
+    jint lscMapHeight,
     jstring debugDirStr,
     jobject listener)
 {
@@ -522,6 +525,26 @@ Java_com_renskylab_camera_NativeEngine_processCopiedBurst(
             for (int i = 0; i < 9; ++i) {
                 ccm[i] = params[25 + i];
             }
+            // Transform Sensor-to-XYZ CCM into Sensor-to-DCI-P3 (Display P3) CCM
+            // M_XYZ_to_P3 matrix coefficients (Row-major):
+            // [  2.4934969, -0.9313836, -0.2827892 ]
+            // [ -0.8294889,  1.7995483,  0.0134563 ]
+            // [  0.0358458, -0.2048879,  1.3312097 ]
+            std::vector<float> sensorToXYZ = ccm;
+            const float mP3[9] = {
+                 2.4934969f, -0.9313836f, -0.2827892f,
+                -0.8294889f,  1.7995483f,  0.0134563f,
+                 0.0358458f, -0.2048879f,  1.3312097f
+            };
+            for (int row = 0; row < 3; ++row) {
+                for (int col = 0; col < 3; ++col) {
+                    float sum = 0.0f;
+                    for (int k = 0; k < 3; ++k) {
+                        sum += mP3[row * 3 + k] * sensorToXYZ[k * 3 + col];
+                    }
+                    ccm[row * 3 + col] = sum;
+                }
+            }
         } else {
             ccm = {
                 1.0f, 0.0f, 0.0f,
@@ -530,7 +553,7 @@ Java_com_renskylab_camera_NativeEngine_processCopiedBurst(
             };
         }
         ctx.metadata["color_correction_matrix"] = ccm;
-        LOGI("Extracted dynamic Color Correction Matrix (CCM) from JNI: [%.3f, %.3f, %.3f; %.3f, %.3f, %.3f; %.3f, %.3f, %.3f]",
+        LOGI("Extracted dynamic Color Correction Matrix (CCM) transformed to DCI-P3: [%.3f, %.3f, %.3f; %.3f, %.3f, %.3f; %.3f, %.3f, %.3f]",
              ccm[0], ccm[1], ccm[2], ccm[3], ccm[4], ccm[5], ccm[6], ccm[7], ccm[8]);
 
         int cfaPattern = 3; // default BGGR
@@ -555,6 +578,25 @@ Java_com_renskylab_camera_NativeEngine_processCopiedBurst(
         LOGI("Extracted white level from JNI: %.1f", whiteLevel);
 
         env->ReleaseFloatArrayElements(configParams, params, JNI_ABORT);
+    }
+
+    // ── Lens Shading Correction map ──────────────────────────────────────────
+    if (lscDataArr != nullptr) {
+        jsize lscLen = env->GetArrayLength(lscDataArr);
+        jfloat* lscPtr = env->GetFloatArrayElements(lscDataArr, nullptr);
+        std::vector<float> lscVec(lscPtr, lscPtr + lscLen);
+        env->ReleaseFloatArrayElements(lscDataArr, lscPtr, JNI_ABORT);
+        ctx.metadata["lsc_data"]        = lscVec;
+        ctx.metadata["lsc_map_width"]   = static_cast<int>(lscMapWidth);
+        ctx.metadata["lsc_map_height"]  = static_cast<int>(lscMapHeight);
+        LOGI("processCopiedBurst: LSC map received — %d×%d (%zu floats)",
+             static_cast<int>(lscMapWidth), static_cast<int>(lscMapHeight), lscVec.size());
+    } else {
+        // Unity map — no correction
+        ctx.metadata["lsc_data"]        = std::vector<float>{1.f, 1.f, 1.f, 1.f};
+        ctx.metadata["lsc_map_width"]   = 1;
+        ctx.metadata["lsc_map_height"]  = 1;
+        LOGI("processCopiedBurst: no LSC map provided — unity gain applied");
     }
     
     const char* debugDir = env->GetStringUTFChars(debugDirStr, nullptr);
