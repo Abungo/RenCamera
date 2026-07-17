@@ -348,7 +348,7 @@ uniform float u_strength_multiplier;
 layout(rgba8, binding = 0) writeonly uniform image2D u_output_image;
 
 float luma(vec3 rgb) {
-    return 0.2722 * rgb.r + 0.6740 * rgb.g + 0.0538 * rgb.b;
+    return 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
 }
 
 void main() {
@@ -446,7 +446,7 @@ layout(std430, binding = 0) writeonly buffer OutputBuffer {
 };
 
 float luma(vec3 rgb) {
-    return 0.2722 * rgb.r + 0.6740 * rgb.g + 0.0538 * rgb.b;
+    return 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
 }
 
 float acesFilm(float x) {
@@ -674,7 +674,7 @@ vec3 unpackRGB(uint val) {
 }
 
 float luma(vec3 rgb) {
-    return 0.2722 * rgb.r + 0.6740 * rgb.g + 0.0538 * rgb.b;
+    return 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
 }
 
 void main() {

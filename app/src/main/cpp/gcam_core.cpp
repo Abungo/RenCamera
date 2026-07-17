@@ -525,17 +525,21 @@ Java_com_renskylab_camera_NativeEngine_processCopiedBurst(
             for (int i = 0; i < 9; ++i) {
                 ccm[i] = params[25 + i];
             }
-            // Transform Sensor-to-XYZ CCM into Sensor-to-DCI-P3 (Display P3) CCM
-            // M_XYZ_to_P3 matrix coefficients (Row-major):
-            // [  2.4934969, -0.9313836, -0.2827892 ]
-            // [ -0.8294889,  1.7995483,  0.0134563 ]
-            // [  0.0358458, -0.2048879,  1.3312097 ]
+            // Transform Sensor-to-sRGB CCM into Sensor-to-Display P3 CCM
+            // M_sRGB_to_P3 matrix coefficients (Row-major):
+            // [ 0.8225, 0.1775, 0.0000 ]
+            // [ 0.0332, 0.9668, 0.0000 ]
+            // [ 0.0171, 0.0724, 0.9105 ]
             std::vector<float> sensorToXYZ = ccm;
             const float mP3[9] = {
-                 2.4934969f, -0.9313836f, -0.2827892f,
-                -0.8294889f,  1.7995483f,  0.0134563f,
-                 0.0358458f, -0.2048879f,  1.3312097f
+                0.8225f, 0.1775f, 0.0000f,
+                0.0332f, 0.9668f, 0.0000f,
+                0.0171f, 0.0724f, 0.9105f
             };
+            LOGI("Original dynamic CCM from JNI (Sensor-to-sRGB): [%.3f, %.3f, %.3f; %.3f, %.3f, %.3f; %.3f, %.3f, %.3f]",
+                 sensorToXYZ[0], sensorToXYZ[1], sensorToXYZ[2],
+                 sensorToXYZ[3], sensorToXYZ[4], sensorToXYZ[5],
+                 sensorToXYZ[6], sensorToXYZ[7], sensorToXYZ[8]);
             for (int row = 0; row < 3; ++row) {
                 for (int col = 0; col < 3; ++col) {
                     float sum = 0.0f;
